@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 @dataclass(frozen=True)
@@ -74,6 +74,33 @@ ProviderCapability = Literal["read_only", "workspace_write"]
 WriterAttemptStage = Literal["implementing", "correcting"]
 WriterAttemptPurpose = Literal["implementation", "correction"]
 WriterRecoveryAction = Literal["retry_restored", "adopt_current"]
+TargetReleaseReason = Literal["published", "operator_released"]
+
+
+class TargetOwnership(BaseModel):
+    """Durable audit of one run's ownership of a target checkout."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_key: str = Field(min_length=64, max_length=64)
+    canonical_repo: str = Field(min_length=1, max_length=4096)
+    device: int = Field(ge=0)
+    inode: int = Field(ge=0)
+    acquired_at: str
+    released_at: str | None = None
+    release_reason: TargetReleaseReason | None = None
+    release_note: str | None = Field(default=None, min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_release(self) -> "TargetOwnership":
+        released = self.released_at is not None
+        if released != (self.release_reason is not None):
+            raise ValueError("target release timestamp and reason must appear together")
+        if self.release_reason == "operator_released" and self.release_note is None:
+            raise ValueError("operator target release requires a note")
+        if self.release_reason != "operator_released" and self.release_note is not None:
+            raise ValueError("target release note is only valid for operator release")
+        return self
 
 
 class WriterAttemptState(BaseModel):
@@ -189,6 +216,7 @@ class WorkflowRun(BaseModel):
     policy_decisions: list[PolicyDecision] = Field(default_factory=list)
     provider_resume_stage: str | None = None
     provider_resume_prompt: str | None = None
+    target_ownership: TargetOwnership | None = None
     active_writer_attempt: WriterAttemptState | None = None
     writer_recovery_decisions: list[WriterRecoveryDecision] = Field(
         default_factory=list

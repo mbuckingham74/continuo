@@ -47,7 +47,7 @@ tasks/<task-ref>-*.md
 
 For example, task `009` must resolve to exactly one file such as `tasks/009-example.md`. The controller persists the specification and its SHA-256, coordinates the run, and stores local run state under `runs/`.
 
-The controller and its safety behavior are implemented and covered by 59 unit tests. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
+The controller and its safety behavior are implemented and covered by 84 unit tests. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
 
 ## How it works
 
@@ -205,6 +205,7 @@ The target repository must contain exactly one matching task specification, be c
 | `run <task-ref>` | Create and advance a new run until it reaches an approval gate or block |
 | `resume <run-id>` | Safely continue from the saved stage without intentionally repeating completed provider work |
 | `recover-writer <run-id>` | Explicitly retry an exactly restored writer state or adopt trustworthy current changes, with an audited note |
+| `release-target <run-id>` | Deliberately release a clean blocked or declined target, with an audited operator note |
 | `approve-policy <run-id>` | Record an explicit human policy decision and resume |
 | `report <run-id>` | Show provider timing, failures, retries, corrections, decisions, review, and Git status |
 | `status` | List the ten most recently updated local runs |
@@ -221,13 +222,21 @@ uv run python orchestrator.py recover-writer <run-id> \
   --action retry-restored --note "Repository restored to the saved pre-attempt state."
 uv run python orchestrator.py recover-writer <run-id> \
   --action adopt-current --note "Reviewed and reconciled the current partial changes."
+uv run python orchestrator.py release-target <run-id> \
+  --note "The clean blocked run is deliberately abandoned."
 uv run python orchestrator.py approve-policy <run-id> \
   --decision "Exact human-approved policy text."
 ```
 
 ## Persistence and privacy
 
-Run state is written to ignored local files at `runs/<run-id>.json`. Each record can contain:
+Run state is written to ignored local files at `runs/<run-id>.json`. Per-target
+coordination state is stored under `runs/.target-locks/`. A run owns its target
+across provider blocks, writer recovery, and commit/push approval stops; only a
+successful push or explicit clean `release-target` action releases it. Continuo
+does not clean or discard partial changes to make a release eligible.
+
+Each run record can contain:
 
 - the complete task specification;
 - provider prompts, commands, stdout, and stderr;
@@ -235,6 +244,7 @@ Run state is written to ignored local files at `runs/<run-id>.json`. Each record
 - provider capability and writer pre/post repository evidence;
 - human policy decisions;
 - explicit writer-recovery decisions and operator notes;
+- target identity, ownership, and release audit fields;
 - repository fingerprints and verification results; and
 - Git operation records.
 
@@ -250,6 +260,7 @@ The report command derives metrics from saved records, including:
 - correction count and distinct defect identities;
 - Sol escalation and policy-decision counts;
 - writer-recovery decision count and any pending writer-state block;
+- target ownership state and canonical target key;
 - final review status; and
 - commit and push status.
 
@@ -264,15 +275,17 @@ uv sync
 uv run python -m unittest -v
 ```
 
-The 75 tests exercise temporary repositories, recorded sanitized fixtures, fake
+The 84 tests exercise temporary repositories, recorded sanitized fixtures, fake
 providers, and real local child/grandchild processes. They cover preflight
 safety, task resolution, correction budgets, repeat-finding escalation, policy
 decisions, trusted failure-evidence precedence, Claude envelope/content
 separation, capability-aware retry, writer pre/post snapshots, explicit
 restoration/adoption, crash recovery, provider-stop resume behavior, bounded
 process cleanup, timeout/interruption output, sandbox command construction,
-reporting, Git approval defaults, and adversarial Git change parsing,
-fingerprinting, persistence, recovery, and staging behavior.
+target identity, cross-controller mutex contention, durable ownership, clean
+release, stale/corrupt coordination recovery, reporting, Git approval defaults,
+and adversarial Git change parsing, fingerprinting, persistence, recovery, and
+staging behavior.
 
 Before committing changes, also check the diff:
 

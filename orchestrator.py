@@ -5,13 +5,15 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import sqlite3
 import subprocess
 import uuid
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator, NamedTuple
 
 import typer
 from rich.console import Console
@@ -24,6 +26,7 @@ from models import (
     ProviderRecord,
     RepoState,
     ReviewResult,
+    TargetOwnership,
     WorkflowRun,
     WriterAttemptPurpose,
     WriterAttemptStage,
@@ -113,6 +116,25 @@ def repo_state(repo: Path) -> RepoState:
         head=git_text(repo, "rev-parse", "HEAD"),
         clean=not bool(git_text(repo, "status", "--porcelain=v1", "--untracked-files=all")),
         origin=origin,
+    )
+
+
+class TargetIdentity(NamedTuple):
+    target_key: str
+    canonical_repo: str
+    device: int
+    inode: int
+
+
+def target_identity(repo: Path) -> TargetIdentity:
+    canonical = repo.resolve(strict=True)
+    stat = canonical.stat()
+    encoded = f"continuo-target-v1\0{stat.st_dev}\0{stat.st_ino}".encode()
+    return TargetIdentity(
+        target_key=hashlib.sha256(encoded).hexdigest(),
+        canonical_repo=str(canonical),
+        device=stat.st_dev,
+        inode=stat.st_ino,
     )
 
 
@@ -247,6 +269,362 @@ def load_run(run_id: str, runs_dir: Path = RUNS) -> WorkflowRun:
         return WorkflowRun.model_validate_json(path.read_text(encoding="utf-8"))
     except Exception as exc:
         raise ControllerError(f"run state is invalid: {path}: {exc}") from exc
+
+
+class TargetCoordinator:
+    """Per-target durable ownership plus a crash-releasing SQLite mutex."""
+
+    SCHEMA_VERSION = 1
+
+    def __init__(self, repo: Path, runs_dir: Path) -> None:
+        self.repo = repo
+        self.runs_dir = runs_dir
+        self.identity = target_identity(repo)
+        self.database = (
+            runs_dir
+            / ".target-locks"
+            / f"{self.identity.target_key}.sqlite3"
+        )
+
+    def _connect(self) -> sqlite3.Connection:
+        self.database.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            connection = sqlite3.connect(
+                self.database,
+                timeout=0,
+                isolation_level=None,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout = 0")
+            return connection
+        except sqlite3.Error as exc:
+            raise ControllerError(
+                "target ownership database could not be opened"
+            ) from exc
+
+    def _ensure_schema(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS coordination_meta (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                schema_version INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS target_owner (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                target_key TEXT NOT NULL,
+                canonical_repo TEXT NOT NULL,
+                device INTEGER NOT NULL,
+                inode INTEGER NOT NULL,
+                run_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL
+            )
+            """
+        )
+        metadata = connection.execute(
+            "SELECT schema_version FROM coordination_meta WHERE singleton = 1"
+        ).fetchone()
+        if metadata is None:
+            connection.execute(
+                "INSERT INTO coordination_meta(singleton, schema_version) "
+                "VALUES (1, ?)",
+                (self.SCHEMA_VERSION,),
+            )
+        elif metadata["schema_version"] != self.SCHEMA_VERSION:
+            raise ControllerError("target ownership database schema is unsupported")
+
+    def _owner_hint(self) -> str | None:
+        try:
+            connection = self._connect()
+            try:
+                row = connection.execute(
+                    "SELECT run_id FROM target_owner WHERE singleton = 1"
+                ).fetchone()
+                return row["run_id"] if row is not None else None
+            finally:
+                connection.close()
+        except (ControllerError, sqlite3.Error):
+            return None
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                    owner = self._owner_hint()
+                    suffix = f" by run {owner}" if owner else ""
+                    raise ControllerError(
+                        "target is currently executing in another controller"
+                        + suffix
+                    ) from exc
+                raise
+            self._ensure_schema(connection)
+            yield connection
+            connection.commit()
+        except ControllerError:
+            connection.rollback()
+            raise
+        except sqlite3.Error as exc:
+            connection.rollback()
+            raise ControllerError(
+                "target ownership database is invalid or unavailable"
+            ) from exc
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _owner(self, connection: sqlite3.Connection) -> sqlite3.Row | None:
+        return connection.execute(
+            "SELECT * FROM target_owner WHERE singleton = 1"
+        ).fetchone()
+
+    def _validate_identity_fields(
+        self,
+        target_key: str,
+        canonical_repo: str,
+        device: int,
+        inode: int,
+    ) -> None:
+        identity = self.identity
+        if (
+            target_key != identity.target_key
+            or canonical_repo != identity.canonical_repo
+            or device != identity.device
+            or inode != identity.inode
+        ):
+            raise ControllerError("target ownership identity does not match checkout")
+
+    def _validate_run_identity(self, run: WorkflowRun) -> None:
+        try:
+            saved_repo = str(Path(run.repo.repo).resolve(strict=True))
+        except OSError as exc:
+            raise ControllerError(
+                "saved target repository identity cannot be resolved"
+            ) from exc
+        if saved_repo != self.identity.canonical_repo:
+            raise ControllerError("saved run targets a different checkout")
+        ownership = run.target_ownership
+        if ownership is not None:
+            self._validate_identity_fields(
+                ownership.target_key,
+                ownership.canonical_repo,
+                ownership.device,
+                ownership.inode,
+            )
+
+    def _validate_owner_row(self, owner: sqlite3.Row) -> None:
+        self._validate_identity_fields(
+            owner["target_key"],
+            owner["canonical_repo"],
+            owner["device"],
+            owner["inode"],
+        )
+
+    def _validate_owner_audit(
+        self,
+        owner: sqlite3.Row,
+        ownership: TargetOwnership,
+    ) -> None:
+        if ownership.acquired_at != owner["acquired_at"]:
+            raise ControllerError("target ownership state is unknown")
+
+    def _release_audit(
+        self,
+        run: WorkflowRun,
+        reason: str,
+        note: str | None,
+    ) -> None:
+        ownership = run.target_ownership
+        if ownership is None:
+            raise ControllerError("target ownership audit is missing")
+        run.target_ownership = TargetOwnership.model_validate(
+            {
+                **ownership.model_dump(),
+                "released_at": datetime.now(timezone.utc).isoformat(),
+                "release_reason": reason,
+                "release_note": note,
+            }
+        )
+        run.updated_at = datetime.now(timezone.utc).isoformat()
+        persist(run, self.runs_dir)
+
+    def _reconcile_other_owner(
+        self,
+        connection: sqlite3.Connection,
+        owner: sqlite3.Row,
+    ) -> None:
+        self._validate_owner_row(owner)
+        try:
+            owner_run = load_run(owner["run_id"], self.runs_dir)
+        except ControllerError as exc:
+            raise ControllerError("target ownership state is unknown") from exc
+        self._validate_run_identity(owner_run)
+        ownership = owner_run.target_ownership
+        if ownership is None:
+            raise ControllerError("target ownership state is unknown")
+        self._validate_owner_audit(owner, ownership)
+
+        if ownership.released_at is not None:
+            current = repo_state(self.repo)
+            if not current.clean:
+                raise ControllerError("released target is not clean")
+            connection.execute("DELETE FROM target_owner WHERE singleton = 1")
+            return
+
+        if owner_run.stage == "pushed_awaiting_merge":
+            current = repo_state(self.repo)
+            if (
+                owner_run.commit_hash is None
+                or current.head != owner_run.commit_hash
+                or not current.clean
+                or current.branch != owner_run.repo.branch
+                or current.origin != owner_run.repo.origin
+            ):
+                raise ControllerError("published target release cannot be proven")
+            self._release_audit(owner_run, "published", None)
+            connection.execute("DELETE FROM target_owner WHERE singleton = 1")
+            return
+
+        raise ControllerError(
+            f"target is owned by unresolved run {owner['run_id']}"
+        )
+
+    def _clear_releasable_other_owner(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        owner = self._owner(connection)
+        if owner is not None:
+            self._reconcile_other_owner(connection, owner)
+
+    def claim_new(self, run: WorkflowRun) -> None:
+        self._validate_run_identity(run)
+        with self.transaction() as connection:
+            self._clear_releasable_other_owner(connection)
+            acquired_at = datetime.now(timezone.utc).isoformat()
+            run.target_ownership = TargetOwnership(
+                target_key=self.identity.target_key,
+                canonical_repo=self.identity.canonical_repo,
+                device=self.identity.device,
+                inode=self.identity.inode,
+                acquired_at=acquired_at,
+            )
+            run.updated_at = acquired_at
+            persist(run, self.runs_dir)
+            connection.execute(
+                """
+                INSERT INTO target_owner(
+                    singleton, target_key, canonical_repo, device, inode,
+                    run_id, acquired_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self.identity.target_key,
+                    self.identity.canonical_repo,
+                    self.identity.device,
+                    self.identity.inode,
+                    run.run_id,
+                    acquired_at,
+                ),
+            )
+
+    def _claim_legacy(
+        self,
+        connection: sqlite3.Connection,
+        run: WorkflowRun,
+    ) -> None:
+        acquired_at = datetime.now(timezone.utc).isoformat()
+        run.target_ownership = TargetOwnership(
+            target_key=self.identity.target_key,
+            canonical_repo=self.identity.canonical_repo,
+            device=self.identity.device,
+            inode=self.identity.inode,
+            acquired_at=acquired_at,
+        )
+        run.updated_at = acquired_at
+        persist(run, self.runs_dir)
+        connection.execute(
+            """
+            INSERT INTO target_owner(
+                singleton, target_key, canonical_repo, device, inode,
+                run_id, acquired_at
+            ) VALUES (1, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                self.identity.target_key,
+                self.identity.canonical_repo,
+                self.identity.device,
+                self.identity.inode,
+                run.run_id,
+                acquired_at,
+            ),
+        )
+
+    def claim_legacy(self, run: WorkflowRun) -> None:
+        self._validate_run_identity(run)
+        if run.target_ownership is not None:
+            raise ControllerError("run already has a target ownership audit")
+        with self.transaction() as connection:
+            self._clear_releasable_other_owner(connection)
+            self._claim_legacy(connection, run)
+
+    @contextmanager
+    def execute(
+        self,
+        run: WorkflowRun,
+    ) -> Iterator[sqlite3.Connection]:
+        self._validate_run_identity(run)
+        ownership = run.target_ownership
+        if ownership is not None and ownership.released_at is not None:
+            raise ControllerError("released run cannot reacquire target ownership")
+
+        with self.transaction() as connection:
+            owner = self._owner(connection)
+            if owner is None:
+                raise ControllerError("run is not the durable target owner")
+            else:
+                self._validate_owner_row(owner)
+                if owner["run_id"] != run.run_id:
+                    self._reconcile_other_owner(connection, owner)
+                    raise ControllerError("run is not the durable target owner")
+                if ownership is None:
+                    raise ControllerError("target ownership audit is missing")
+                self._validate_owner_audit(owner, ownership)
+            yield connection
+
+    def release(
+        self,
+        connection: sqlite3.Connection,
+        run: WorkflowRun,
+        *,
+        reason: str,
+        note: str | None,
+    ) -> None:
+        owner = self._owner(connection)
+        if owner is None or owner["run_id"] != run.run_id:
+            raise ControllerError("run is not the durable target owner")
+        self._validate_owner_row(owner)
+        current = repo_state(self.repo)
+        if not current.clean:
+            raise ControllerError("target release requires a clean checkout")
+        if reason == "published" and (
+            run.stage != "pushed_awaiting_merge"
+            or run.commit_hash is None
+            or current.head != run.commit_hash
+            or current.branch != run.repo.branch
+            or current.origin != run.repo.origin
+        ):
+            raise ControllerError("published target release cannot be proven")
+        self._release_audit(run, reason, note)
+        connection.execute("DELETE FROM target_owner WHERE singleton = 1")
 
 
 def _record_provider(
@@ -449,6 +827,20 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
         "sol_escalations": provider_counts.get("Sol High", 0),
         "policy_decisions": len(run.policy_decisions),
         "writer_recovery_decisions": len(run.writer_recovery_decisions),
+        "target_ownership_state": (
+            "legacy"
+            if run.target_ownership is None
+            else (
+                "released"
+                if run.target_ownership.released_at is not None
+                else "active"
+            )
+        ),
+        "target_key": (
+            run.target_ownership.target_key
+            if run.target_ownership is not None
+            else None
+        ),
         "pending_writer_state": (
             run.stage if run.stage.startswith("blocked_writer_") else None
         ),
@@ -528,6 +920,10 @@ def _print_run_report(run: WorkflowRun) -> None:
         "Writer recovery decisions: "
         f"{report['writer_recovery_decisions']}"
     )
+    ownership_text = str(report["target_ownership_state"])
+    if report["target_key"]:
+        ownership_text += f" ({str(report['target_key'])[:12]})"
+    console.print(f"Target ownership: {ownership_text}")
     if report["pending_writer_state"]:
         console.print(
             f"Pending writer state: {report['pending_writer_state']}"
@@ -830,6 +1226,23 @@ class Controller:
 
     def approve_policy(self, run_id: str, approved_text: str) -> WorkflowRun:
         run = load_run(run_id, self.runs_dir)
+        coordinator = TargetCoordinator(self.repo, self.runs_dir)
+        if run.target_ownership is None:
+            self._resume_guard(run)
+            coordinator.claim_legacy(run)
+        with coordinator.execute(run) as connection:
+            result = self._approve_policy_owned(run, approved_text)
+            return self._finish_owned_action(
+                coordinator,
+                connection,
+                result,
+            )
+
+    def _approve_policy_owned(
+        self,
+        run: WorkflowRun,
+        approved_text: str,
+    ) -> WorkflowRun:
         self._resume_guard(run)
 
         if run.stage != "blocked_policy_ambiguity":
@@ -891,6 +1304,24 @@ class Controller:
         note: str,
     ) -> WorkflowRun:
         run = load_run(run_id, self.runs_dir)
+        coordinator = TargetCoordinator(self.repo, self.runs_dir)
+        if run.target_ownership is None:
+            self._resume_guard(run)
+            coordinator.claim_legacy(run)
+        with coordinator.execute(run) as connection:
+            result = self._recover_writer_owned(run, action, note)
+            return self._finish_owned_action(
+                coordinator,
+                connection,
+                result,
+            )
+
+    def _recover_writer_owned(
+        self,
+        run: WorkflowRun,
+        action: WriterRecoveryAction,
+        note: str,
+    ) -> WorkflowRun:
         if run.stage not in {
             "blocked_writer_retry_required",
             "blocked_writer_partial_changes",
@@ -971,6 +1402,50 @@ class Controller:
         if not self._verify(run):
             return run
         return self._review_and_correct(run)
+
+    def _finish_owned_action(
+        self,
+        coordinator: TargetCoordinator,
+        connection: sqlite3.Connection,
+        run: WorkflowRun,
+    ) -> WorkflowRun:
+        ownership = run.target_ownership
+        if (
+            run.stage == "pushed_awaiting_merge"
+            and ownership is not None
+            and ownership.released_at is None
+        ):
+            coordinator.release(
+                connection,
+                run,
+                reason="published",
+                note=None,
+            )
+        return run
+
+    def release_target(self, run_id: str, note: str) -> WorkflowRun:
+        run = load_run(run_id, self.runs_dir)
+        note = note.strip()
+        if not note:
+            raise ControllerError("target release note cannot be empty")
+        if len(note) > 1000:
+            raise ControllerError("target release note exceeds 1000 characters")
+        if not (
+            run.stage.startswith("blocked")
+            or run.stage in {"commit_declined", "push_declined"}
+        ):
+            raise ControllerError(
+                "target release requires a blocked or declined run"
+            )
+        coordinator = TargetCoordinator(self.repo, self.runs_dir)
+        with coordinator.execute(run) as connection:
+            coordinator.release(
+                connection,
+                run,
+                reason="operator_released",
+                note=note,
+            )
+        return run
 
     def _block(self, run: WorkflowRun, stage: str, message: str) -> WorkflowRun:
         run.stage = stage
@@ -1696,10 +2171,18 @@ class Controller:
             specification=specification,
             repo=state,
         )
-        self._save(run)
         if not state.clean:
+            self._save(run)
             return self._block(run, "blocked_dirty_repo", "jobs repo must be clean before starting")
-        return self._run_from(run)
+        coordinator = TargetCoordinator(self.repo, self.runs_dir)
+        coordinator.claim_new(run)
+        with coordinator.execute(run) as connection:
+            result = self._run_from(run)
+            return self._finish_owned_action(
+                coordinator,
+                connection,
+                result,
+            )
 
     def _run_from(self, run: WorkflowRun) -> WorkflowRun:
         if run.stage == "created":
@@ -1755,6 +2238,19 @@ class Controller:
 
     def resume(self, run_id: str) -> WorkflowRun:
         run = load_run(run_id, self.runs_dir)
+        coordinator = TargetCoordinator(self.repo, self.runs_dir)
+        if run.target_ownership is None:
+            self._resume_guard(run)
+            coordinator.claim_legacy(run)
+        with coordinator.execute(run) as connection:
+            result = self._resume_owned(run)
+            return self._finish_owned_action(
+                coordinator,
+                connection,
+                result,
+            )
+
+    def _resume_owned(self, run: WorkflowRun) -> WorkflowRun:
 
         if run.stage in {
             "blocked_writer_retry_required",
@@ -2075,6 +2571,36 @@ def recover_writer_command(
     _handle_error(recover)
 
 
+@app.command("release-target")
+def release_target_command(
+    run_id: str = typer.Argument(..., help="Saved blocked or declined run."),
+    note: str = typer.Option(
+        ...,
+        "--note",
+        help="Required operator rationale recorded in the ownership audit.",
+    ),
+    repo: Path | None = typer.Option(
+        None,
+        "--repo",
+        help="Override the jobs repository path.",
+    ),
+) -> None:
+    """Release a clean target from a deliberately abandoned run."""
+
+    def release() -> None:
+        saved = load_run(run_id)
+        controller = Controller(
+            configured_repo(repo) if repo else Path(saved.repo.repo)
+        )
+        result = controller.release_target(run_id, note)
+        console.print(
+            f"Run {result.run_id}: target released; workflow remains "
+            f"{result.stage}."
+        )
+
+    _handle_error(release)
+
+
 @app.command("approve-policy")
 def approve_policy_command(
     run_id: str = typer.Argument(..., help="Saved run awaiting human policy approval."),
@@ -2153,17 +2679,34 @@ def status(
             console.print(load_run(run_id).model_dump_json(indent=2))
             return
         paths = sorted(RUNS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
-        table = Table("Run", "Task", "Stage", "Corrections", "Policies")
+        table = Table(
+            "Run",
+            "Task",
+            "Stage",
+            "Ownership",
+            "Corrections",
+            "Policies",
+        )
         for path in paths:
             try:
                 run = WorkflowRun.model_validate_json(path.read_text(encoding="utf-8"))
             except Exception:
-                table.add_row(path.stem, "—", "INVALID", "—", "—")
+                table.add_row(path.stem, "—", "INVALID", "—", "—", "—")
                 continue
+            ownership = (
+                "legacy"
+                if run.target_ownership is None
+                else (
+                    "released"
+                    if run.target_ownership.released_at is not None
+                    else "active"
+                )
+            )
             table.add_row(
                 run.run_id,
                 run.task_ref,
                 run.stage,
+                ownership,
                 str(run.correction_cycles),
                 str(len(run.policy_decisions)),
             )

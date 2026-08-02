@@ -17,6 +17,7 @@ import providers
 from models import (
     RepoState,
     ReviewResult,
+    TargetOwnership,
     WorkflowRun,
     WriterAttemptState,
     WriterRecoveryDecision,
@@ -94,10 +95,18 @@ class ControllerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def controller(self, sonnet, terra=None, sol=None, luna=None, approval=None):
+    def controller(
+        self,
+        sonnet,
+        terra=None,
+        sol=None,
+        luna=None,
+        approval=None,
+        runs_dir=None,
+    ):
         return orchestrator.Controller(
             self.repo,
-            self.runs,
+            runs_dir or self.runs,
             sonnet=sonnet,
             terra=terra or (lambda prompt, repo: ProviderExecution(["codex"], 0, "resolved", "")),
             sol=sol or (lambda prompt, repo: ProviderExecution(["codex"], 0, "GUIDANCE: inspect the remaining defect", "")),
@@ -483,8 +492,15 @@ class ControllerTests(unittest.TestCase):
         before_save.changed_files = []
         before_save.working_tree_fingerprint = None
         before_save.implementation_review = None
-        orchestrator.persist(before_save, self.runs)
-        resumed_before = controller.resume(before_save.run_id)
+        before_save.target_ownership = None
+        before_runs = self.runs / "before-verification-save"
+        orchestrator.persist(before_save, before_runs)
+        resumed_before = self.controller(
+            self.passing_sonnet,
+            luna=luna,
+            approval=lambda prompt: False,
+            runs_dir=before_runs,
+        ).resume(before_save.run_id)
         self.assertEqual(resumed_before.stage, "commit_declined")
         self.assertEqual(luna_calls, calls_after_implementation)
         self.assertEqual(resumed_before.changed_files, [special])
@@ -493,8 +509,15 @@ class ControllerTests(unittest.TestCase):
         after_save.run_id = "after-verification-save"
         after_save.stage = "implementation_verified"
         after_save.implementation_review = None
-        orchestrator.persist(after_save, self.runs)
-        resumed_after = controller.resume(after_save.run_id)
+        after_save.target_ownership = None
+        after_runs = self.runs / "after-verification-save"
+        orchestrator.persist(after_save, after_runs)
+        resumed_after = self.controller(
+            self.passing_sonnet,
+            luna=luna,
+            approval=lambda prompt: False,
+            runs_dir=after_runs,
+        ).resume(after_save.run_id)
         self.assertEqual(resumed_after.stage, "commit_declined")
         self.assertEqual(luna_calls, calls_after_implementation)
 
@@ -1410,9 +1433,13 @@ class ControllerTests(unittest.TestCase):
             malformed,
             capability="read_only",
         )
-        orchestrator.persist(malformed_run, self.runs)
+        malformed_runs = self.runs / "malformed-content-recovery"
+        orchestrator.persist(malformed_run, malformed_runs)
 
-        recovered_malformed = self.controller(unexpected_provider).resume(
+        recovered_malformed = self.controller(
+            unexpected_provider,
+            runs_dir=malformed_runs,
+        ).resume(
             malformed_run.run_id
         )
 
@@ -1442,11 +1469,13 @@ class ControllerTests(unittest.TestCase):
             success,
             capability="read_only",
         )
-        orchestrator.persist(success_run, self.runs)
+        success_runs = self.runs / "successful-content-recovery"
+        orchestrator.persist(success_run, success_runs)
 
         recovered_success = self.controller(
             unexpected_provider,
             approval=lambda prompt: False,
+            runs_dir=success_runs,
         ).resume(success_run.run_id)
 
         self.assertEqual(recovered_success.stage, "commit_declined")
@@ -1916,10 +1945,12 @@ class ControllerTests(unittest.TestCase):
             )
 
         unchanged = interrupted_run("crash-unchanged")
-        orchestrator.persist(unchanged, self.runs)
+        unchanged_runs = self.runs / unchanged.run_id
+        orchestrator.persist(unchanged, unchanged_runs)
         recovered_unchanged = self.controller(
             self.passing_sonnet,
             luna=unexpected_luna,
+            runs_dir=unchanged_runs,
         ).resume(unchanged.run_id)
         self.assertEqual(
             recovered_unchanged.stage,
@@ -1933,10 +1964,12 @@ class ControllerTests(unittest.TestCase):
             post_files,
         )
         partial = interrupted_run("crash-partial")
-        orchestrator.persist(partial, self.runs)
+        partial_runs = self.runs / partial.run_id
+        orchestrator.persist(partial, partial_runs)
         recovered_partial = self.controller(
             self.passing_sonnet,
             luna=unexpected_luna,
+            runs_dir=partial_runs,
         ).resume(partial.run_id)
         self.assertEqual(
             recovered_partial.stage,
@@ -1962,10 +1995,12 @@ class ControllerTests(unittest.TestCase):
                 repository_fingerprint_after=post_fingerprint,
             )
         )
-        orchestrator.persist(failed, self.runs)
+        failed_runs = self.runs / failed.run_id
+        orchestrator.persist(failed, failed_runs)
         recovered_failed = self.controller(
             self.passing_sonnet,
             luna=unexpected_luna,
+            runs_dir=failed_runs,
         ).resume(failed.run_id)
         self.assertEqual(
             recovered_failed.stage,
@@ -1989,11 +2024,13 @@ class ControllerTests(unittest.TestCase):
                 repository_fingerprint_after=post_fingerprint,
             )
         )
-        orchestrator.persist(success, self.runs)
+        success_runs = self.runs / success.run_id
+        orchestrator.persist(success, success_runs)
         recovered_success = self.controller(
             self.passing_sonnet,
             luna=unexpected_luna,
             approval=lambda prompt: False,
+            runs_dir=success_runs,
         ).resume(success.run_id)
         self.assertEqual(recovered_success.stage, "commit_declined")
         self.assertIsNone(recovered_success.active_writer_attempt)
@@ -2045,10 +2082,12 @@ class ControllerTests(unittest.TestCase):
                 )
             ],
         )
-        orchestrator.persist(retry_crash, self.runs)
+        retry_runs = self.runs / retry_crash.run_id
+        orchestrator.persist(retry_crash, retry_runs)
         recovered_retry = self.controller(
             self.passing_sonnet,
             luna=unexpected_luna,
+            runs_dir=retry_runs,
         ).resume(retry_crash.run_id)
         self.assertEqual(
             recovered_retry.stage,
@@ -2083,11 +2122,13 @@ class ControllerTests(unittest.TestCase):
                 )
             ],
         )
-        orchestrator.persist(adopt_crash, self.runs)
+        adopt_runs = self.runs / adopt_crash.run_id
+        orchestrator.persist(adopt_crash, adopt_runs)
         recovered_adopt = self.controller(
             self.passing_sonnet,
             luna=unexpected_luna,
             approval=lambda prompt: False,
+            runs_dir=adopt_runs,
         ).resume(adopt_crash.run_id)
         self.assertEqual(recovered_adopt.stage, "commit_declined")
         self.assertEqual(len(recovered_adopt.writer_recovery_decisions), 1)
@@ -2326,6 +2367,563 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(
             legacy.provider_runs[0].repository_fingerprint_before
         )
+
+    def test_target_identity_aliases_and_separate_checkouts(self) -> None:
+        alias = Path(self.temp.name) / "repo-alias"
+        alias.symlink_to(self.repo, target_is_directory=True)
+
+        direct = orchestrator.target_identity(self.repo)
+        through_alias = orchestrator.target_identity(alias)
+        self.assertEqual(through_alias, direct)
+        self.assertEqual(
+            orchestrator.TargetCoordinator(alias, self.runs).database,
+            orchestrator.TargetCoordinator(self.repo, self.runs).database,
+        )
+
+        second = Path(self.temp.name) / "second-checkout"
+        second.mkdir()
+        git(second, "init", "-b", "main")
+        git(second, "config", "user.email", "tests@example.invalid")
+        git(second, "config", "user.name", "Controller Tests")
+        git(second, "remote", "add", "origin", "https://example.invalid/jobs.git")
+        (second / "tasks").mkdir()
+        (second / "tasks/009-example.md").write_text("Second checkout task.\n")
+        git(second, "add", ".")
+        git(second, "commit", "-m", "fixture")
+
+        second_identity = orchestrator.target_identity(second)
+        self.assertNotEqual(second_identity.target_key, direct.target_key)
+
+        first_coordinator = orchestrator.TargetCoordinator(self.repo, self.runs)
+        second_calls = 0
+
+        def second_review(prompt, repo):
+            nonlocal second_calls
+            second_calls += 1
+            return review_execution(
+                "FAIL",
+                "POLICY_AMBIGUITY",
+                "independent target fixture",
+            )
+
+        with first_coordinator.transaction():
+            result = orchestrator.Controller(
+                second,
+                self.runs,
+                sonnet=second_review,
+                terra=lambda prompt, repo: ProviderExecution(
+                    ["codex"], 0, "human decision required", ""
+                ),
+            ).new_run("009")
+
+        self.assertEqual(result.stage, "blocked_policy_ambiguity")
+        self.assertEqual(second_calls, 1)
+
+    def test_new_claim_precedes_provider_and_all_public_actions_contend(self) -> None:
+        provider_entered = threading.Event()
+        provider_release = threading.Event()
+        provider_calls = 0
+        result_holder = []
+        errors = []
+
+        def slow_review(prompt, repo):
+            nonlocal provider_calls
+            provider_calls += 1
+            saved = list(self.runs.glob("*.json"))
+            self.assertEqual(len(saved), 1)
+            observed = orchestrator.load_run(saved[0].stem, self.runs)
+            self.assertIsNotNone(observed.target_ownership)
+            provider_entered.set()
+            if not provider_release.wait(5):
+                raise AssertionError("test provider was not released")
+            return review_execution(
+                "FAIL",
+                "POLICY_AMBIGUITY",
+                "mutex fixture",
+            )
+
+        controller = self.controller(
+            slow_review,
+            terra=lambda prompt, repo: ProviderExecution(
+                ["codex"], 0, "human decision required", ""
+            ),
+        )
+
+        def start_first() -> None:
+            try:
+                result_holder.append(controller.new_run("009"))
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=start_first)
+        worker.start()
+        self.assertTrue(provider_entered.wait(5))
+
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "currently executing",
+        ):
+            self.controller(self.passing_sonnet).new_run("009")
+        self.assertEqual(len(list(self.runs.glob("*.json"))), 1)
+        self.assertEqual(provider_calls, 1)
+
+        provider_release.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        run = result_holder[0]
+        self.assertEqual(run.stage, "blocked_policy_ambiguity")
+        self.assertIsNone(run.target_ownership.released_at)
+
+        before = orchestrator.load_run(run.run_id, self.runs).model_dump()
+        coordinator = orchestrator.TargetCoordinator(self.repo, self.runs)
+        with coordinator.transaction():
+            actions = (
+                lambda: controller.resume(run.run_id),
+                lambda: controller.approve_policy(run.run_id, "approved text"),
+                lambda: controller.recover_writer(
+                    run.run_id, "retry_restored", "recovery note"
+                ),
+                lambda: controller.release_target(run.run_id, "abandon run"),
+            )
+            for action in actions:
+                with self.assertRaisesRegex(
+                    orchestrator.ControllerError,
+                    "currently executing",
+                ):
+                    action()
+
+        self.assertEqual(
+            orchestrator.load_run(run.run_id, self.runs).model_dump(),
+            before,
+        )
+        with coordinator.transaction() as connection:
+            owner = coordinator._owner(connection)
+            self.assertEqual(owner["run_id"], run.run_id)
+
+    def test_dirty_retention_clean_release_and_released_run_closure(self) -> None:
+        second_provider_calls = 0
+        run = self.controller(
+            self.passing_sonnet,
+            approval=lambda prompt: False,
+        ).new_run("009")
+        self.assertEqual(run.stage, "commit_declined")
+        self.assertIsNone(run.target_ownership.released_at)
+
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "clean checkout",
+        ):
+            self.controller(self.passing_sonnet).release_target(
+                run.run_id,
+                "cannot abandon dirty work",
+            )
+
+        def second_review(prompt, repo):
+            nonlocal second_provider_calls
+            second_provider_calls += 1
+            return self.passing_sonnet(prompt, repo)
+
+        dirty_block = self.controller(second_review).new_run("009")
+        self.assertEqual(dirty_block.stage, "blocked_dirty_repo")
+        self.assertIsNone(dirty_block.target_ownership)
+        self.assertEqual(second_provider_calls, 0)
+
+        (self.repo / "implementation.py").unlink()
+        git_records = len(run.git_operations)
+        provider_records = len(run.provider_runs)
+        released = self.controller(self.passing_sonnet).release_target(
+            run.run_id,
+            "operator deliberately abandoned the clean declined run",
+        )
+        self.assertEqual(released.target_ownership.release_reason, "operator_released")
+        self.assertEqual(
+            released.target_ownership.release_note,
+            "operator deliberately abandoned the clean declined run",
+        )
+        self.assertEqual(len(released.git_operations), git_records)
+        self.assertEqual(len(released.provider_runs), provider_records)
+
+        for action in (
+            lambda: self.controller(self.passing_sonnet).resume(run.run_id),
+            lambda: self.controller(self.passing_sonnet).release_target(
+                run.run_id, "second release"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                orchestrator.ControllerError,
+                "released run",
+            ):
+                action()
+
+        replacement = self.controller(
+            lambda prompt, repo: review_execution(
+                "FAIL", "POLICY_AMBIGUITY", "replacement owns target"
+            ),
+            terra=lambda prompt, repo: ProviderExecution(
+                ["codex"], 0, "human decision required", ""
+            ),
+        ).new_run("009")
+        self.assertNotEqual(replacement.run_id, run.run_id)
+        self.assertEqual(
+            replacement.target_ownership.target_key,
+            released.target_ownership.target_key,
+        )
+
+    def test_clean_push_decline_retains_owner_and_push_releases_it(self) -> None:
+        declined = self.controller(
+            self.passing_sonnet,
+            approval=lambda prompt: prompt.startswith("Commit"),
+            runs_dir=self.runs / "declined",
+        ).new_run("009")
+        self.assertEqual(declined.stage, "push_declined")
+        self.assertTrue(orchestrator.repo_state(self.repo).clean)
+        self.assertIsNone(declined.target_ownership.released_at)
+
+        bare = Path(self.temp.name) / "origin.git"
+        git(bare.parent, "init", "--bare", str(bare))
+        git(self.repo, "remote", "set-url", "origin", str(bare))
+        (self.repo / "implementation.py").write_text("# next implementation\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "prepare published fixture")
+
+        published_runs = self.runs / "published"
+        published = self.controller(
+            self.passing_sonnet,
+            luna=lambda prompt, repo: (
+                (repo / "published.py").write_text("# published\n"),
+                ProviderExecution(["codex"], 0, "implemented", ""),
+            )[1],
+            approval=lambda prompt: True,
+            runs_dir=published_runs,
+        ).new_run("009")
+        self.assertEqual(published.stage, "pushed_awaiting_merge")
+        self.assertEqual(published.target_ownership.release_reason, "published")
+        self.assertIsNone(published.target_ownership.release_note)
+        self.assertTrue(orchestrator.repo_state(self.repo).clean)
+        coordinator = orchestrator.TargetCoordinator(self.repo, published_runs)
+        with coordinator.transaction() as connection:
+            self.assertIsNone(coordinator._owner(connection))
+
+    def test_stale_release_and_published_states_reconcile_conservatively(self) -> None:
+        def policy_review(prompt, repo):
+            return review_execution(
+                "FAIL", "POLICY_AMBIGUITY", "stale-owner fixture"
+            )
+
+        terra = lambda prompt, repo: ProviderExecution(
+            ["codex"], 0, "human decision required", ""
+        )
+
+        released_runs = self.runs / "stale-released"
+        released_controller = self.controller(
+            policy_review,
+            terra=terra,
+            runs_dir=released_runs,
+        )
+        old = released_controller.new_run("009")
+        released_coordinator = orchestrator.TargetCoordinator(
+            self.repo, released_runs
+        )
+        released_coordinator._release_audit(
+            old,
+            "operator_released",
+            "release audit persisted before owner deletion",
+        )
+        replacement = released_controller.new_run("009")
+        self.assertNotEqual(replacement.run_id, old.run_id)
+        with released_coordinator.transaction() as connection:
+            self.assertEqual(
+                released_coordinator._owner(connection)["run_id"],
+                replacement.run_id,
+            )
+
+        pushed_runs = self.runs / "stale-published"
+        pushed_controller = self.controller(
+            policy_review,
+            terra=terra,
+            runs_dir=pushed_runs,
+        )
+        pushed = pushed_controller.new_run("009")
+        pushed.stage = "pushed_awaiting_merge"
+        pushed.commit_hash = git(self.repo, "rev-parse", "HEAD")
+        orchestrator.persist(pushed, pushed_runs)
+        successor = pushed_controller.new_run("009")
+        finalized = orchestrator.load_run(pushed.run_id, pushed_runs)
+        self.assertEqual(finalized.target_ownership.release_reason, "published")
+        self.assertEqual(successor.stage, "blocked_policy_ambiguity")
+
+    def test_unknown_owner_and_invalid_database_fail_before_provider(self) -> None:
+        scenarios = ("missing", "corrupt", "identity", "audit")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                runs_dir = self.runs / f"unknown-{scenario}"
+                calls = 0
+
+                def policy_review(prompt, repo):
+                    nonlocal calls
+                    calls += 1
+                    return review_execution(
+                        "FAIL", "POLICY_AMBIGUITY", "owner fixture"
+                    )
+
+                controller = self.controller(
+                    policy_review,
+                    terra=lambda prompt, repo: ProviderExecution(
+                        ["codex"], 0, "human decision required", ""
+                    ),
+                    runs_dir=runs_dir,
+                )
+                owner = controller.new_run("009")
+                path = runs_dir / f"{owner.run_id}.json"
+                calls_before = calls
+                if scenario == "missing":
+                    path.unlink()
+                elif scenario == "corrupt":
+                    path.write_text("{not-json", encoding="utf-8")
+                elif scenario == "identity":
+                    owner.target_ownership.canonical_repo = str(
+                        Path(self.temp.name) / "different-repo"
+                    )
+                    orchestrator.persist(owner, runs_dir)
+                else:
+                    owner.target_ownership.acquired_at = (
+                        "2026-08-02T00:00:00+00:00"
+                    )
+                    orchestrator.persist(owner, runs_dir)
+
+                with self.assertRaises(orchestrator.ControllerError):
+                    controller.new_run("009")
+                self.assertEqual(calls, calls_before)
+
+        for scenario in ("corrupt", "wrong-schema"):
+            with self.subTest(database=scenario):
+                runs_dir = self.runs / f"database-{scenario}"
+                coordinator = orchestrator.TargetCoordinator(self.repo, runs_dir)
+                coordinator.database.parent.mkdir(parents=True, exist_ok=True)
+                if scenario == "corrupt":
+                    coordinator.database.write_bytes(b"not a sqlite database")
+                else:
+                    connection = orchestrator.sqlite3.connect(coordinator.database)
+                    connection.execute(
+                        "CREATE TABLE coordination_meta ("
+                        "singleton INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL)"
+                    )
+                    connection.execute(
+                        "INSERT INTO coordination_meta VALUES (1, 999)"
+                    )
+                    connection.commit()
+                    connection.close()
+                calls = 0
+
+                def unexpected(prompt, repo):
+                    nonlocal calls
+                    calls += 1
+                    return self.passing_sonnet(prompt, repo)
+
+                with self.assertRaises(orchestrator.ControllerError):
+                    self.controller(unexpected, runs_dir=runs_dir).new_run("009")
+                self.assertEqual(calls, 0)
+                self.assertEqual(list(runs_dir.glob("*.json")), [])
+
+    def test_transaction_cleanup_on_exception_and_abrupt_child_exit(self) -> None:
+        run = self.controller(
+            lambda prompt, repo: review_execution(
+                "FAIL", "POLICY_AMBIGUITY", "crash fixture"
+            ),
+            terra=lambda prompt, repo: ProviderExecution(
+                ["codex"], 0, "human decision required", ""
+            ),
+        ).new_run("009")
+        coordinator = orchestrator.TargetCoordinator(self.repo, self.runs)
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic crash"):
+            with coordinator.transaction():
+                raise RuntimeError("synthetic crash")
+        with coordinator.transaction() as connection:
+            self.assertEqual(coordinator._owner(connection)["run_id"], run.run_id)
+
+        source = (
+            "import os,sys\n"
+            "from pathlib import Path\n"
+            "import orchestrator\n"
+            "coordinator = orchestrator.TargetCoordinator("
+            "Path(sys.argv[1]), Path(sys.argv[2]))\n"
+            "with coordinator.transaction():\n"
+            "    os._exit(17)\n"
+        )
+        child = subprocess.run(
+            [sys.executable, "-c", source, str(self.repo), str(self.runs)],
+            cwd=Path(__file__).parent,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(child.returncode, 17, child.stderr)
+        with coordinator.transaction() as connection:
+            self.assertEqual(coordinator._owner(connection)["run_id"], run.run_id)
+
+    def test_claim_crash_boundaries_and_writer_owner_cannot_be_bypassed(self) -> None:
+        orphan_runs = self.runs / "claim-rollback"
+        orphan = WorkflowRun(
+            run_id="claim-rollback-orphan",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Claim rollback fixture.",
+            repo=orchestrator.repo_state(self.repo),
+        )
+        coordinator = orchestrator.TargetCoordinator(self.repo, orphan_runs)
+        original_claim = coordinator._claim_legacy
+
+        def crash_after_claim(connection, run):
+            original_claim(connection, run)
+            raise RuntimeError("crash before owner commit")
+
+        with patch.object(
+            coordinator,
+            "_claim_legacy",
+            side_effect=crash_after_claim,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "before owner commit"):
+                coordinator.claim_legacy(orphan)
+        with coordinator.transaction() as connection:
+            self.assertIsNone(coordinator._owner(connection))
+        self.assertIsNotNone(
+            orchestrator.load_run(orphan.run_id, orphan_runs).target_ownership
+        )
+
+        later = self.controller(
+            lambda prompt, repo: review_execution(
+                "FAIL", "POLICY_AMBIGUITY", "later clean claimant"
+            ),
+            terra=lambda prompt, repo: ProviderExecution(
+                ["codex"], 0, "human decision required", ""
+            ),
+            runs_dir=orphan_runs,
+        ).new_run("009")
+        self.assertEqual(later.stage, "blocked_policy_ambiguity")
+
+        committed_runs = self.runs / "claim-committed"
+        created = WorkflowRun(
+            run_id="claim-committed-before-provider",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Committed claim fixture.",
+            repo=orchestrator.repo_state(self.repo),
+        )
+        orchestrator.persist(created, committed_runs)
+        committed_coordinator = orchestrator.TargetCoordinator(
+            self.repo, committed_runs
+        )
+        committed_coordinator.claim_legacy(created)
+        with committed_coordinator.transaction() as connection:
+            self.assertEqual(
+                committed_coordinator._owner(connection)["run_id"],
+                created.run_id,
+            )
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "blocked or declined",
+        ):
+            self.controller(
+                self.passing_sonnet,
+                runs_dir=committed_runs,
+            ).release_target(created.run_id, "not yet releasable")
+
+        resumed = self.controller(
+            lambda prompt, repo: review_execution(
+                "FAIL", "POLICY_AMBIGUITY", "same owner resumes"
+            ),
+            terra=lambda prompt, repo: ProviderExecution(
+                ["codex"], 0, "human decision required", ""
+            ),
+            runs_dir=committed_runs,
+        ).resume(created.run_id)
+        self.assertEqual(resumed.stage, "blocked_policy_ambiguity")
+
+        writer_runs = self.runs / "writer-owner"
+        writer = WorkflowRun(
+            run_id="writer-block-owner",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Writer ownership fixture.",
+            repo=orchestrator.repo_state(self.repo),
+            stage="blocked_writer_retry_required",
+        )
+        orchestrator.persist(writer, writer_runs)
+        claimed_writer = self.controller(
+            self.passing_sonnet,
+            runs_dir=writer_runs,
+        ).resume(writer.run_id)
+        self.assertIsNotNone(claimed_writer.target_ownership)
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "unresolved run",
+        ):
+            self.controller(
+                self.passing_sonnet,
+                runs_dir=writer_runs,
+            ).new_run("009")
+
+    def test_legacy_claim_round_trip_reporting_and_scope_boundaries(self) -> None:
+        legacy_runs = self.runs / "legacy"
+        legacy = WorkflowRun(
+            run_id="legacy-unowned",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Legacy schema-six fixture.",
+            repo=orchestrator.repo_state(self.repo),
+            stage="blocked_provider_failure",
+        )
+        path = orchestrator.persist(legacy, legacy_runs)
+        before = path.read_bytes()
+        loaded = orchestrator.load_run(legacy.run_id, legacy_runs)
+        report = orchestrator._run_report(loaded)
+        self.assertEqual(report["target_ownership_state"], "legacy")
+        self.assertIsNone(report["target_key"])
+        self.assertEqual(path.read_bytes(), before)
+
+        resumed = self.controller(
+            self.passing_sonnet,
+            runs_dir=legacy_runs,
+        ).resume(legacy.run_id)
+        self.assertEqual(resumed.stage, "blocked_provider_failure")
+        self.assertIsNotNone(resumed.target_ownership)
+        self.assertEqual(
+            orchestrator._run_report(resumed)["target_ownership_state"],
+            "active",
+        )
+
+        released = TargetOwnership.model_validate(
+            {
+                **resumed.target_ownership.model_dump(),
+                "released_at": "2026-08-02T00:01:00+00:00",
+                "release_reason": "operator_released",
+                "release_note": "bounded audit note",
+            }
+        )
+        self.assertEqual(
+            TargetOwnership.model_validate_json(
+                released.model_dump_json()
+            ).model_dump(),
+            released.model_dump(),
+        )
+
+        coordinator = orchestrator.TargetCoordinator(self.repo, legacy_runs)
+        self.assertEqual(coordinator.database.parent, legacy_runs / ".target-locks")
+        source = Path(orchestrator.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("flock", source)
+        self.assertNotIn("force-unlock", source)
+        self.assertIn("JOBS_REPO", source)
+        self.assertTrue((Path(__file__).parent / "src/jobs_orchestrator").is_dir())
 
 
 class ProviderFailureContractTests(unittest.TestCase):
