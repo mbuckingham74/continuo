@@ -8,6 +8,7 @@ import re
 import subprocess
 import uuid
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -16,7 +17,20 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from models import GitRecord, PolicyDecision, ProviderRecord, RepoState, ReviewResult, WorkflowRun
+from models import (
+    GitRecord,
+    PolicyDecision,
+    ProviderCapability,
+    ProviderRecord,
+    RepoState,
+    ReviewResult,
+    WorkflowRun,
+    WriterAttemptPurpose,
+    WriterAttemptStage,
+    WriterAttemptState,
+    WriterRecoveryAction,
+    WriterRecoveryDecision,
+)
 from providers import (
     DEFAULT_REPO,
     ProviderExecution,
@@ -240,7 +254,31 @@ def _record_provider(
     purpose: str,
     provider: str,
     execution: ProviderExecution,
+    *,
+    capability: ProviderCapability,
+    repository_fingerprint_before: str | None = None,
+    repository_fingerprint_after: str | None = None,
 ) -> ProviderExecution:
+    if execution.capability not in {None, capability}:
+        raise ControllerError(
+            f"provider execution capability mismatch: expected {capability}, "
+            f"received {execution.capability}"
+        )
+    execution = replace(
+        execution,
+        capability=capability,
+        repository_fingerprint_before=repository_fingerprint_before,
+        repository_fingerprint_after=repository_fingerprint_after,
+        attempts=tuple(
+            replace(
+                attempt,
+                capability=capability,
+                repository_fingerprint_before=repository_fingerprint_before,
+                repository_fingerprint_after=repository_fingerprint_after,
+            )
+            for attempt in execution.attempts
+        ),
+    )
     execution = (
         normalize_sonnet_execution(execution)
         if provider == "Sonnet 5 High"
@@ -260,6 +298,13 @@ def _record_provider(
                     failure_kind=attempt.failure_kind,
                     failure_source=attempt.failure_source,
                     failure_code=attempt.failure_code,
+                    capability=attempt.capability,
+                    repository_fingerprint_before=(
+                        attempt.repository_fingerprint_before
+                    ),
+                    repository_fingerprint_after=(
+                        attempt.repository_fingerprint_after
+                    ),
                     retry_scheduled=attempt.retry_scheduled,
                 )
             )
@@ -277,6 +322,13 @@ def _record_provider(
             failure_kind=execution.failure_kind,
             failure_source=execution.failure_source,
             failure_code=execution.failure_code,
+            capability=execution.capability,
+            repository_fingerprint_before=(
+                execution.repository_fingerprint_before
+            ),
+            repository_fingerprint_after=(
+                execution.repository_fingerprint_after
+            ),
         )
     )
     return execution
@@ -321,6 +373,13 @@ def _report_review_history(run: WorkflowRun) -> list[ReviewResult]:
             failure_kind=record.failure_kind,
             failure_source=record.failure_source,
             failure_code=record.failure_code,
+            capability=record.capability,
+            repository_fingerprint_before=(
+                record.repository_fingerprint_before
+            ),
+            repository_fingerprint_after=(
+                record.repository_fingerprint_after
+            ),
         )
         try:
             history.append(parse_sonnet_review(execution))
@@ -389,6 +448,10 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
         "distinct_defects": len(defect_keys),
         "sol_escalations": provider_counts.get("Sol High", 0),
         "policy_decisions": len(run.policy_decisions),
+        "writer_recovery_decisions": len(run.writer_recovery_decisions),
+        "pending_writer_state": (
+            run.stage if run.stage.startswith("blocked_writer_") else None
+        ),
         "verification_runs": verification_runs,
         "final_review": (
             run.implementation_review.status
@@ -460,6 +523,15 @@ def _print_run_report(run: WorkflowRun) -> None:
         if len(text) > 110:
             text = text[:107] + "..."
         console.print(f"  {decision.decision_id}: {text}")
+
+    console.print(
+        "Writer recovery decisions: "
+        f"{report['writer_recovery_decisions']}"
+    )
+    if report["pending_writer_state"]:
+        console.print(
+            f"Pending writer state: {report['pending_writer_state']}"
+        )
 
     final_review = report["final_review"] or "not available"
     console.print(f"Final review: {final_review}")
@@ -608,6 +680,13 @@ def _implementation_review_history(run: WorkflowRun) -> list[ReviewResult]:
                     failure_kind=record.failure_kind,
                     failure_source=record.failure_source,
                     failure_code=record.failure_code,
+                    capability=record.capability,
+                    repository_fingerprint_before=(
+                        record.repository_fingerprint_before
+                    ),
+                    repository_fingerprint_after=(
+                        record.repository_fingerprint_after
+                    ),
                 )
             )
         except Exception:
@@ -805,6 +884,94 @@ class Controller:
         self._save(run)
         return run
 
+    def recover_writer(
+        self,
+        run_id: str,
+        action: WriterRecoveryAction,
+        note: str,
+    ) -> WorkflowRun:
+        run = load_run(run_id, self.runs_dir)
+        if run.stage not in {
+            "blocked_writer_retry_required",
+            "blocked_writer_partial_changes",
+            "blocked_writer_state_unknown",
+        }:
+            raise ControllerError(
+                "writer recovery requires a blocked writer-recovery stage"
+            )
+        active = run.active_writer_attempt
+        if active is None:
+            raise ControllerError(
+                "writer recovery requires durable pre-attempt evidence"
+            )
+        prompt = run.provider_resume_prompt
+        if not prompt:
+            raise ControllerError("writer recovery requires the saved writer prompt")
+        note = note.strip()
+        if not note:
+            raise ControllerError("writer recovery note cannot be empty")
+        if len(note) > 1000:
+            raise ControllerError("writer recovery note exceeds 1000 characters")
+        if action not in {"retry_restored", "adopt_current"}:
+            raise ControllerError("unsupported writer recovery action")
+
+        files, fingerprint = self._writer_snapshot(run)
+        if action == "retry_restored":
+            if fingerprint != active.pre_fingerprint:
+                raise ControllerError(
+                    "retry-restored requires the exact saved pre-attempt state"
+                )
+        elif fingerprint == active.pre_fingerprint or not files:
+            raise ControllerError(
+                "adopt-current requires trustworthy changes beyond the "
+                "saved pre-attempt state"
+            )
+
+        run.writer_recovery_decisions.append(
+            WriterRecoveryDecision(
+                decision_id=(
+                    f"writer-recovery-{len(run.writer_recovery_decisions) + 1:02d}"
+                ),
+                decided_at=datetime.now(timezone.utc).isoformat(),
+                action=action,
+                note=note,
+                writer_attempt_id=active.attempt_id,
+                stage=active.stage,
+                purpose=active.purpose,
+                pre_fingerprint=active.pre_fingerprint,
+                saved_post_fingerprint=active.post_fingerprint,
+                observed_fingerprint=fingerprint,
+                observed_changed_files=files,
+            )
+        )
+
+        if action == "retry_restored":
+            self._arm_writer_attempt(
+                run,
+                active.stage,
+                active.purpose,
+                prompt,
+                files,
+                fingerprint,
+            )
+            if not self._execute_armed_writer(run):
+                return run
+            return self._run_from(run)
+
+        completed_stage = (
+            "correction_completed"
+            if active.stage == "correcting"
+            else "implementation_completed"
+        )
+        self._clear_provider(run)
+        run.active_writer_attempt = None
+        run.stage = completed_stage
+        run.last_error = None
+        self._save(run)
+        if not self._verify(run):
+            return run
+        return self._review_and_correct(run)
+
     def _block(self, run: WorkflowRun, stage: str, message: str) -> WorkflowRun:
         run.stage = stage
         run.last_error = message
@@ -906,7 +1073,11 @@ class Controller:
         )
         execution = provider(prompt, self.repo)
         execution = _record_provider(
-            run, purpose, provider_name, execution
+            run,
+            purpose,
+            provider_name,
+            execution,
+            capability="read_only",
         )
         self._save(run)
 
@@ -941,6 +1112,9 @@ class Controller:
                 "provider failure lacks enough saved context for safe resumption",
             )
 
+        if stage in {"implementing", "correcting"}:
+            return self._observe_unrecorded_writer(run)
+
         provider_map = {
             "terra_resolving": (
                 "policy clarification",
@@ -962,16 +1136,6 @@ class Controller:
                 "Sonnet 5 High",
                 self.sonnet,
             ),
-            "implementing": (
-                "implementation",
-                "Luna High",
-                self.luna,
-            ),
-            "correcting": (
-                "correction",
-                "Luna High",
-                self.luna,
-            ),
         }
 
         if stage not in provider_map:
@@ -991,7 +1155,11 @@ class Controller:
         )
         execution = provider(prompt, self.repo)
         execution = _record_provider(
-            run, purpose, provider_name, execution
+            run,
+            purpose,
+            provider_name,
+            execution,
+            capability="read_only",
         )
         self._save(run)
 
@@ -1030,6 +1198,7 @@ class Controller:
             "policy clarification",
             "Terra High",
             execution,
+            capability="read_only",
         )
         self._save(run)
 
@@ -1080,6 +1249,7 @@ class Controller:
             purpose,
             "Sonnet 5 High",
             execution,
+            capability="read_only",
         )
         self._save(run)
 
@@ -1166,10 +1336,156 @@ class Controller:
         self._save(run)
         return True
 
-    def _implement(self, run: WorkflowRun, correction: bool = False) -> bool:
-        run.stage = "correcting" if correction else "implementing"
-        label = "Correction" if correction else "Implementation"
+    def _writer_snapshot(self, run: WorkflowRun) -> tuple[list[str], str]:
+        current = repo_state(self.repo)
+        if current.repo != run.repo.repo:
+            raise ControllerError(
+                "writer recovery refused: configured repository differs from saved run"
+            )
+        if (
+            current.branch != run.repo.branch
+            or current.head != run.repo.head
+            or current.origin != run.repo.origin
+        ):
+            raise ControllerError(
+                "writer recovery refused: branch, HEAD, or origin changed"
+            )
+        files = changed_files(self.repo)
+        return files, working_tree_fingerprint(self.repo, files)
 
+    def _arm_writer_attempt(
+        self,
+        run: WorkflowRun,
+        stage: WriterAttemptStage,
+        purpose: WriterAttemptPurpose,
+        prompt: str,
+        files: list[str],
+        fingerprint: str,
+    ) -> None:
+        run.stage = stage
+        run.last_error = None
+        self._arm_provider(run, stage, prompt)
+        run.active_writer_attempt = WriterAttemptState(
+            attempt_id=f"writer-{uuid.uuid4().hex[:12]}",
+            stage=stage,
+            purpose=purpose,
+            pre_fingerprint=fingerprint,
+            pre_changed_files=files,
+        )
+        self._save(run)
+
+    def _block_writer_state(
+        self,
+        run: WorkflowRun,
+        detail: str,
+    ) -> WorkflowRun:
+        active = run.active_writer_attempt
+        if active is None or active.inspection_error:
+            stage = "blocked_writer_state_unknown"
+            state_detail = "repository state could not be determined"
+        elif active.post_fingerprint == active.pre_fingerprint:
+            stage = "blocked_writer_retry_required"
+            state_detail = "repository matches the saved pre-attempt state"
+        else:
+            stage = "blocked_writer_partial_changes"
+            state_detail = "repository differs from the saved pre-attempt state"
+        return self._block(
+            run,
+            stage,
+            f"{detail}; {state_detail}; ordinary resume will not invoke Luna",
+        )
+
+    def _observe_unrecorded_writer(self, run: WorkflowRun) -> WorkflowRun:
+        active = run.active_writer_attempt
+        if active is None:
+            return self._block(
+                run,
+                "blocked_writer_state_unknown",
+                "legacy or interrupted writer stage lacks pre-attempt evidence; "
+                "ordinary resume will not invoke Luna",
+            )
+        try:
+            files, fingerprint = self._writer_snapshot(run)
+            active.post_changed_files = files
+            active.post_fingerprint = fingerprint
+            active.inspection_error = None
+        except ControllerError as exc:
+            active.inspection_error = str(exc)[:1000]
+        self._save(run)
+        return self._block_writer_state(
+            run,
+            "writer outcome was not durably recorded",
+        )
+
+    def _execute_armed_writer(self, run: WorkflowRun) -> bool:
+        active = run.active_writer_attempt
+        prompt = run.provider_resume_prompt
+        if active is None or not prompt:
+            self._block(
+                run,
+                "blocked_writer_state_unknown",
+                "writer attempt lacks durable state or prompt",
+            )
+            return False
+
+        label = "Correction" if active.stage == "correcting" else "Implementation"
+        console.print(f"[cyan]Stage:[/cyan] {label} — Luna High")
+        execution = self.luna(prompt, self.repo)
+
+        post_files: list[str] | None = None
+        post_fingerprint: str | None = None
+        try:
+            post_files, post_fingerprint = self._writer_snapshot(run)
+            active.post_changed_files = post_files
+            active.post_fingerprint = post_fingerprint
+            active.inspection_error = None
+        except ControllerError as exc:
+            active.inspection_error = str(exc)[:1000]
+
+        execution = _record_provider(
+            run,
+            active.purpose,
+            "Luna High",
+            execution,
+            capability="workspace_write",
+            repository_fingerprint_before=active.pre_fingerprint,
+            repository_fingerprint_after=post_fingerprint,
+        )
+        active.provider_record_index = len(run.provider_runs) - 1
+        self._save(run)
+
+        if active.inspection_error:
+            self._block_writer_state(
+                run,
+                "writer returned but repository inspection failed: "
+                + active.inspection_error,
+            )
+            return False
+        if execution_failed(execution):
+            self._block_writer_state(
+                run,
+                f"Luna High failed during {active.purpose}",
+            )
+            return False
+
+        completed_stage = (
+            "correction_completed"
+            if active.stage == "correcting"
+            else "implementation_completed"
+        )
+        self._clear_provider(run)
+        run.active_writer_attempt = None
+        run.stage = completed_stage
+        self._save(run)
+        return self._verify(run)
+
+    def _implement(self, run: WorkflowRun, correction: bool = False) -> bool:
+        stage: WriterAttemptStage = (
+            "correcting" if correction else "implementing"
+        )
+        purpose: WriterAttemptPurpose = (
+            "correction" if correction else "implementation"
+        )
         prompt = _task_prompt(run)
         if correction:
             prompt += (
@@ -1188,40 +1504,24 @@ class Controller:
                     "correction:\n"
                     + run.sol_guidance
                 )
-
-        self._arm_provider(run, run.stage, prompt)
-        self._save(run)
-
-        console.print(
-            f"[cyan]Stage:[/cyan] {label} — Luna High"
-        )
-        execution = self.luna(prompt, self.repo)
-        purpose = "correction" if correction else "implementation"
-        execution = _record_provider(
-            run,
-            purpose,
-            "Luna High",
-            execution,
-        )
-        self._save(run)
-
-        if execution_failed(execution):
-            self._block_provider(
+        try:
+            files, fingerprint = self._writer_snapshot(run)
+        except ControllerError as exc:
+            self._block(
                 run,
-                "Luna High",
-                purpose,
-                execution,
+                "blocked_writer_state_unknown",
+                f"writer pre-attempt repository inspection failed: {exc}",
             )
             return False
-
-        self._clear_provider(run)
-        run.stage = (
-            "correction_completed"
-            if correction
-            else "implementation_completed"
+        self._arm_writer_attempt(
+            run,
+            stage,
+            purpose,
+            prompt,
+            files,
+            fingerprint,
         )
-        self._save(run)
-        return self._verify(run)
+        return self._execute_armed_writer(run)
 
     def _escalate_to_sol(
         self,
@@ -1248,6 +1548,7 @@ class Controller:
             "escalation guidance",
             "Sol High",
             execution,
+            capability="read_only",
         )
         self._save(run)
 
@@ -1454,6 +1755,28 @@ class Controller:
 
     def resume(self, run_id: str) -> WorkflowRun:
         run = load_run(run_id, self.runs_dir)
+
+        if run.stage in {
+            "blocked_writer_retry_required",
+            "blocked_writer_partial_changes",
+            "blocked_writer_state_unknown",
+        }:
+            console.print(f"Stage: {run.stage}")
+            console.print(
+                "Writer recovery requires the explicit recover-writer command; "
+                "ordinary resume will not invoke Luna."
+            )
+            return run
+
+        if run.stage in {"implementing", "correcting"}:
+            return self._recover_provider_stage(run)
+
+        if (
+            run.stage in _PROVIDER_RESUMABLE_BLOCKS
+            and run.provider_resume_stage in {"implementing", "correcting"}
+        ):
+            return self._resume_blocked_provider(run)
+
         self._resume_guard(run)
 
         if (
@@ -1476,12 +1799,103 @@ class Controller:
         if run.stage.startswith("blocked") or run.stage == "pushed_awaiting_merge":
             console.print(f"Stage: {run.stage}")
             return run
-        if run.stage in {"spec_reviewing", "implementing", "correcting", "reviewing", "terra_resolving", "sol_escalating"}:
+        if run.stage in {
+            "spec_reviewing",
+            "reviewing",
+            "terra_resolving",
+            "sol_escalating",
+        }:
             return self._recover_provider_stage(run)
         return self._run_from(run)
 
+    def _recover_saved_writer(self, run: WorkflowRun) -> WorkflowRun:
+        active = run.active_writer_attempt
+        if active is None:
+            return self._block(
+                run,
+                "blocked_writer_state_unknown",
+                "legacy or interrupted writer stage lacks pre-attempt evidence; "
+                "ordinary resume will not invoke Luna",
+            )
+        index = active.provider_record_index
+        if index is None:
+            return self._observe_unrecorded_writer(run)
+        if index >= len(run.provider_runs):
+            active.inspection_error = "saved writer provider record is missing"
+            self._save(run)
+            return self._block_writer_state(
+                run,
+                "writer audit linkage is invalid",
+            )
+        record = run.provider_runs[index]
+        if (
+            record.provider != "Luna High"
+            or record.purpose != active.purpose
+            or record.capability != "workspace_write"
+        ):
+            active.inspection_error = "saved writer provider record does not match"
+            self._save(run)
+            return self._block_writer_state(
+                run,
+                "writer audit linkage is invalid",
+            )
+        if active.post_fingerprint is None and active.inspection_error is None:
+            try:
+                files, fingerprint = self._writer_snapshot(run)
+                active.post_changed_files = files
+                active.post_fingerprint = fingerprint
+            except ControllerError as exc:
+                active.inspection_error = str(exc)[:1000]
+            self._save(run)
+
+        execution = normalize_provider_execution(
+            ProviderExecution(
+                command=record.command,
+                returncode=record.returncode,
+                stdout=record.stdout,
+                stderr=record.stderr,
+                duration_seconds=record.duration_seconds,
+                failure_kind=record.failure_kind,
+                failure_source=record.failure_source,
+                failure_code=record.failure_code,
+                capability=record.capability,
+                repository_fingerprint_before=(
+                    record.repository_fingerprint_before
+                ),
+                repository_fingerprint_after=(
+                    record.repository_fingerprint_after
+                ),
+            )
+        )
+        if active.inspection_error:
+            return self._block_writer_state(
+                run,
+                "saved writer result has unknown repository state",
+            )
+        if execution_failed(execution):
+            return self._block_writer_state(
+                run,
+                f"Luna High failed during {active.purpose}",
+            )
+
+        completed_stage = (
+            "correction_completed"
+            if active.stage == "correcting"
+            else "implementation_completed"
+        )
+        self._clear_provider(run)
+        run.active_writer_attempt = None
+        run.stage = completed_stage
+        self._save(run)
+        if not self._verify(run):
+            return run
+        return self._review_and_correct(run)
+
     def _recover_provider_stage(self, run: WorkflowRun) -> WorkflowRun:
         """Consume a provider result already persisted before a process crash."""
+
+        if run.stage in {"implementing", "correcting"}:
+            return self._recover_saved_writer(run)
 
         if not run.provider_runs:
             return self._block(run, "blocked_interrupted_provider", "provider stage was interrupted before output was recorded")
@@ -1491,8 +1905,6 @@ class Controller:
             "sol_escalating": ("escalation guidance", "Sol High"),
             "spec_reviewing": ("specification", "Sonnet 5 High"),
             "reviewing": ("implementation", "Sonnet 5 High"),
-            "implementing": ("implementation", "Luna High"),
-            "correcting": ("correction", "Luna High"),
         }[run.stage]
         if (record.purpose, record.provider) != expected_provider_run:
             return self._block(
@@ -1509,6 +1921,13 @@ class Controller:
             failure_kind=record.failure_kind,
             failure_source=record.failure_source,
             failure_code=record.failure_code,
+            capability=record.capability,
+            repository_fingerprint_before=(
+                record.repository_fingerprint_before
+            ),
+            repository_fingerprint_after=(
+                record.repository_fingerprint_after
+            ),
         )
         execution = (
             normalize_sonnet_execution(execution)
@@ -1577,21 +1996,8 @@ class Controller:
             run.stage = "implementation_reviewed"
             self._save(run)
             return self._review_and_correct(run)
-        if run.stage == "correcting":
-            run.stage = "correction_completed"
-            self._save(run)
-            if execution_failed(execution):
-                return self._block(run, "blocked_provider_failure", "Luna failed during correction")
-            if not self._verify(run):
-                return run
-            return self._review_and_correct(run)
-        run.stage = "implementation_completed"
-        self._save(run)
-        if execution_failed(execution):
-            return self._block(run, "blocked_provider_failure", "Luna failed during implementation")
-        if not self._verify(run):
-            return run
-        return self._review_and_correct(run)
+
+        raise ControllerError(f"unsupported recoverable provider stage: {run.stage}")
 
 
 def _handle_error(action: Callable[[], object]) -> None:
@@ -1627,6 +2033,46 @@ def resume(
         result = Controller(configured_repo(repo) if repo else Path(saved.repo.repo)).resume(run_id)
         console.print(f"Run {result.run_id}: {result.stage}")
     _handle_error(action)
+
+
+@app.command("recover-writer")
+def recover_writer_command(
+    run_id: str = typer.Argument(..., help="Saved run awaiting writer recovery."),
+    action: str = typer.Option(
+        ...,
+        "--action",
+        help="Recovery action: retry-restored or adopt-current.",
+    ),
+    note: str = typer.Option(
+        ...,
+        "--note",
+        help="Required operator rationale recorded in the run audit.",
+    ),
+    repo: Path | None = typer.Option(
+        None,
+        "--repo",
+        help="Override the jobs repository path.",
+    ),
+) -> None:
+    """Explicitly recover a blocked workspace-writing provider attempt."""
+
+    def recover() -> None:
+        actions: dict[str, WriterRecoveryAction] = {
+            "retry-restored": "retry_restored",
+            "adopt-current": "adopt_current",
+        }
+        if action not in actions:
+            raise ControllerError(
+                "--action must be retry-restored or adopt-current"
+            )
+        saved = load_run(run_id)
+        controller = Controller(
+            configured_repo(repo) if repo else Path(saved.repo.repo)
+        )
+        result = controller.recover_writer(run_id, actions[action], note)
+        console.print(f"Run {result.run_id}: {result.stage}")
+
+    _handle_error(recover)
 
 
 @app.command("approve-policy")

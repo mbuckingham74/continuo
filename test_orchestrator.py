@@ -14,7 +14,13 @@ from unittest.mock import patch
 
 import orchestrator
 import providers
-from models import RepoState, ReviewResult, WorkflowRun
+from models import (
+    RepoState,
+    ReviewResult,
+    WorkflowRun,
+    WriterAttemptState,
+    WriterRecoveryDecision,
+)
 from providers import ProviderExecution, build_luna_command, build_sol_command, build_sonnet_command
 
 
@@ -492,7 +498,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(resumed_after.stage, "commit_declined")
         self.assertEqual(luna_calls, calls_after_implementation)
 
-    def test_change_enumeration_failure_blocks_before_implementation_review(self) -> None:
+    def test_change_enumeration_failure_blocks_before_writer_invocation(self) -> None:
         sonnet_calls = 0
 
         def sonnet(prompt, repo):
@@ -507,10 +513,14 @@ class ControllerTests(unittest.TestCase):
         ):
             run = self.controller(sonnet, approval=lambda prompt: False).new_run("009")
 
-        self.assertEqual(run.stage, "blocked_unexpected_repo_state")
+        self.assertEqual(run.stage, "blocked_writer_state_unknown")
         self.assertEqual(sonnet_calls, 1)
-        self.assertFalse(run.verification["change_enumeration"])
-        self.assertIn("malformed porcelain fixture", run.verification["change_enumeration_error"])
+        self.assertNotIn("change_enumeration", run.verification)
+        self.assertIn("malformed porcelain fixture", run.last_error)
+        self.assertEqual(
+            [record.provider for record in run.provider_runs],
+            ["Sonnet 5 High"],
+        )
         self.assertEqual(run.git_operations, [])
 
     def test_staging_failure_is_audited_and_blocks_commit(self) -> None:
@@ -822,6 +832,7 @@ class ControllerTests(unittest.TestCase):
                 stderr="",
                 duration_seconds=12.5,
             ),
+            capability="workspace_write",
         )
         orchestrator._record_provider(
             run,
@@ -833,6 +844,7 @@ class ControllerTests(unittest.TestCase):
                 stdout="legacy review output",
                 stderr="",
             ),
+            capability="read_only",
         )
 
         report = orchestrator._run_report(run)
@@ -945,6 +957,7 @@ class ControllerTests(unittest.TestCase):
         execution = providers._run(
             ["claude"],
             self.repo,
+            capability="read_only",
             runner=runner,
             sleeper=lambda seconds: None,
         )
@@ -1156,6 +1169,7 @@ class ControllerTests(unittest.TestCase):
                     "import time; print('review partial', flush=True); time.sleep(60)",
                 ],
                 repo,
+                capability="read_only",
                 deadline_seconds=0.15,
                 term_grace_seconds=0.15,
                 poll_interval_seconds=0.02,
@@ -1188,6 +1202,7 @@ class ControllerTests(unittest.TestCase):
                     "import time; print('writer partial', flush=True); time.sleep(60)",
                 ],
                 repo,
+                capability="workspace_write",
                 deadline_seconds=0.15,
                 term_grace_seconds=0.15,
                 poll_interval_seconds=0.02,
@@ -1200,13 +1215,13 @@ class ControllerTests(unittest.TestCase):
         )
         run = controller.new_run("009")
 
-        self.assertEqual(run.stage, "blocked_provider_timeout")
+        self.assertEqual(run.stage, "blocked_writer_retry_required")
         self.assertEqual(luna_calls, 1)
         self.assertEqual(run.provider_runs[-1].failure_kind, "timeout")
         self.assertIn("writer partial", run.provider_runs[-1].stdout)
 
         resumed = controller.resume(run.run_id)
-        self.assertEqual(resumed.stage, "blocked_provider_timeout")
+        self.assertEqual(resumed.stage, "blocked_writer_retry_required")
         self.assertEqual(luna_calls, 1)
 
     def test_timeout_record_recovery_reconstructs_block_without_provider(self) -> None:
@@ -1361,6 +1376,7 @@ class ControllerTests(unittest.TestCase):
             "specification",
             "Sonnet 5 High",
             native_error,
+            capability="read_only",
         )
         self.assertTrue(providers.execution_failed(normalized))
         orchestrator.persist(run, self.runs)
@@ -1392,6 +1408,7 @@ class ControllerTests(unittest.TestCase):
             "specification",
             "Sonnet 5 High",
             malformed,
+            capability="read_only",
         )
         orchestrator.persist(malformed_run, self.runs)
 
@@ -1423,6 +1440,7 @@ class ControllerTests(unittest.TestCase):
             "specification",
             "Sonnet 5 High",
             success,
+            capability="read_only",
         )
         orchestrator.persist(success_run, self.runs)
 
@@ -1473,9 +1491,841 @@ class ControllerTests(unittest.TestCase):
 
         recovered = self.controller(self.passing_sonnet).resume(run.run_id)
 
-        self.assertEqual(recovered.stage, "blocked_provider_failure")
+        self.assertEqual(recovered.stage, "blocked_writer_state_unknown")
         self.assertEqual(recovered.provider_runs[-1].failure_kind, None)
         self.assertNotIn("implementation.py", orchestrator.changed_files(self.repo))
+
+    def test_writer_marker_precedes_call_and_success_records_exact_snapshots(self) -> None:
+        observed: dict[str, object] = {}
+        clean_fingerprint = orchestrator.working_tree_fingerprint(self.repo, [])
+
+        def luna(prompt, repo):
+            saved_path = next(self.runs.glob("*.json"))
+            saved = orchestrator.load_run(saved_path.stem, self.runs)
+            active = saved.active_writer_attempt
+            self.assertIsNotNone(active)
+            observed["stage"] = saved.stage
+            observed["prompt"] = saved.provider_resume_prompt
+            observed["attempt_id"] = active.attempt_id
+            observed["pre_files"] = active.pre_changed_files
+            observed["pre_fingerprint"] = active.pre_fingerprint
+            (repo / "implementation.py").write_text("# implementation\n")
+            return ProviderExecution(["codex"], 0, "implemented", "")
+
+        run = self.controller(
+            self.passing_sonnet,
+            luna=luna,
+            approval=lambda prompt: False,
+        ).new_run("009")
+
+        self.assertEqual(observed["stage"], "implementing")
+        self.assertEqual(observed["pre_files"], [])
+        self.assertEqual(observed["pre_fingerprint"], clean_fingerprint)
+        self.assertTrue(observed["prompt"])
+        self.assertEqual(run.stage, "commit_declined")
+        self.assertIsNone(run.active_writer_attempt)
+        writer = next(
+            record for record in run.provider_runs if record.provider == "Luna High"
+        )
+        self.assertEqual(writer.capability, "workspace_write")
+        self.assertEqual(
+            writer.repository_fingerprint_before,
+            clean_fingerprint,
+        )
+        self.assertEqual(
+            writer.repository_fingerprint_after,
+            orchestrator.working_tree_fingerprint(self.repo),
+        )
+        self.assertNotEqual(
+            writer.repository_fingerprint_before,
+            writer.repository_fingerprint_after,
+        )
+
+    def test_correction_snapshot_describes_existing_reviewed_changes(self) -> None:
+        sonnet_calls = 0
+        luna_calls = 0
+        correction_observation: dict[str, object] = {}
+
+        def sonnet(prompt, repo):
+            nonlocal sonnet_calls
+            sonnet_calls += 1
+            if sonnet_calls == 2:
+                return review_execution(
+                    "FAIL",
+                    "IMPLEMENTATION_DEFECT",
+                    "correct the fixture",
+                    "fixture-defect",
+                )
+            return review_execution("PASS", "PASS")
+
+        def luna(prompt, repo):
+            nonlocal luna_calls
+            luna_calls += 1
+            if luna_calls == 1:
+                (repo / "implementation.py").write_text("# first pass\n")
+            else:
+                saved_path = next(self.runs.glob("*.json"))
+                saved = orchestrator.load_run(saved_path.stem, self.runs)
+                active = saved.active_writer_attempt
+                self.assertIsNotNone(active)
+                correction_observation["stage"] = active.stage
+                correction_observation["purpose"] = active.purpose
+                correction_observation["files"] = active.pre_changed_files
+                correction_observation["fingerprint"] = active.pre_fingerprint
+                correction_observation["saved_fingerprint"] = (
+                    saved.working_tree_fingerprint
+                )
+                (repo / "correction.py").write_text("# correction\n")
+            return ProviderExecution(["codex"], 0, "implemented", "")
+
+        run = self.controller(
+            sonnet,
+            luna=luna,
+            approval=lambda prompt: False,
+        ).new_run("009")
+
+        self.assertEqual(run.stage, "commit_declined")
+        self.assertEqual(correction_observation["stage"], "correcting")
+        self.assertEqual(correction_observation["purpose"], "correction")
+        self.assertEqual(correction_observation["files"], ["implementation.py"])
+        self.assertEqual(
+            correction_observation["fingerprint"],
+            correction_observation["saved_fingerprint"],
+        )
+
+    def test_failed_writer_preserves_all_partial_path_states_without_cleanup(self) -> None:
+        tracked = self.repo / 'tracked "名称".txt'
+        staged = self.repo / "staged -> path.txt"
+        deleted = self.repo / "deleted path.txt"
+        rename_old = self.repo / "rename old.txt"
+        rename_new = self.repo / 'rename new 名称 " -> path.txt'
+        for path in (tracked, staged, deleted, rename_old):
+            path.write_text("base\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "writer path fixtures")
+
+        def luna(prompt, repo):
+            tracked.write_text("modified\n")
+            staged.write_text("staged modification\n")
+            git(repo, "add", "--", staged.name)
+            deleted.unlink()
+            rename_old.rename(rename_new)
+            git(repo, "add", "-A", "--", rename_old.name, rename_new.name)
+            (repo / 'untracked 名称 " -> file.txt').write_text("new\n")
+            return ProviderExecution(
+                ["codex"],
+                1,
+                "partial output",
+                "HTTP 401 Unauthorized",
+            )
+
+        controller = self.controller(self.passing_sonnet, luna=luna)
+        run = controller.new_run("009")
+
+        expected = sorted(
+            [
+                tracked.name,
+                staged.name,
+                deleted.name,
+                rename_old.name,
+                rename_new.name,
+                'untracked 名称 " -> file.txt',
+            ]
+        )
+        self.assertEqual(run.stage, "blocked_writer_partial_changes")
+        self.assertEqual(run.active_writer_attempt.post_changed_files, expected)
+        self.assertNotEqual(
+            run.active_writer_attempt.pre_fingerprint,
+            run.active_writer_attempt.post_fingerprint,
+        )
+        self.assertEqual(run.provider_runs[-1].failure_kind, "auth")
+        self.assertEqual(run.provider_runs[-1].failure_source, "stderr")
+        self.assertEqual(run.provider_runs[-1].failure_code, "401")
+        self.assertEqual(run.provider_runs[-1].capability, "workspace_write")
+        self.assertEqual(run.verification, {})
+        self.assertEqual(run.git_operations, [])
+        self.assertTrue(tracked.exists())
+        self.assertTrue(staged.exists())
+        self.assertFalse(deleted.exists())
+        self.assertFalse(rename_old.exists())
+        self.assertTrue(rename_new.exists())
+        self.assertTrue((self.repo / 'untracked 名称 " -> file.txt').exists())
+        worktrees = git(self.repo, "worktree", "list", "--porcelain")
+        self.assertEqual(worktrees.count("worktree "), 1)
+
+        before_resume = run.model_dump()
+        resumed = controller.resume(run.run_id)
+        self.assertEqual(resumed.stage, "blocked_writer_partial_changes")
+        self.assertEqual(resumed.model_dump(), before_resume)
+
+    def test_writer_post_inspection_failure_keeps_raw_attempt_and_unknown_state(self) -> None:
+        real_changed_files = orchestrator.changed_files
+        enumerations = 0
+
+        def fragile_changed_files(repo):
+            nonlocal enumerations
+            enumerations += 1
+            if enumerations == 2:
+                raise orchestrator.ControllerError("synthetic post-state failure")
+            return real_changed_files(repo)
+
+        def luna(prompt, repo):
+            (repo / "partial.py").write_text("# partial\n")
+            return ProviderExecution(
+                ["codex"],
+                1,
+                "raw writer output",
+                "Error: service unavailable",
+            )
+
+        with patch.object(
+            orchestrator,
+            "changed_files",
+            side_effect=fragile_changed_files,
+        ):
+            run = self.controller(self.passing_sonnet, luna=luna).new_run("009")
+
+        self.assertEqual(run.stage, "blocked_writer_state_unknown")
+        self.assertEqual(len(run.provider_runs), 2)
+        self.assertEqual(run.provider_runs[-1].stdout, "raw writer output")
+        self.assertEqual(run.provider_runs[-1].failure_kind, "unavailable")
+        self.assertIsNone(run.provider_runs[-1].repository_fingerprint_after)
+        self.assertIn(
+            "synthetic post-state failure",
+            run.active_writer_attempt.inspection_error,
+        )
+
+    def test_successful_noop_writer_uses_existing_no_changes_block(self) -> None:
+        run = self.controller(
+            self.passing_sonnet,
+            luna=lambda prompt, repo: ProviderExecution(
+                ["codex"], 0, "claimed success", ""
+            ),
+        ).new_run("009")
+
+        self.assertEqual(run.stage, "blocked_no_changes")
+        self.assertIsNone(run.active_writer_attempt)
+        self.assertEqual(run.provider_runs[-1].capability, "workspace_write")
+        self.assertEqual(
+            run.provider_runs[-1].repository_fingerprint_before,
+            run.provider_runs[-1].repository_fingerprint_after,
+        )
+
+    def test_retry_restored_requires_exact_state_and_audits_one_new_attempt(self) -> None:
+        first_calls = 0
+
+        def failed_luna(prompt, repo):
+            nonlocal first_calls
+            first_calls += 1
+            return ProviderExecution(
+                ["codex"], 1, "", "Error: service unavailable"
+            )
+
+        initial = self.controller(
+            self.passing_sonnet,
+            luna=failed_luna,
+        ).new_run("009")
+        self.assertEqual(initial.stage, "blocked_writer_retry_required")
+        old_attempt_id = initial.active_writer_attempt.attempt_id
+        saved_prompt = initial.provider_resume_prompt
+
+        external = self.repo / "operator-change.txt"
+        external.write_text("not restored\n")
+        retry_calls = 0
+
+        def retried_luna(prompt, repo):
+            nonlocal retry_calls
+            retry_calls += 1
+            saved = orchestrator.load_run(initial.run_id, self.runs)
+            self.assertNotEqual(
+                saved.active_writer_attempt.attempt_id,
+                old_attempt_id,
+            )
+            self.assertEqual(saved.provider_resume_prompt, saved_prompt)
+            self.assertNotIn("HTTP 503", prompt)
+            (repo / "implementation.py").write_text("# restored retry\n")
+            return ProviderExecution(["codex"], 0, "implemented", "")
+
+        controller = self.controller(
+            self.passing_sonnet,
+            luna=retried_luna,
+            approval=lambda prompt: False,
+        )
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "exact saved pre-attempt state",
+        ):
+            controller.recover_writer(
+                initial.run_id,
+                "retry_restored",
+                "HTTP 503: retry only after exact restore",
+            )
+        refused = orchestrator.load_run(initial.run_id, self.runs)
+        self.assertEqual(refused.stage, "blocked_writer_retry_required")
+        self.assertEqual(refused.writer_recovery_decisions, [])
+        self.assertEqual(retry_calls, 0)
+
+        external.unlink()
+        recovered = controller.recover_writer(
+            initial.run_id,
+            "retry_restored",
+            "HTTP 503: retry only after exact restore",
+        )
+
+        self.assertEqual(recovered.stage, "commit_declined")
+        self.assertEqual(first_calls, 1)
+        self.assertEqual(retry_calls, 1)
+        self.assertEqual(len(recovered.writer_recovery_decisions), 1)
+        decision = recovered.writer_recovery_decisions[0]
+        self.assertEqual(decision.action, "retry_restored")
+        self.assertEqual(decision.writer_attempt_id, old_attempt_id)
+        self.assertEqual(
+            decision.note,
+            "HTTP 503: retry only after exact restore",
+        )
+        writer_records = [
+            record
+            for record in recovered.provider_runs
+            if record.provider == "Luna High"
+        ]
+        self.assertEqual(len(writer_records), 2)
+        self.assertEqual(
+            [record.capability for record in writer_records],
+            ["workspace_write", "workspace_write"],
+        )
+
+    def test_adopt_current_audits_reconciled_state_without_writer_success(self) -> None:
+        writer_calls = 0
+
+        def failed_luna(prompt, repo):
+            nonlocal writer_calls
+            writer_calls += 1
+            (repo / "partial.py").write_text("# first partial\n")
+            return ProviderExecution(["codex"], 1, "partial", "failure")
+
+        initial = self.controller(
+            self.passing_sonnet,
+            luna=failed_luna,
+        ).new_run("009")
+        self.assertEqual(initial.stage, "blocked_writer_partial_changes")
+        saved_post = initial.active_writer_attempt.post_fingerprint
+        provider_count = len(initial.provider_runs)
+
+        (self.repo / "partial.py").write_text("# operator reconciled\n")
+        (self.repo / "reconciled.py").write_text("# chosen state\n")
+
+        def unexpected_luna(prompt, repo):
+            raise AssertionError("adopt-current must not invoke Luna")
+
+        recovered = self.controller(
+            self.passing_sonnet,
+            luna=unexpected_luna,
+            approval=lambda prompt: False,
+        ).recover_writer(
+            initial.run_id,
+            "adopt_current",
+            "Adopt reconciled diff; prompt says quota exceeded",
+        )
+
+        self.assertEqual(recovered.stage, "commit_declined")
+        self.assertEqual(writer_calls, 1)
+        self.assertEqual(len(recovered.provider_runs), provider_count + 1)
+        self.assertEqual(recovered.provider_runs[-1].provider, "Sonnet 5 High")
+        self.assertIsNone(recovered.active_writer_attempt)
+        decision = recovered.writer_recovery_decisions[-1]
+        self.assertEqual(decision.action, "adopt_current")
+        self.assertEqual(decision.saved_post_fingerprint, saved_post)
+        self.assertNotEqual(decision.observed_fingerprint, saved_post)
+        self.assertEqual(
+            decision.observed_changed_files,
+            ["partial.py", "reconciled.py"],
+        )
+        report = orchestrator._run_report(recovered)
+        self.assertEqual(report["writer_recovery_decisions"], 1)
+        self.assertEqual(report["provider_calls_total"], provider_count + 1)
+
+    def test_adopt_current_refuses_noop_unknown_and_identity_mismatch(self) -> None:
+        def unchanged_failure(prompt, repo):
+            return ProviderExecution(["codex"], 1, "", "failure")
+
+        run = self.controller(
+            self.passing_sonnet,
+            luna=unchanged_failure,
+        ).new_run("009")
+        controller = self.controller(self.passing_sonnet)
+
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "trustworthy changes",
+        ):
+            controller.recover_writer(run.run_id, "adopt_current", "no-op")
+
+        saved = orchestrator.load_run(run.run_id, self.runs)
+        saved.stage = "blocked_writer_state_unknown"
+        saved.active_writer_attempt.inspection_error = "prior inspection failed"
+        orchestrator.persist(saved, self.runs)
+        git(self.repo, "remote", "set-url", "origin", "https://example.invalid/other.git")
+
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "branch, HEAD, or origin changed",
+        ):
+            controller.recover_writer(
+                run.run_id,
+                "adopt_current",
+                "identity mismatch",
+            )
+
+        refused = orchestrator.load_run(run.run_id, self.runs)
+        self.assertEqual(refused.stage, "blocked_writer_state_unknown")
+        self.assertIsNotNone(refused.active_writer_attempt)
+        self.assertEqual(refused.writer_recovery_decisions, [])
+
+    def test_writer_crash_recovery_never_reinvokes_and_consumes_saved_success(self) -> None:
+        pre_files = orchestrator.changed_files(self.repo)
+        pre_fingerprint = orchestrator.working_tree_fingerprint(
+            self.repo,
+            pre_files,
+        )
+        provider_calls = 0
+
+        def unexpected_luna(prompt, repo):
+            nonlocal provider_calls
+            provider_calls += 1
+            raise AssertionError("writer crash recovery must not invoke Luna")
+
+        def interrupted_run(run_id):
+            return WorkflowRun(
+                run_id=run_id,
+                created_at="2026-08-02T00:00:00+00:00",
+                task_ref="009",
+                task_file="tasks/009-example.md",
+                task_sha256="0" * 64,
+                specification="Crash recovery fixture.",
+                repo=orchestrator.repo_state(self.repo),
+                stage="implementing",
+                provider_resume_stage="implementing",
+                provider_resume_prompt="saved writer prompt",
+                active_writer_attempt=WriterAttemptState(
+                    attempt_id=f"writer-{run_id}",
+                    stage="implementing",
+                    purpose="implementation",
+                    pre_fingerprint=pre_fingerprint,
+                    pre_changed_files=pre_files,
+                ),
+            )
+
+        unchanged = interrupted_run("crash-unchanged")
+        orchestrator.persist(unchanged, self.runs)
+        recovered_unchanged = self.controller(
+            self.passing_sonnet,
+            luna=unexpected_luna,
+        ).resume(unchanged.run_id)
+        self.assertEqual(
+            recovered_unchanged.stage,
+            "blocked_writer_retry_required",
+        )
+
+        (self.repo / "crash-partial.py").write_text("# partial\n")
+        post_files = orchestrator.changed_files(self.repo)
+        post_fingerprint = orchestrator.working_tree_fingerprint(
+            self.repo,
+            post_files,
+        )
+        partial = interrupted_run("crash-partial")
+        orchestrator.persist(partial, self.runs)
+        recovered_partial = self.controller(
+            self.passing_sonnet,
+            luna=unexpected_luna,
+        ).resume(partial.run_id)
+        self.assertEqual(
+            recovered_partial.stage,
+            "blocked_writer_partial_changes",
+        )
+
+        failed = interrupted_run("crash-failed-record")
+        failed.active_writer_attempt.post_fingerprint = post_fingerprint
+        failed.active_writer_attempt.post_changed_files = post_files
+        failed.active_writer_attempt.provider_record_index = 0
+        failed.provider_runs.append(
+            orchestrator.ProviderRecord(
+                provider="Luna High",
+                purpose="implementation",
+                command=["codex"],
+                returncode=1,
+                stderr="HTTP 503 Service Unavailable",
+                failure_kind="unavailable",
+                failure_source="stderr",
+                failure_code="503",
+                capability="workspace_write",
+                repository_fingerprint_before=pre_fingerprint,
+                repository_fingerprint_after=post_fingerprint,
+            )
+        )
+        orchestrator.persist(failed, self.runs)
+        recovered_failed = self.controller(
+            self.passing_sonnet,
+            luna=unexpected_luna,
+        ).resume(failed.run_id)
+        self.assertEqual(
+            recovered_failed.stage,
+            "blocked_writer_partial_changes",
+        )
+        self.assertEqual(recovered_failed.provider_runs[0].failure_kind, "unavailable")
+
+        success = interrupted_run("crash-success-record")
+        success.active_writer_attempt.post_fingerprint = post_fingerprint
+        success.active_writer_attempt.post_changed_files = post_files
+        success.active_writer_attempt.provider_record_index = 0
+        success.provider_runs.append(
+            orchestrator.ProviderRecord(
+                provider="Luna High",
+                purpose="implementation",
+                command=["codex"],
+                returncode=0,
+                stdout="implemented",
+                capability="workspace_write",
+                repository_fingerprint_before=pre_fingerprint,
+                repository_fingerprint_after=post_fingerprint,
+            )
+        )
+        orchestrator.persist(success, self.runs)
+        recovered_success = self.controller(
+            self.passing_sonnet,
+            luna=unexpected_luna,
+            approval=lambda prompt: False,
+        ).resume(success.run_id)
+        self.assertEqual(recovered_success.stage, "commit_declined")
+        self.assertIsNone(recovered_success.active_writer_attempt)
+        self.assertEqual(provider_calls, 0)
+
+    def test_recovery_decision_crash_states_resume_without_implicit_writer(self) -> None:
+        pre_files = orchestrator.changed_files(self.repo)
+        pre_fingerprint = orchestrator.working_tree_fingerprint(
+            self.repo,
+            pre_files,
+        )
+        calls = 0
+
+        def unexpected_luna(prompt, repo):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("resume must not invoke a recovery writer")
+
+        retry_crash = WorkflowRun(
+            run_id="retry-decision-crash",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Retry decision crash fixture.",
+            repo=orchestrator.repo_state(self.repo),
+            stage="implementing",
+            provider_resume_stage="implementing",
+            provider_resume_prompt="saved prompt",
+            active_writer_attempt=WriterAttemptState(
+                attempt_id="writer-new-retry",
+                stage="implementing",
+                purpose="implementation",
+                pre_fingerprint=pre_fingerprint,
+                pre_changed_files=pre_files,
+            ),
+            writer_recovery_decisions=[
+                WriterRecoveryDecision(
+                    decision_id="writer-recovery-01",
+                    decided_at="2026-08-02T00:01:00+00:00",
+                    action="retry_restored",
+                    note="decision saved before retry start",
+                    writer_attempt_id="writer-old-retry",
+                    stage="implementing",
+                    purpose="implementation",
+                    pre_fingerprint=pre_fingerprint,
+                    observed_fingerprint=pre_fingerprint,
+                    observed_changed_files=pre_files,
+                )
+            ],
+        )
+        orchestrator.persist(retry_crash, self.runs)
+        recovered_retry = self.controller(
+            self.passing_sonnet,
+            luna=unexpected_luna,
+        ).resume(retry_crash.run_id)
+        self.assertEqual(
+            recovered_retry.stage,
+            "blocked_writer_retry_required",
+        )
+        self.assertEqual(len(recovered_retry.writer_recovery_decisions), 1)
+
+        (self.repo / "adopted.py").write_text("# adopted\n")
+        adopted_fingerprint = orchestrator.working_tree_fingerprint(self.repo)
+        adopt_crash = WorkflowRun(
+            run_id="adopt-decision-crash",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Adopt decision crash fixture.",
+            repo=orchestrator.repo_state(self.repo),
+            stage="implementation_completed",
+            writer_recovery_decisions=[
+                WriterRecoveryDecision(
+                    decision_id="writer-recovery-01",
+                    decided_at="2026-08-02T00:01:00+00:00",
+                    action="adopt_current",
+                    note="decision and completed stage saved",
+                    writer_attempt_id="writer-old-adopt",
+                    stage="implementing",
+                    purpose="implementation",
+                    pre_fingerprint=pre_fingerprint,
+                    saved_post_fingerprint=adopted_fingerprint,
+                    observed_fingerprint=adopted_fingerprint,
+                    observed_changed_files=["adopted.py"],
+                )
+            ],
+        )
+        orchestrator.persist(adopt_crash, self.runs)
+        recovered_adopt = self.controller(
+            self.passing_sonnet,
+            luna=unexpected_luna,
+            approval=lambda prompt: False,
+        ).resume(adopt_crash.run_id)
+        self.assertEqual(recovered_adopt.stage, "commit_declined")
+        self.assertEqual(len(recovered_adopt.writer_recovery_decisions), 1)
+        self.assertEqual(calls, 0)
+
+    def test_failed_correction_retry_preserves_controller_state_and_prompt(self) -> None:
+        sonnet_calls = 0
+        luna_calls = 0
+
+        def sonnet(prompt, repo):
+            nonlocal sonnet_calls
+            sonnet_calls += 1
+            if sonnet_calls == 2:
+                return review_execution(
+                    "FAIL",
+                    "IMPLEMENTATION_DEFECT",
+                    "persistent correction fixture",
+                    "persistent-fixture",
+                )
+            return review_execution("PASS", "PASS")
+
+        def luna(prompt, repo):
+            nonlocal luna_calls
+            luna_calls += 1
+            if luna_calls == 1:
+                (repo / "implementation.py").write_text("# initial\n")
+                return ProviderExecution(["codex"], 0, "implemented", "")
+            return ProviderExecution(
+                ["codex"],
+                1,
+                "correction failed without changes",
+                "Error: service unavailable",
+            )
+
+        blocked = self.controller(sonnet, luna=luna).new_run("009")
+        self.assertEqual(blocked.stage, "blocked_writer_retry_required")
+        self.assertEqual(blocked.active_writer_attempt.stage, "correcting")
+        self.assertEqual(blocked.correction_cycles, 1)
+        saved_prompt = blocked.provider_resume_prompt
+        old_attempt_id = blocked.active_writer_attempt.attempt_id
+        blocked.sol_guidance = "preserve this Sol round guidance"
+        blocked.policy_decisions.append(
+            orchestrator.PolicyDecision(
+                decision_id="policy-01",
+                approved_at="2026-08-02T00:00:00+00:00",
+                trigger_finding_key="persistent-fixture",
+                trigger_summary="preserve policy state",
+                recommendation="preserve recommendation",
+                approved_text="preserve approved policy",
+            )
+        )
+        orchestrator.persist(blocked, self.runs)
+
+        retry_calls = 0
+
+        def correction_retry(prompt, repo):
+            nonlocal retry_calls
+            retry_calls += 1
+            saved = orchestrator.load_run(blocked.run_id, self.runs)
+            self.assertEqual(saved.correction_cycles, 1)
+            self.assertEqual(
+                saved.sol_guidance,
+                "preserve this Sol round guidance",
+            )
+            self.assertEqual(len(saved.policy_decisions), 1)
+            self.assertEqual(saved.provider_resume_prompt, saved_prompt)
+            self.assertNotEqual(
+                saved.active_writer_attempt.attempt_id,
+                old_attempt_id,
+            )
+            self.assertEqual(len(saved.writer_recovery_decisions), 1)
+            (repo / "correction.py").write_text("# recovered correction\n")
+            return ProviderExecution(["codex"], 0, "corrected", "")
+
+        recovered = self.controller(
+            sonnet,
+            luna=correction_retry,
+            approval=lambda prompt: False,
+        ).recover_writer(
+            blocked.run_id,
+            "retry_restored",
+            "retry the restored correction once",
+        )
+
+        self.assertEqual(recovered.stage, "commit_declined")
+        self.assertEqual(recovered.correction_cycles, 1)
+        self.assertEqual(
+            recovered.sol_guidance,
+            "preserve this Sol round guidance",
+        )
+        self.assertEqual(len(recovered.policy_decisions), 1)
+        self.assertEqual(retry_calls, 1)
+        history = orchestrator._implementation_review_history(recovered)
+        self.assertEqual(
+            [review.finding_key for review in history],
+            ["persistent-fixture"],
+        )
+        self.assertEqual(recovered.implementation_review.finding_key, "PASS")
+
+    def test_external_change_after_writer_snapshot_is_detected_without_locking(self) -> None:
+        observed: dict[str, object] = {}
+
+        def luna(prompt, repo):
+            saved_path = next(self.runs.glob("*.json"))
+            saved = orchestrator.load_run(saved_path.stem, self.runs)
+            observed["pre_files"] = saved.active_writer_attempt.pre_changed_files
+            (repo / "external-race.txt").write_text("outside mutation\n")
+            return ProviderExecution(["codex"], 1, "", "failure")
+
+        run = self.controller(self.passing_sonnet, luna=luna).new_run("009")
+
+        self.assertEqual(observed["pre_files"], [])
+        self.assertEqual(run.stage, "blocked_writer_partial_changes")
+        self.assertEqual(
+            run.active_writer_attempt.post_changed_files,
+            ["external-race.txt"],
+        )
+        self.assertFalse((self.repo / ".continuo.lock").exists())
+        self.assertEqual(
+            git(self.repo, "worktree", "list", "--porcelain").count(
+                "worktree "
+            ),
+            1,
+        )
+
+    def test_writer_schema_round_trip_legacy_defaults_and_report(self) -> None:
+        fingerprint = "a" * 64
+        run = WorkflowRun(
+            run_id="writer-audit",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Writer audit fixture.",
+            repo=orchestrator.repo_state(self.repo),
+            stage="blocked_writer_partial_changes",
+            provider_resume_stage="implementing",
+            provider_resume_prompt="saved prompt",
+            active_writer_attempt=WriterAttemptState(
+                attempt_id="writer-audit-1",
+                stage="implementing",
+                purpose="implementation",
+                pre_fingerprint=fingerprint,
+                pre_changed_files=[],
+                post_fingerprint="b" * 64,
+                post_changed_files=["partial.py"],
+                provider_record_index=1,
+            ),
+            writer_recovery_decisions=[
+                WriterRecoveryDecision(
+                    decision_id="writer-recovery-01",
+                    decided_at="2026-08-02T00:01:00+00:00",
+                    action="retry_restored",
+                    note="restored exactly",
+                    writer_attempt_id="writer-old-1",
+                    stage="implementing",
+                    purpose="implementation",
+                    pre_fingerprint=fingerprint,
+                    saved_post_fingerprint="b" * 64,
+                    observed_fingerprint=fingerprint,
+                    observed_changed_files=[],
+                ),
+                WriterRecoveryDecision(
+                    decision_id="writer-recovery-02",
+                    decided_at="2026-08-02T00:02:00+00:00",
+                    action="adopt_current",
+                    note="adopt reconciled state",
+                    writer_attempt_id="writer-old-2",
+                    stage="correcting",
+                    purpose="correction",
+                    pre_fingerprint=fingerprint,
+                    saved_post_fingerprint="b" * 64,
+                    observed_fingerprint="c" * 64,
+                    observed_changed_files=["partial.py"],
+                ),
+            ],
+        )
+        run.provider_runs.extend(
+            [
+                orchestrator.ProviderRecord(
+                    provider="legacy provider",
+                    purpose="legacy",
+                    command=["legacy"],
+                    returncode=0,
+                ),
+                orchestrator.ProviderRecord(
+                    provider="Luna High",
+                    purpose="implementation",
+                    command=["codex"],
+                    returncode=1,
+                    duration_seconds=1.25,
+                    failure_kind="unavailable",
+                    failure_source="stderr",
+                    failure_code="503",
+                    capability="workspace_write",
+                    repository_fingerprint_before=fingerprint,
+                    repository_fingerprint_after="b" * 64,
+                ),
+            ]
+        )
+        orchestrator.persist(run, self.runs)
+        loaded = orchestrator.load_run(run.run_id, self.runs)
+        self.assertEqual(loaded.model_dump(), run.model_dump())
+
+        report = orchestrator._run_report(loaded)
+        self.assertEqual(report["provider_calls_total"], 2)
+        self.assertEqual(report["provider_failure_counts"], {"unavailable": 1})
+        self.assertEqual(report["writer_recovery_decisions"], 2)
+        self.assertEqual(
+            report["pending_writer_state"],
+            "blocked_writer_partial_changes",
+        )
+
+        legacy_payload = {
+            "schema_version": 6,
+            "run_id": "legacy-schema-six",
+            "created_at": "2026-08-01T00:00:00+00:00",
+            "task_ref": "009",
+            "task_file": "tasks/009-example.md",
+            "task_sha256": "0" * 64,
+            "specification": "Legacy schema-six fixture.",
+            "repo": orchestrator.repo_state(self.repo).model_dump(),
+            "provider_runs": [
+                {
+                    "provider": "Luna High",
+                    "purpose": "implementation",
+                    "command": ["codex"],
+                    "returncode": 1,
+                }
+            ],
+        }
+        legacy = WorkflowRun.model_validate(legacy_payload)
+        self.assertIsNone(legacy.active_writer_attempt)
+        self.assertEqual(legacy.writer_recovery_decisions, [])
+        self.assertIsNone(legacy.provider_runs[0].capability)
+        self.assertIsNone(
+            legacy.provider_runs[0].repository_fingerprint_before
+        )
 
 
 class ProviderFailureContractTests(unittest.TestCase):
@@ -1622,6 +2472,7 @@ class ProviderFailureContractTests(unittest.TestCase):
                 execution = providers._run(
                     ["missing-provider"],
                     self.repo,
+                    capability="read_only",
                     runner=runner,
                     sleeper=lambda seconds: None,
                 )
@@ -1769,6 +2620,7 @@ Diff:
         execution = providers._run(
             ["claude"],
             self.repo,
+            capability="read_only",
             runner=runner,
             sleeper=lambda seconds: None,
             native_classifier=providers.classify_claude_native_failure,
@@ -1874,6 +2726,7 @@ Diff:
         prose_execution = providers._run(
             ["codex", "exec", "--model", "gpt-5.6-luna"],
             self.repo,
+            capability="workspace_write",
             runner=prose_runner,
             sleeper=lambda seconds: None,
         )
@@ -1906,12 +2759,151 @@ Diff:
         trusted_execution = providers._run(
             ["codex", "exec", "--model", "gpt-5.6-luna"],
             self.repo,
+            capability="workspace_write",
             runner=trusted_runner,
             sleeper=lambda seconds: None,
         )
-        self.assertEqual(trusted_calls, 2)
-        self.assertFalse(providers.execution_failed(trusted_execution))
-        self.assertTrue(trusted_execution.attempts[0].retry_scheduled)
+        self.assertEqual(trusted_calls, 1)
+        self.assertTrue(providers.execution_failed(trusted_execution))
+        self.assertFalse(trusted_execution.attempts[0].retry_scheduled)
+
+    def test_capability_validation_precedes_spawn_and_writer_errors_are_single_shot(self) -> None:
+        runner_calls = 0
+        sleep_calls: list[float] = []
+
+        def runner(command, **kwargs):
+            nonlocal runner_calls
+            runner_calls += 1
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with self.assertRaises(TypeError):
+            providers._run(  # type: ignore[call-arg]
+                ["provider"],
+                self.repo,
+                runner=runner,
+            )
+        with self.assertRaisesRegex(ValueError, "capability"):
+            providers._run(
+                ["provider"],
+                self.repo,
+                capability="invalid",  # type: ignore[arg-type]
+                runner=runner,
+            )
+        self.assertEqual(runner_calls, 0)
+
+        fixtures = (
+            ("quota exceeded", "quota", None),
+            ("HTTP 401 Unauthorized", "auth", "401"),
+            ("status code: 429 Too Many Requests", "rate_limit", "429"),
+            ("no such file or directory", "configuration", None),
+            ("HTTP 503 Service Unavailable", "unavailable", "503"),
+            ("unclassified writer failure", "provider_error", "1"),
+        )
+        for stderr, kind, code in fixtures:
+            with self.subTest(kind=kind):
+                calls = 0
+
+                def failing_runner(command, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    return subprocess.CompletedProcess(command, 1, "raw", stderr)
+
+                execution = providers._run(
+                    ["codex", "exec", "--model", "gpt-5.6-luna"],
+                    self.repo,
+                    capability="workspace_write",
+                    runner=failing_runner,
+                    sleeper=sleep_calls.append,
+                )
+                self.assertEqual(calls, 1)
+                self.assertEqual(len(execution.attempts), 1)
+                self.assertEqual(execution.failure_kind, kind)
+                self.assertEqual(execution.failure_code, code)
+                self.assertEqual(execution.capability, "workspace_write")
+                self.assertFalse(execution.attempts[0].retry_scheduled)
+                self.assertEqual(
+                    execution.attempts[0].capability,
+                    "workspace_write",
+                )
+        self.assertEqual(sleep_calls, [])
+
+    def test_read_only_retry_keeps_capability_command_and_exact_delays(self) -> None:
+        command = ["claude", "-p", "same prompt"]
+        results = iter(
+            (
+                subprocess.CompletedProcess(
+                    command,
+                    1,
+                    "",
+                    "HTTP 503 Service Unavailable",
+                ),
+                subprocess.CompletedProcess(
+                    command,
+                    1,
+                    "",
+                    "HTTP 502 Bad Gateway",
+                ),
+                subprocess.CompletedProcess(command, 0, "success", ""),
+            )
+        )
+        commands: list[list[str]] = []
+        delays: list[float] = []
+
+        def runner(candidate, **kwargs):
+            commands.append(candidate)
+            return next(results)
+
+        execution = providers._run(
+            command,
+            self.repo,
+            capability="read_only",
+            runner=runner,
+            sleeper=delays.append,
+        )
+
+        self.assertEqual(commands, [command, command, command])
+        self.assertEqual(delays, [5.0, 15.0])
+        self.assertEqual(
+            [attempt.capability for attempt in execution.attempts],
+            ["read_only", "read_only", "read_only"],
+        )
+        self.assertEqual(
+            [attempt.retry_scheduled for attempt in execution.attempts],
+            [True, True, False],
+        )
+
+    def test_workspace_interruption_is_single_shot_after_supervisor_cleanup(self) -> None:
+        command = ["codex", "exec", "--model", "gpt-5.6-luna"]
+        supervised = providers._SupervisedResult(
+            subprocess.CompletedProcess(
+                command,
+                providers.PROVIDER_INTERRUPTED_RETURN_CODE,
+                "partial writer output",
+                "continuo-supervisor: interrupted; process_group=terminated",
+            ),
+            "interrupted",
+        )
+        sleep_calls: list[float] = []
+
+        with patch.object(
+            providers,
+            "_supervise_process",
+            return_value=supervised,
+        ) as supervisor:
+            execution = providers._run(
+                command,
+                self.repo,
+                capability="workspace_write",
+                sleeper=sleep_calls.append,
+            )
+
+        supervisor.assert_called_once()
+        self.assertEqual(len(execution.attempts), 1)
+        self.assertEqual(execution.failure_kind, "interrupted")
+        self.assertEqual(execution.failure_source, "supervisor")
+        self.assertEqual(execution.capability, "workspace_write")
+        self.assertFalse(execution.attempts[0].retry_scheduled)
+        self.assertEqual(sleep_calls, [])
 
 
 @unittest.skipUnless(os.name == "posix", "real process-group tests require POSIX")
@@ -1933,6 +2925,7 @@ class ProviderSupervisorTests(unittest.TestCase):
         return providers._run(
             [sys.executable, "-c", source],
             self.repo,
+            capability="read_only",
             deadline_seconds=deadline,
             term_grace_seconds=grace,
             poll_interval_seconds=0.02,
@@ -2128,6 +3121,7 @@ print(f"parent {os.getpid()} child {child.pid}", flush=True)
                             providers._run(
                                 [sys.executable, "-c", "pass"],
                                 self.repo,
+                                capability="read_only",
                                 **arguments,
                             )
                         popen.assert_not_called()
@@ -2136,6 +3130,7 @@ print(f"parent {os.getpid()} child {child.pid}", flush=True)
         execution = providers._run(
             [str(self.repo / "missing-provider")],
             self.repo,
+            capability="read_only",
             deadline_seconds=1.0,
         )
 

@@ -4,7 +4,7 @@
 
 *Deterministic notation for probabilistic work.*
 
-- **Implementation status:** current source on 2026-08-01
+- **Implementation status:** current source on 2026-08-02
 - **Product identity:** Continuo
 - **Persisted run schema:** version 6
 - **Primary implementation:** `orchestrator.py`, `providers.py`, and `models.py`
@@ -104,7 +104,8 @@ Defines the persisted Pydantic models and current model routes:
 - `ModelRoute` for the hard-coded role/CLI/model triples;
 - `ReviewResult` and its closed status/category vocabulary;
 - `RepoState` for the initial repository snapshot;
-- `ProviderRecord` and `GitRecord` for the audit trail;
+- `ProviderRecord`, `WriterAttemptState`, `WriterRecoveryDecision`, and
+  `GitRecord` for the audit trail;
 - immutable `PolicyDecision` records; and
 - `WorkflowRun`, the versioned run state.
 
@@ -247,6 +248,8 @@ Current named block classes include:
 - policy: `blocked_policy_ambiguity`;
 - provider access: `blocked_provider_quota`, `blocked_provider_billing`, `blocked_provider_auth`, `blocked_provider_rate_limit`, `blocked_provider_unavailable`, `blocked_provider_configuration`, `blocked_provider_failure`;
 - provider protocol/recovery: `blocked_provider_output`, `blocked_interrupted_provider`; and
+- workspace-writer recovery: `blocked_writer_retry_required`,
+  `blocked_writer_partial_changes`, `blocked_writer_state_unknown`; and
 - Git: `blocked_git_failure`.
 
 Legacy `blocked_after_correction` and `blocked_after_escalation` runs have a compatibility resume path when their saved state qualifies under the current correction policy.
@@ -419,7 +422,15 @@ Quota/usage-cap, billing, authentication, and rate-limit failures stop the entir
 
 ### Same-provider outage retries only
 
-Only failures classified as `unavailable` are retried automatically. The delays are fixed at 5 seconds and 15 seconds, for at most three total attempts. Every attempt is recorded separately, including whether another retry was scheduled.
+Only read-only failures classified as `unavailable` are retried automatically.
+The delays are fixed at 5 seconds and 15 seconds, for at most three total
+attempts. Every attempt is recorded separately, including its declared
+`read_only` capability and whether another retry was scheduled.
+
+Every `workspace_write` attempt is single-shot, including trusted
+unavailability, timeout, interruption, and account/configuration failures. The
+provider boundary never schedules a writer retry or calls its sleeper after a
+writer result.
 
 There is no automatic cross-provider fallback. A Sonnet outage is retried as Sonnet; the controller will not substitute Terra, Sol, Luna, or another vendor. After the bounded attempts, the run blocks as `blocked_provider_unavailable`.
 
@@ -429,7 +440,11 @@ This preserves role semantics, avoids permission drift, and prevents an infrastr
 
 Read-only provider operations have a 30-minute hard deadline and workspace-writer operations have a 60-minute hard deadline. Real subprocesses run in isolated process groups. On deadline or operator interruption, the controller sends TERM, allows a five-second grace period, escalates to KILL when necessary, reaps the direct child, and captures available output plus a cleanup diagnostic.
 
-`timeout` and `interrupted` are terminal attempt outcomes. They never enter the ordinary unavailability retry and block as `blocked_provider_timeout` or `blocked_provider_interrupted`. Those blocks are deliberately not resumable until capability-aware writer reconciliation is implemented.
+`timeout` and `interrupted` are terminal attempt outcomes. They never enter the
+ordinary unavailability retry. Read-only attempts block in the corresponding
+`blocked_provider_timeout` or `blocked_provider_interrupted` stage. Writer
+attempts instead use the persisted pre/post repository evidence and one of the
+three writer-recovery blocks described below.
 
 ### Invalid structured output
 
@@ -446,7 +461,7 @@ exclusive, and no other role is substituted.
 
 ## 13. Crash recovery and exact-stage resume
 
-Before a provider invocation, the controller:
+Before a read-only provider invocation, the controller:
 
 1. sets the precise in-progress stage;
 2. saves `provider_resume_stage`;
@@ -455,15 +470,55 @@ Before a provider invocation, the controller:
 
 After the provider returns, it appends one or more `ProviderRecord` entries and persists again before parsing or advancing.
 
-On resume:
+On read-only resume:
 
 - a successfully recorded result at an in-progress stage is consumed without re-running that completed provider call;
 - the latest record must match the provider and purpose expected for the saved stage;
 - a stage with no matching recorded output blocks as `blocked_interrupted_provider` rather than guessing;
-- a provider-failure block with saved stage and prompt re-invokes only that exact provider stage when explicitly resumed; and
+- a provider-failure block with saved stage and prompt re-invokes only that exact read-only provider stage when explicitly resumed; and
 - a successful resumed call continues from that stage without repeating the earlier implementation or review steps.
 
-This is exact-stage recovery, not transaction rollback. Provider-side effects cannot be rolled back by the controller. Repository fingerprints and verification provide the complementary check for Luna's workspace changes.
+### Workspace-writer write-ahead state
+
+Before every initial implementation, correction, or explicitly authorized
+writer retry, the controller validates repository path, branch, `HEAD`, and
+origin; enumerates exact changed paths; computes the working-tree fingerprint;
+and atomically persists an active writer marker with a unique attempt ID, stage,
+purpose, pre-state, and exact saved prompt. Luna is invoked only after that save.
+
+After Luna returns, the raw physical attempt and observed post-state are saved
+before outcome routing. A failed writer reaches:
+
+- `blocked_writer_retry_required` when current state exactly equals pre-state;
+- `blocked_writer_partial_changes` when the fingerprints differ; or
+- `blocked_writer_state_unknown` when repository identity, enumeration, or
+  fingerprinting cannot be trusted.
+
+Ordinary `resume` never invokes Luna from these blocks. A crash with only an
+active marker compares current state and reconstructs the appropriate block
+without inferring success. A saved failed result reconstructs the same block; a
+saved successful result is consumed once and advances into verification without
+repeating Luna. Legacy Luna stages without pre-attempt evidence fail closed as
+writer state unknown.
+
+This is exact-stage recovery, not transaction rollback. Continuo never resets,
+cleans, deletes, or otherwise discards partial writer changes automatically.
+
+### Explicit writer recovery
+
+`recover-writer` accepts only a writer-recovery block and requires an audited,
+nonempty operator note:
+
+- `retry-restored` revalidates the repository and requires an exact match to the
+  saved pre-attempt fingerprint. It records the decision, atomically arms a new
+  attempt ID, and invokes the same saved prompt once.
+- `adopt-current` requires unchanged repository identity, a trustworthy
+  fingerprint different from pre-state, and at least one changed path. It
+  records the chosen state, invokes no writer, fabricates no success record, and
+  enters normal verification and Sonnet review.
+
+Leaving the run blocked is the abort choice. Any manual restoration or
+reconciliation happens outside Continuo and is proven again before recovery.
 
 ## 14. Repository snapshot and fingerprint safety
 
@@ -472,7 +527,6 @@ This is exact-stage recovery, not transaction rollback. Provider-side effects ca
 Every run records:
 
 - absolute repository path;
-- named branch;
 - original `HEAD` commit;
 - initial cleanliness; and
 - origin URL.
@@ -552,6 +606,9 @@ Runs are stored as formatted JSON in `runs/<run-id>.json`. The run ID is the fir
 - Terra resolution and Sol guidance;
 - appended human policy decisions;
 - provider resume stage and exact prompt;
+- active writer attempt with pre/post fingerprints, paths, inspection error, and
+  provider-record linkage;
+- immutable writer-recovery decisions with operator note and observed state;
 - changed files and working-tree fingerprint;
 - verification results;
 - complete provider-attempt records;
@@ -560,14 +617,21 @@ Runs are stored as formatted JSON in `runs/<run-id>.json`. The run ID is the fir
 
 Each provider record includes provider label, purpose, full command, physical
 return code, stdout, stderr, duration, failure classification, optional evidence
-source/native-or-OS code, and whether another same-provider retry was scheduled.
+source/native-or-OS code, declared capability, optional writer pre/post
+fingerprints, and whether another same-provider retry was scheduled.
 Because prompts are command arguments, the persisted command is also an input
 audit record. The optional provenance fields preserve schema-6 compatibility:
 legacy records load with explicit `null` provenance and are not rewritten.
 
 Git records include the operation label, command, return code, stdout, and stderr.
 
-Persistence is local and inspectable, but it is not yet a tamper-evident event log, database transaction system, concurrent-run lock, encrypted secret store, or formal schema-migration framework.
+The M0.4 fields are additive schema-6 compatibility fields: historical records
+load with `None` capability/fingerprints and empty writer state/decisions; no
+facts are invented and no historical JSON is rewritten.
+
+Persistence is local and inspectable, but it is not yet a tamper-evident event
+log, database transaction system, concurrent-run lock, encrypted secret store,
+or formal schema-migration framework.
 
 ## 18. Observability, heartbeats, reporting, and metrics
 
@@ -634,7 +698,27 @@ Creates, persists, and advances a new run until it completes a gate or reaches a
 uv run python orchestrator.py resume <run-id>
 ```
 
-Loads the saved repository path unless `--repo` is explicitly supplied, applies the resume guard, and continues only from the saved stage.
+Loads the saved repository path unless `--repo` is explicitly supplied, applies
+the relevant repository guard, and continues only from the saved stage. A
+writer-recovery block remains blocked and directs the operator to
+`recover-writer`; ordinary resume never repeats Luna from that state.
+
+### Recover a blocked writer
+
+```sh
+uv run python orchestrator.py recover-writer <run-id> \
+  --action retry-restored \
+  --note "Repository manually restored to the exact saved pre-state."
+
+uv run python orchestrator.py recover-writer <run-id> \
+  --action adopt-current \
+  --note "Current partial changes were reviewed and reconciled."
+```
+
+The equivalent `jobs-orchestrator recover-writer` command is retained. The note
+is length-bounded audit text only: it is not appended to a provider prompt or
+used for failure classification. Recovery does not imply commit or push
+approval.
 
 ### Approve a policy decision
 
@@ -652,7 +736,8 @@ Only valid at `blocked_policy_ambiguity`. It displays Terra's recommendation and
 uv run python orchestrator.py report <run-id>
 ```
 
-Prints derived timing, provider, correction, policy, review, and Git metrics.
+Prints derived timing, provider, correction, policy, writer-recovery, review,
+and Git metrics, including a pending writer-state classification when present.
 
 ### Inspect status
 
@@ -665,7 +750,7 @@ Lists recent runs or prints one run's complete JSON.
 
 ## 20. Current tests and what they cover
 
-The current suite has 59 `unittest` cases. It creates isolated temporary Git
+The current suite has 75 `unittest` cases. It creates isolated temporary Git
 repositories, loads checksummed sanitized Claude fixtures, substitutes
 deterministic fake provider functions, and uses real local Python
 child/grandchild processes for supervisor tests. The tests do not call live model
@@ -702,6 +787,18 @@ providers or mutate the real Jobs repository.
 - timing and run-report metrics are derived safely, including legacy untimed records;
 - quota failure blocks the whole run and explicit resume retries only the interrupted review stage;
 - unavailability retries only the same provider, with per-attempt audit fields;
+- read-only unavailability retains its exact 5/15-second retry while every
+  workspace-write result is single-shot;
+- writer markers persist exact pre-state before invocation and post-state beside
+  returned attempts, including dirty correction state and adversarial paths;
+- unchanged, partial, and uninspectable writer failures enter distinct blocks
+  that ordinary resume cannot use to reinvoke Luna;
+- explicit exact-restoration retry and reconciled-state adoption are audited,
+  preconditioned, and never perform automatic cleanup;
+- interrupted writer markers and saved failed/successful results recover
+  deterministically without repeating completed or uncertain work;
+- additive schema-6 capability, writer-state, and recovery-decision fields
+  round-trip while legacy records retain safe defaults;
 - real provider processes enforce deadlines, preserve partial output, and clean up process groups through TERM/KILL escalation;
 - timeout and interruption persist distinct non-resumable blocked stages without provider retry;
 - provider-native, OS, supervisor, anchored-stderr, opt-in bounded-stdout-tail,
@@ -717,7 +814,11 @@ providers or mutate the real Jobs repository.
 
 ### Not covered today
 
-There are no live-provider integration tests, project-specific verification tests, full CLI end-to-end tests, concurrency tests, persistence-corruption recovery tests beyond status display, schema-migration tests, actual remote push tests, Windows process-tree integration tests, or tests for every blocked/recovery stage combination.
+There are no live-provider integration tests, project-specific verification
+tests, full CLI end-to-end tests, concurrency/locking tests,
+persistence-corruption recovery tests beyond status display, general
+schema-migration tests, actual remote push tests, Windows process-tree
+integration tests, or tests for every blocked/recovery stage combination.
 
 ## 21. Current limitations and technical debt
 

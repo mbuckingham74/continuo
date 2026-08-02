@@ -70,6 +70,53 @@ ProviderFailureSource = Literal[
     "returncode",
 ]
 
+ProviderCapability = Literal["read_only", "workspace_write"]
+WriterAttemptStage = Literal["implementing", "correcting"]
+WriterAttemptPurpose = Literal["implementation", "correction"]
+WriterRecoveryAction = Literal["retry_restored", "adopt_current"]
+
+
+class WriterAttemptState(BaseModel):
+    """Durable write-ahead repository evidence for one writer invocation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempt_id: str = Field(min_length=1, max_length=64)
+    stage: WriterAttemptStage
+    purpose: WriterAttemptPurpose
+    pre_fingerprint: str = Field(min_length=64, max_length=64)
+    pre_changed_files: list[str] = Field(default_factory=list)
+    post_fingerprint: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+    )
+    post_changed_files: list[str] | None = None
+    inspection_error: str | None = Field(default=None, max_length=1000)
+    provider_record_index: int | None = Field(default=None, ge=0)
+
+
+class WriterRecoveryDecision(BaseModel):
+    """An explicit operator choice for an uncertain writer outcome."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    decision_id: str = Field(min_length=1, max_length=64)
+    decided_at: str
+    action: WriterRecoveryAction
+    note: str = Field(min_length=1, max_length=1000)
+    writer_attempt_id: str = Field(min_length=1, max_length=64)
+    stage: WriterAttemptStage
+    purpose: WriterAttemptPurpose
+    pre_fingerprint: str = Field(min_length=64, max_length=64)
+    saved_post_fingerprint: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+    )
+    observed_fingerprint: str = Field(min_length=64, max_length=64)
+    observed_changed_files: list[str] = Field(default_factory=list)
+
 
 class ProviderRecord(BaseModel):
     provider: str
@@ -82,6 +129,17 @@ class ProviderRecord(BaseModel):
     failure_kind: ProviderFailureKind | None = None
     failure_source: ProviderFailureSource | None = None
     failure_code: str | None = Field(default=None, max_length=120)
+    capability: ProviderCapability | None = None
+    repository_fingerprint_before: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+    )
+    repository_fingerprint_after: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+    )
     retry_scheduled: bool = False
 
 
@@ -131,6 +189,10 @@ class WorkflowRun(BaseModel):
     policy_decisions: list[PolicyDecision] = Field(default_factory=list)
     provider_resume_stage: str | None = None
     provider_resume_prompt: str | None = None
+    active_writer_attempt: WriterAttemptState | None = None
+    writer_recovery_decisions: list[WriterRecoveryDecision] = Field(
+        default_factory=list
+    )
     changed_files: list[str] = Field(default_factory=list)
     working_tree_fingerprint: str | None = None
     verification: dict[str, object] = Field(default_factory=dict)

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable
 
 from models import (
+    ProviderCapability,
     ProviderFailureKind,
     ProviderFailureSource,
     ReviewResult,
@@ -74,6 +75,9 @@ class ProviderAttempt:
     failure_kind: ProviderFailureKind | None = None
     failure_source: ProviderFailureSource | None = None
     failure_code: str | None = None
+    capability: ProviderCapability | None = None
+    repository_fingerprint_before: str | None = None
+    repository_fingerprint_after: str | None = None
     retry_scheduled: bool = False
 
 
@@ -87,6 +91,9 @@ class ProviderExecution:
     failure_kind: ProviderFailureKind | None = None
     failure_source: ProviderFailureSource | None = None
     failure_code: str | None = None
+    capability: ProviderCapability | None = None
+    repository_fingerprint_before: str | None = None
+    repository_fingerprint_after: str | None = None
     attempts: tuple[ProviderAttempt, ...] = ()
 
 
@@ -711,6 +718,8 @@ def _supervise_process(
 def _run(
     command: list[str],
     repo: Path,
+    *,
+    capability: ProviderCapability,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     sleeper: Callable[[float], None] = time.sleep,
     deadline_seconds: float = READ_ONLY_PROVIDER_DEADLINE_SECONDS,
@@ -725,6 +734,9 @@ def _run(
     allow_stdout_tail: bool = False,
 ) -> ProviderExecution:
     """Run one provider with bounded same-provider outage retries only."""
+
+    if capability not in {"read_only", "workspace_write"}:
+        raise ValueError("provider capability must be read_only or workspace_write")
 
     _validate_supervision_timing(
         deadline_seconds,
@@ -809,6 +821,7 @@ def _run(
         # configuration, and unknown errors stop immediately.
         retry_scheduled = (
             failure_kind == "unavailable"
+            and capability == "read_only"
             and attempt_number < max_attempts
         )
 
@@ -826,6 +839,7 @@ def _run(
                 failure_code=(
                     evidence.code if evidence is not None else None
                 ),
+                capability=capability,
                 retry_scheduled=retry_scheduled,
             )
         )
@@ -872,6 +886,7 @@ def _run(
             failure_code=(
                 evidence.code if evidence is not None else None
             ),
+            capability=capability,
             attempts=tuple(attempts),
         )
 
@@ -882,6 +897,7 @@ def execute_sonnet_review(prompt: str, repo: Path = DEFAULT_REPO) -> ProviderExe
     return _run(
         build_sonnet_command(prompt),
         repo,
+        capability="read_only",
         deadline_seconds=READ_ONLY_PROVIDER_DEADLINE_SECONDS,
         native_classifier=classify_claude_native_failure,
     )
@@ -921,6 +937,7 @@ def execute_terra_resolution(prompt: str, repo: Path = DEFAULT_REPO) -> Provider
     return _run(
         build_terra_command(prompt),
         repo,
+        capability="read_only",
         deadline_seconds=READ_ONLY_PROVIDER_DEADLINE_SECONDS,
     )
 
@@ -929,6 +946,7 @@ def execute_sol_escalation(prompt: str, repo: Path = DEFAULT_REPO) -> ProviderEx
     return _run(
         build_sol_command(prompt),
         repo,
+        capability="read_only",
         deadline_seconds=READ_ONLY_PROVIDER_DEADLINE_SECONDS,
     )
 
@@ -937,5 +955,6 @@ def execute_luna_implementation(prompt: str, repo: Path = DEFAULT_REPO) -> Provi
     return _run(
         build_luna_command(prompt),
         repo,
+        capability="workspace_write",
         deadline_seconds=WRITE_PROVIDER_DEADLINE_SECONDS,
     )

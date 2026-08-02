@@ -127,10 +127,16 @@ The controller snapshots repository path, branch, `HEAD`, and origin. After ever
   prose, prompts, transcripts, and diffs are not transport evidence.
 - Claude native error envelopes are separated from successful review content and
   never consume the invalid-content retry.
-- Provider unavailability receives two bounded same-provider retries, after 5 and 15 seconds.
+- Read-only provider unavailability receives two bounded same-provider retries,
+  after 5 and 15 seconds. Workspace-write attempts are always single-shot.
 - Read-only provider attempts have a 30-minute hard deadline; Luna writer attempts have a 60-minute deadline.
-- Timeout or interruption terminates the isolated process group, preserves partial output, and blocks without retry or ordinary resume.
+- Timeout or interruption terminates the isolated process group and preserves
+  partial output. An uncertain writer result also persists pre/post repository
+  evidence and blocks without automatic or ordinary-resume reinvocation.
 - Quota, billing, authentication, rate-limit, configuration, and unclassified failures stop the current run immediately.
+- Writer recovery is explicit: retry requires proof of exact restoration;
+  adoption requires trustworthy current changes. Continuo never automatically
+  resets, cleans, or discards partial changes.
 - The controller never substitutes another provider automatically.
 
 ### Human gates
@@ -198,6 +204,7 @@ The target repository must contain exactly one matching task specification, be c
 |---|---|
 | `run <task-ref>` | Create and advance a new run until it reaches an approval gate or block |
 | `resume <run-id>` | Safely continue from the saved stage without intentionally repeating completed provider work |
+| `recover-writer <run-id>` | Explicitly retry an exactly restored writer state or adopt trustworthy current changes, with an audited note |
 | `approve-policy <run-id>` | Record an explicit human policy decision and resume |
 | `report <run-id>` | Show provider timing, failures, retries, corrections, decisions, review, and Git status |
 | `status` | List the ten most recently updated local runs |
@@ -210,6 +217,10 @@ uv run python orchestrator.py status
 uv run python orchestrator.py status <run-id>
 uv run python orchestrator.py report <run-id>
 uv run python orchestrator.py resume <run-id>
+uv run python orchestrator.py recover-writer <run-id> \
+  --action retry-restored --note "Repository restored to the saved pre-attempt state."
+uv run python orchestrator.py recover-writer <run-id> \
+  --action adopt-current --note "Reviewed and reconciled the current partial changes."
 uv run python orchestrator.py approve-policy <run-id> \
   --decision "Exact human-approved policy text."
 ```
@@ -221,7 +232,9 @@ Run state is written to ignored local files at `runs/<run-id>.json`. Each record
 - the complete task specification;
 - provider prompts, commands, stdout, and stderr;
 - provider timing and failure classifications;
+- provider capability and writer pre/post repository evidence;
 - human policy decisions;
+- explicit writer-recovery decisions and operator notes;
 - repository fingerprints and verification results; and
 - Git operation records.
 
@@ -236,6 +249,7 @@ The report command derives metrics from saved records, including:
 - provider failures and same-provider retries;
 - correction count and distinct defect identities;
 - Sol escalation and policy-decision counts;
+- writer-recovery decision count and any pending writer-state block;
 - final review status; and
 - commit and push status.
 
@@ -250,7 +264,15 @@ uv sync
 uv run python -m unittest -v
 ```
 
-The 59 tests exercise temporary repositories, recorded sanitized fixtures, fake providers, and real local child/grandchild processes. They cover preflight safety, task resolution, correction budgets, repeat-finding escalation, policy decisions, trusted failure-evidence precedence, Claude envelope/content separation, provider failures and retries, provider-stop resume behavior, bounded process cleanup, timeout/interruption output and recovery, sandbox command construction, reporting, Git approval defaults, and adversarial Git change parsing, fingerprinting, persistence, recovery, and staging behavior.
+The 75 tests exercise temporary repositories, recorded sanitized fixtures, fake
+providers, and real local child/grandchild processes. They cover preflight
+safety, task resolution, correction budgets, repeat-finding escalation, policy
+decisions, trusted failure-evidence precedence, Claude envelope/content
+separation, capability-aware retry, writer pre/post snapshots, explicit
+restoration/adoption, crash recovery, provider-stop resume behavior, bounded
+process cleanup, timeout/interruption output, sandbox command construction,
+reporting, Git approval defaults, and adversarial Git change parsing,
+fingerprinting, persistence, recovery, and staging behavior.
 
 Before committing changes, also check the diff:
 

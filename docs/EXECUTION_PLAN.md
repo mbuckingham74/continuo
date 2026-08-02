@@ -355,9 +355,52 @@ baseline for extraction. No live Jobs pilot occurs in this gate.
   - Publication evidence (2026-08-02): commit
     `4a3262eda14e41c60a21b7b3d3d152dffe48a286` (`Normalize provider failure
     evidence`) was pushed directly to `origin/main` with all 59 tests passing.
-- [ ] **M0.4 / A-1:** make the provider-attempt lifecycle capability-aware; allow
+- [~] **M0.4 / A-1:** make the provider-attempt lifecycle capability-aware; allow
   bounded read-only retry while blocking uncertain write-capable recovery when
   partial changes exist.
+  - Planning evidence (2026-08-02): the draft bounded execution note and
+    adversarial matrix below were derived from authoritative A-1, the completed
+    M0.2–M0.3 attempt vocabulary, and the current retry, writer, fingerprint,
+    persistence, blocked-resume, and crash-recovery paths. This is planning only:
+    no provider, model, controller, or test implementation changed, and
+    implementation remains unauthorized until the repository owner reviews the
+    capability, persistence, recovery-action, and destructive-operation
+    decisions.
+  - Baseline validation (2026-08-02): all 59 tests pass at published `main`
+    commit `b2e3c656085a50ff3d34d1ca47bdf01f6529b858` without live providers or an
+    external target.
+  - Approval evidence (2026-08-02): the repository owner approved the bounded
+    contract, including the capability vocabulary, additive schema-6 bridge,
+    three writer block states, two explicit recovery actions, and
+    non-destructive restoration policy. Implementation is authorized within
+    this reviewed boundary.
+  - Implementation evidence (2026-08-02): provider attempts now require an
+    explicit `read_only` or `workspace_write` capability before launch. The
+    existing read-only 5/15-second unavailability sequence is preserved while
+    every writer attempt is single-shot. The controller atomically saves exact
+    pre-writer paths/fingerprint and an active marker, records post-state beside
+    the physical attempt, routes uncertain outcomes to the three approved writer
+    blocks, excludes them from ordinary writer resume, and exposes only the
+    audited `retry-restored` and `adopt-current` recovery actions. No automatic
+    reset, checkout, clean, deletion, worktree, clone, lock, fallback, permission
+    expansion, commit, or push behavior was added.
+  - Adversarial evidence (2026-08-02): 16 new deterministic tests plus updated
+    M0.2/M0.3 expectations cover all 39 matrix rows across capability validation,
+    read-only retry, single-shot writer failure kinds, timeout/interruption,
+    marker ordering, clean/dirty and adversarial Git snapshots, unchanged,
+    partial, unknown, and no-op outcomes, both recovery actions and refusals,
+    manual restoration/reconciliation, crash boundaries, correction-state
+    preservation, schema-6 compatibility, reporting, notes, race disclosure, and
+    shared-checkout behavior. All 75 tests pass using only temporary Git
+    repositories, fake providers, recorded fixtures, and local child processes.
+  - Validation evidence (2026-08-02): root and isolated editable-install
+    `jobs-orchestrator` help expose the same required `recover-writer` command;
+    `JOBS_REPO` and `src/jobs_orchestrator` remain intact. All ten authoritative
+    local Markdown links/anchors and all 39 ordered M0.4 matrix rows validate;
+    Python compilation, documentation checks, and `git diff --check` pass. No
+    live provider or external target was invoked and no commit or push was made.
+    The complete implementation diff remains uncommitted pending repository-owner
+    review, so M0.4 stays in progress.
 - [ ] **M0.5 / Q-2:** enforce one active run per canonical target and test clean
   release, crash recovery, stale ownership, and approval-pending ownership.
 - [ ] **M0.6 / Q-6:** make run storage private by default and define explicit
@@ -761,6 +804,285 @@ by deterministic tests; the full existing suite plus new tests passes without
 live providers; documentation and compatibility smoke checks pass;
 `git diff --check` passes; the complete implementation diff is reviewed; and no
 M0.4 behavior or other roadmap item enters the change.
+
+### M0.4 / A-1 bounded execution note (approved 2026-08-02)
+
+**Status and boundary.** The repository owner approved this contract on
+2026-08-02 before provider, model, controller, or test implementation changed.
+M0.4 owns capability-aware same-provider retry, pre/post repository evidence for
+write-capable attempts, explicit recovery from uncertain writer outcomes, and
+the audit trail for those decisions. M0.5 separately owns one-active-run target
+locking, and later milestones own disposable workspaces, stable route IDs,
+general migrations, and immutable approval identities.
+
+**Invariant and current failure.** A write-capable provider must never be
+automatically or blindly repeated after an attempt that may have changed the
+target repository. At baseline
+`b2e3c656085a50ff3d34d1ca47bdf01f6529b858`, `_run()` schedules the same 5/15
+second unavailability retries for every command. `execute_luna_implementation()`
+therefore can repeat Luna inside the provider boundary before the controller can
+inspect the repository. The controller arms and saves `implementing` or
+`correcting`, but records no pre-attempt repository fingerprint. A failed Luna
+result enters a generic resumable provider block, and ordinary `resume` invokes
+the saved writer prompt again without proving that the first attempt left the
+working tree unchanged.
+
+M0.2 already prevents automatic and ordinary-resume repetition for timeout and
+interruption, but it cannot distinguish a clean writer stop from partial changes.
+M0.3 proves that a trusted Luna unavailability diagnostic still receives an
+automatic retry. A process crash after Luna changes files but before its result
+is saved leaves only the armed writer stage and prompt; exact-stage recovery
+cannot tell a never-started attempt from an unrecorded success or partial
+failure.
+
+The required lifecycle is:
+
+1. declare the operation capability before any subprocess starts;
+2. persist the target identity and pre-attempt writer fingerprint before every
+   workspace-write invocation;
+3. prohibit all automatic retries for workspace-write operations;
+4. after a returned failure, interruption, or timeout, persist the attempt and
+   compare the repository with its pre-attempt state;
+5. block ordinary resume for every uncertain writer outcome; and
+6. continue only after an explicit, audited operator choice whose repository
+   preconditions are revalidated.
+
+**Capability and retry decision for review.** Add the closed internal vocabulary
+`ProviderCapability = Literal["read_only", "workspace_write"]` at the existing
+provider-attempt boundary. It is an execution-safety fact, not the stable role,
+provider-adapter, route, or display identity scheduled for Milestone 1.
+
+Every production wrapper must pass its capability explicitly to `_run()`;
+missing or unknown capabilities fail before process launch. Sonnet, Terra, and
+Sol are `read_only`; Luna is `workspace_write`. A read-only `unavailable` result
+retains the existing two automatic same-provider retries after 5 and 15 seconds.
+A workspace-write result never sets `retry_scheduled=True`, regardless of
+failure kind, trusted evidence source, elapsed time, or observed repository
+state. The controller, rather than provider/model labels or command inspection,
+supplies the capability when recording injected/fake executions.
+
+The existing one same-provider structured-content retry remains available only
+to the current read-only Sonnet and Sol paths. No failure or capability may
+select a different provider, broaden permissions, or turn a writer into a
+read-only operation.
+
+**Writer repository evidence.** Before each initial implementation, correction,
+or explicitly authorized writer retry, the controller must:
+
+- revalidate repository root, branch, `HEAD`, and origin against the saved run;
+- enumerate exact changed paths and compute `working_tree_fingerprint()` using
+  the corrected M0.1 path contract;
+- persist an active writer-attempt marker containing a unique attempt ID,
+  `implementing` or `correcting` stage, purpose, pre-attempt fingerprint, and
+  pre-attempt changed paths; and
+- durably save that marker and the already-saved prompt before invoking Luna.
+
+After Luna returns, the controller computes and persists the post-attempt
+fingerprint and paths beside the physical provider attempt before making a
+workflow transition. A fingerprint/enumeration error after provider return must
+not discard the provider result or trigger a retry: persist the raw attempt,
+retain the pre-state, record the inspection error, and block with unknown writer
+state. A successful writer still follows normal deterministic verification; the
+pre/post comparison is recovery evidence, not proof that the implementation is
+correct.
+
+Each new `ProviderAttempt`/`ProviderExecution`/`ProviderRecord` carries its
+capability. New workspace-write `ProviderRecord` entries additionally carry the
+bounded pre/post fingerprints when observed. Read-only records leave repository
+fingerprint fields `None`; raw streams, physical return codes, M0.3 failure
+provenance, duration, and retry flags remain unchanged.
+
+**Returned writer-failure states.** A returned workspace-write failure,
+timeout, or interruption always records one physical attempt and never performs
+an automatic retry. The controller then chooses one explicit block:
+
+- `blocked_writer_retry_required` when the post-attempt fingerprint exactly
+  equals the pre-attempt fingerprint;
+- `blocked_writer_partial_changes` when the fingerprints differ; or
+- `blocked_writer_state_unknown` when repository identity, change enumeration,
+  or fingerprinting cannot be trusted.
+
+The underlying `failure_kind`, source, code, and streams remain on the provider
+record and continue to contribute to existing failure totals. These writer
+stages express side-effect state; they do not replace or reclassify the provider
+failure. All three retain the active writer marker and are excluded from the
+generic blocked-provider `resume` path.
+
+**Explicit recovery decision for review.** Add a dedicated command with the
+bounded shape:
+
+```text
+jobs-orchestrator recover-writer <run-id> \
+  --action retry-restored|adopt-current --note <operator-text>
+```
+
+The equivalent root CLI command must remain available. The nonempty note records
+operator intent but is not provider input. This command accepts only one of the
+three writer-recovery blocks, rechecks repository identity and current state,
+and persists an immutable `WriterRecoveryDecision` before continuing.
+
+- `retry-restored` requires the current fingerprint to equal the saved
+  pre-attempt fingerprint exactly. It covers both a genuinely unchanged failure
+  and an operator who deliberately discarded/restored partial work outside
+  Continuo. It records the decision, arms a new writer attempt with a new ID and
+  fresh pre-state, and invokes the same saved prompt once. Any further failure
+  blocks again and requires another explicit decision.
+- `adopt-current` requires unchanged branch/`HEAD`/origin, a trustworthy current
+  fingerprint different from the pre-attempt fingerprint, and at least one
+  changed path. It covers direct adoption or operator reconciliation of partial
+  work. It records the decision, does not fabricate a successful provider
+  attempt, does not invoke Luna, advances the interrupted implementation or
+  correction to its completed state, and runs the normal deterministic
+  verification and adversarial review path.
+
+Ordinary `resume` never performs either action and never invokes a writer from a
+writer-recovery block. Leaving the run blocked is the abort choice. Continuo
+does not offer an automatic `discard` action: deleting untracked files or
+reversing tracked/staged changes is destructive and cannot be proven to preserve
+operator work. An operator may restore the exact pre-state manually and then use
+`retry-restored`. An operator may reconcile the current changes manually and
+then use `adopt-current`; the chosen current fingerprint and note are audited.
+
+**Persistence and migration decision for review.** A-1 requires durable
+pre-attempt state and deliberate recovery evidence, while general migration
+machinery remains C-9. The proposed bounded additive bridge retains workflow
+schema version 6 and adds:
+
+- optional capability and pre/post repository fingerprint fields to provider
+  attempt/execution/audit records;
+- optional `active_writer_attempt` state on `WorkflowRun`, with attempt ID,
+  stage, purpose, pre/post fingerprints and paths, and inspection error; and
+- a default-empty `writer_recovery_decisions` list containing action, decision
+  timestamp, note, writer attempt/stage, saved pre/post fingerprints, and the
+  fingerprint observed at decision time.
+
+All new fields are closed, length-bounded where textual, and default to `None`
+or an empty list so existing schema-6 JSON loads without rewriting. Legacy
+records receive no invented capability or fingerprint. A legacy in-progress or
+blocked Luna record without a durable pre-attempt fingerprint is not safe to
+retry or adopt automatically; it blocks as `blocked_writer_state_unknown` and
+requires manual resolution outside the new command. This exception does not
+authorize general migrations, schema stamping changes, stable role IDs, or
+approval-identity work.
+
+**Crash/resume ordering.** The active writer marker is the write-ahead safety
+record for these boundaries:
+
+- crash after marker save but before provider start: recovery compares current
+  state with the pre-fingerprint and blocks as retry-required, partial, or
+  unknown without invoking Luna;
+- crash after Luna side effects but before provider-result save: the same
+  comparison detects unchanged versus partial state; no success is inferred;
+- crash after failed provider record/post-state save but before block save:
+  recovery consumes the saved evidence and reconstructs the same writer block;
+- crash after a successful provider record save: exact-stage recovery consumes
+  the success once and proceeds to verification without repeating Luna;
+- crash after a recovery decision save but before a retry starts: the newly
+  armed attempt marker prevents implicit invocation and requires another
+  explicit recovery decision; and
+- crash after `adopt-current` decision/state save but before verification:
+  resume enters verification/review from the saved completed stage and does not
+  invoke Luna.
+
+The decision save and corresponding stage/active-marker update must be one
+atomic run snapshot. Correction count, finding streak, Sol guidance, policy
+decisions, saved prompt, and commit/push authority remain unchanged across
+writer recovery.
+
+**Audit and reporting effects.** Complete run JSON exposes the capability,
+writer pre/post state, inspection errors, and recovery decisions. The concise
+report adds the pending writer-state classification and recovery-decision count,
+without treating adoption as a provider success or adding a provider call.
+Existing provider failure-kind totals, physical-attempt counts, retry counts,
+and timing remain derived from `ProviderRecord`. The active marker is not a
+provider attempt and must not inflate metrics.
+
+**Bounded implementation contract.** The eventual M0.4 implementation must:
+
+- make `_run()` retry authorization explicit and capability-based before spawn;
+- preserve the read-only 5/15-second unavailability retry while making every
+  workspace-write physical attempt single-shot;
+- centralize writer invocation so initial implementation, correction, explicit
+  retry, fake providers, and crash recovery share one pre/post snapshot path;
+- persist the active writer marker before provider invocation and persist a
+  returned result plus post-state before routing its outcome;
+- remove Luna stages from generic blocked-provider reinvocation and reject
+  ordinary resume from all new writer-recovery blocks;
+- implement only the two explicit, preconditioned recovery actions above;
+- reuse existing repository identity, exact path enumeration, fingerprint,
+  verification, review, failure-provenance, and atomic snapshot primitives;
+- preserve provider permissions, prompts, deadlines, termination cleanup,
+  correction/escalation budgets, and human Git gates; and
+- use only fake provider functions, temporary Git repositories, and local child
+  processes in tests. No test or implementation step invokes a live provider or
+  accesses a Jobs checkout.
+
+**Adversarial test matrix.** Tests use isolated temporary repositories and fake
+providers. No provider CLI, network service, or external target is invoked.
+
+| ID | Fixture / event | Required assertions |
+|---|---|---|
+| C1 | Read-only attempt returns trusted `unavailable` twice, then succeeds | Existing 5/15-second same-provider retries remain; three physical records carry `read_only`; provider, permissions, and prompt do not change. |
+| C2 | Workspace-write attempt returns trusted `unavailable` | Exactly one physical attempt occurs; `retry_scheduled=False`; no sleeper or second provider call runs. |
+| C3 | Workspace-write attempt times out or is interrupted | Process-group cleanup remains intact; exactly one attempt persists; no automatic or ordinary-resume reinvocation occurs. |
+| C4 | Workspace-write attempt returns quota, auth, rate-limit, configuration, or fallback error | Every kind is single-shot and retains its M0.3 failure source/code without cross-provider fallback. |
+| C5 | `_run()` receives a missing or invalid capability | Validation fails before runner/process spawn and before any attempt record is fabricated. |
+| C6 | Sonnet or Sol produces invalid structured content | Existing single read-only content retry remains distinct from transport retry; no workspace-write path gains a content retry. |
+| S1 | Initial implementation begins from a clean repository | Active marker with empty changed-path set and exact pre-fingerprint persists before the fake Luna observes its call. |
+| S2 | Correction begins from an already modified verified repository | Pre-paths/fingerprint describe the current reviewed changes, match the saved resume guard, and do not assume cleanliness. |
+| S3 | Writer succeeds and changes files | Physical record carries workspace-write and exact pre/post fingerprints; active marker survives until the success is durably routed, then normal verification runs. |
+| S4 | Writer fails without changing repository state | Attempt persists and run enters `blocked_writer_retry_required`; provider failure remains audited; ordinary resume makes zero provider calls. |
+| S5 | Writer fails after modifying tracked or untracked content | Different post-fingerprint persists and run enters `blocked_writer_partial_changes`; no verification, retry, or cleanup occurs automatically. |
+| S6 | Writer changes a Unicode, quote, literal-arrow, rename, deletion, staged, or untracked path before failing | Corrected M0.1 enumeration/fingerprint detects each state exactly and never loses a path identity. |
+| S7 | Repository enumeration/fingerprint fails after writer return | Raw provider attempt still persists, post inspection error is audited, run enters `blocked_writer_state_unknown`, and no retry occurs. |
+| S8 | Writer returns success but makes no changes | Success is not a recovery block; existing deterministic verification reaches `blocked_no_changes` without fabricating partial-change recovery. |
+| R1 | Read-only provider is in an existing resumable failure block | Ordinary explicit `resume` retains its current behavior and never changes capability or provider. |
+| R2 | Any new writer-recovery block receives ordinary `resume` | Stage remains blocked and provider-call count stays zero; output directs the operator to `recover-writer`. |
+| R3 | `retry-restored` observes the exact saved pre-fingerprint | Decision persists before one same-prompt workspace-write invocation with a new attempt ID and fresh pre-state. |
+| R4 | `retry-restored` observes any fingerprint or repository-identity mismatch | Command refuses before provider invocation and leaves the active marker/block unchanged. |
+| R5 | `adopt-current` observes valid changed state | Decision persists; no writer call or success record is created; normal verification and Sonnet review consume the current changes. |
+| R6 | `adopt-current` observes no changed paths or the original pre-fingerprint | Command refuses; a no-op cannot be adopted as an implementation. |
+| R7 | `adopt-current` observes branch, `HEAD`, origin, enumeration, or fingerprint failure | Command fails closed without provider, verification, staging, or state erasure. |
+| R8 | Operator manually reconciles partial changes, then chooses `adopt-current` | Decision records saved post-state and newly observed chosen state plus note; reconciled files enter normal verification/review. |
+| R9 | Operator manually restores/discards to the exact pre-state, then chooses `retry-restored` | Exact restoration is proven before a single explicit retry; Continuo performs no destructive cleanup itself. |
+| R10 | Crash after active marker save with no provider record and unchanged repository | Resume invokes no writer and reconstructs `blocked_writer_retry_required`. |
+| R11 | Crash after active marker save with no provider record and changed repository | Resume invokes no writer and reconstructs `blocked_writer_partial_changes`; no success is inferred. |
+| R12 | Crash after failed provider/post-state save but before block save | Recovery reconstructs the same writer block and underlying failure audit without provider reinvocation. |
+| R13 | Crash after successful provider record save but before completed-stage save | Recovery consumes the saved success once, clears the marker only through the normal path, and verifies without repeating Luna. |
+| R14 | Crash after recovery decision save before retry/adopt continuation | Saved marker/stage makes the next resume deterministic; retry never starts implicitly and adopted changes never invoke Luna. |
+| R15 | Failed correction is restored/retried or reconciled/adopted | Correction count, finding streak, Sol round/guidance, policy decisions, and prompt remain unchanged except for the audited recovery decision. |
+| A1 | Persist/load a new read-only record, writer record, active marker, and both decision actions | All capability, fingerprint, path, note, timestamp, failure, duration, and retry fields round-trip exactly. |
+| A2 | Load schema-6 records created before M0.4 | New optional fields default safely; historical JSON is not rewritten and no capability/fingerprint is invented. |
+| A3 | Legacy Luna stage lacks a pre-attempt fingerprint | It blocks as writer state unknown; generic resume and `recover-writer` cannot invoke or adopt it. |
+| A4 | Report contains mixed legacy, read-only, failed writer, and adopted writer history | Existing failure/attempt/retry totals remain stable; pending writer state and recovery count are visible; adoption is not provider success. |
+| A5 | Recovery note contains provider-looking instructions or error prose | Note is length-bounded audit text only; it is never appended to a provider prompt or used for failure classification. |
+| B1 | Partial writer changes include tracked, staged, deleted, or untracked content | M0.4 never runs reset, checkout, clean, unlink, or equivalent destructive restoration. |
+| B2 | Writer fails in the shared target checkout | No disposable worktree/clone is created; isolation remains a later milestone and the run stays bound to its saved repository identity. |
+| B3 | Another process changes the repository between snapshot and invocation | M0.4 fails closed where detected but adds no lock; one-active-run ownership and race closure remain M0.5/Q-2. |
+| B4 | New capability and recovery records are persisted | They do not introduce stable role/route IDs, general schema migrations, event sourcing, approval identity, or configuration. |
+| B5 | Compatibility and scope smoke checks | Root CLI, `jobs-orchestrator`, `JOBS_REPO`, and `src/jobs_orchestrator` remain; no Jobs access, live provider, commit, or push occurs. |
+
+**Explicit exclusions and later boundaries.** M0.4 does not automatically
+discard or revert repository content; create worktrees/clones; add target locks;
+solve concurrent external mutation; change sandbox permissions; add provider or
+route configuration; create stable role IDs; migrate historical schemas; add
+general approval identities; modify correction policy; change commit/push/merge
+authority; invoke live providers; or access a Jobs checkout.
+
+M0.5/Q-2 owns one-active-run target locking and stale-owner behavior. General
+disposable writer isolation remains a later repository/verification milestone.
+C-9 owns migrations and persisted policy; C-5 owns stable role/provider/route
+identity; approval records later add operator identity and richer gate semantics.
+M0.4's capability and writer-recovery records are the smallest safety bridge
+needed to prevent writer repetition before those abstractions exist.
+
+**Exit criteria:** the repository owner approves the capability vocabulary,
+additive schema-6 bridge, three writer block states, two explicit recovery
+actions, and non-destructive policy; every matrix row has deterministic coverage;
+all existing and new tests pass without live providers; root and compatibility
+CLI smoke checks pass; documentation and `git diff --check` pass; the complete
+implementation diff is reviewed; and no M0.5 or later behavior enters the
+change.
 
 ## Gate 2 — Stabilize persisted contracts (roadmap Milestone 1)
 
