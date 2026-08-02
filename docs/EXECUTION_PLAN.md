@@ -1786,6 +1786,10 @@ renaming control identities.
     eleven-file inventory diff and explicitly authorized commit, direct push to
     `origin/main`, and this tracker update. Gate 2.1 is complete; the explicit
     migration item remains separate and has not begun.
+  - Publication evidence (2026-08-02): implementation commit
+    `ecfc6bb04278270784bc185426d95b030057ca60` (`Inventory historical run
+    schemas`) was approved for direct push to `origin/main` with all 105 tests
+    passing.
 - [ ] Add explicit current-schema constants, stepwise migrations, rollback tests,
   and visible failure reporting.
 - [ ] Replace display labels in control flow with separate stable role, provider
