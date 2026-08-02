@@ -17,7 +17,7 @@ Preserved source material:
 
 The intake files are evidence, not requirements. When they conflict with the current source or this document, this document controls planning.
 
-Continuo is now the public product identity. Existing package, import, environment-variable, repository-slug, and CLI identifiers remain compatibility names until the generic-core migration gives them explicit aliases and a safe transition path.
+Continuo is now the public product identity and repository name. Existing package, import, environment-variable, and CLI identifiers remain compatibility names until the generic-core migration gives them explicit aliases and a safe transition path.
 
 ## 1. Executive assessment
 

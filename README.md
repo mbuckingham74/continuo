@@ -143,8 +143,8 @@ Provider CLIs are not needed to run the unit tests because the tests use determi
 ## Installation
 
 ```sh
-git clone https://github.com/mbuckingham74/orchestration-engine.git
-cd orchestration-engine
+git clone https://github.com/mbuckingham74/continuo.git
+cd continuo
 uv sync
 ```
 
