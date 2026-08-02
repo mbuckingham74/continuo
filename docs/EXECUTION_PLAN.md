@@ -1860,7 +1860,7 @@ renaming control identities.
   - Publication evidence (2026-08-02): implementation commit
     `bccde195db42f9497a489e8e51c262aa4e2f0d54` (`Add explicit run schema
     migrations`) was pushed directly to `origin/main` with all 123 tests passing.
-- [~] Replace display labels in control flow with separate stable role, provider
+- [x] Replace display labels in control flow with separate stable role, provider
   adapter, route, and model/display identities.
   - Planning evidence (2026-08-02): the Gate 2.3 contract and
     adversarial matrix below were derived from authoritative C-5, the completed
@@ -1875,8 +1875,8 @@ renaming control identities.
     identity vocabulary, schema-8 persistence/migration boundary, backward-
     compatibility treatment, recovery and retry behavior, CLI behavior, later-
     gate exclusions, and 41-row adversarial matrix, and explicitly authorized
-    commit, direct push to `origin/main`, and this tracker update. Gate 2.3
-    implementation remains a separate action and has not begun.
+    commit, direct push to `origin/main`, and this tracker update. At that
+    approval point, Gate 2.3 implementation remained a separate action.
   - Validation evidence (2026-08-02): all eight non-planning local Markdown
     links/anchors and 41 unique ordered Gate 2.3 matrix rows validate;
     `git diff --check` passes. The planning publication changed only this
@@ -1886,6 +1886,41 @@ renaming control identities.
   - Publication evidence (2026-08-02): contract commit
     `77a6b1a4450f082f38b38b65dc77cfa9f2e247d4` (`Define Gate 2.3 identity
     contract`) was pushed directly to `origin/main`.
+  - Implementation evidence (2026-08-02): the uncommitted Gate 2.3 diff adds
+    the four-entry immutable compatibility catalog, closed role/operation/
+    adapter identities, schema 8, stable pending-call and policy-source links,
+    role-keyed history/recovery/report control, exact historical V7 validation,
+    and the adjacent `7_to_8` transform with a separate immutable identity
+    migration audit. All six approved legacy provider/purpose pairs map only
+    through the closed migration table; unknown or contradictory history
+    remains archive-only; migrated records remain non-executable. Provider
+    commands, capabilities, retry/deadline policy, target ownership, Git gates,
+    fake-provider injection, and compatibility identifiers are unchanged.
+  - Validation evidence (2026-08-02): all 135 deterministic tests pass using
+    temporary repositories, synthetic historical records, recorded fixtures,
+    fake providers, and local child processes. Coverage includes all 41 Gate
+    2.3 matrix rows across display/model collisions, adapter-selected parsing,
+    role/operation/capability rejection, atomic pending identity, physical retry
+    identity, writer/policy links, V1--V7 migration, audit preservation,
+    archive-only contradictions, crash/recovery, read surfaces, reporting, and
+    later-gate boundaries. Python compilation, root and installed CLI help,
+    compatibility import, documentation links/matrix checks, and
+    `git diff --check` pass with `UV_NO_EDITABLE=1` for installed-package
+    validation. No Jobs checkout, private run, live provider, network service,
+    external target, commit, push, or later Gate 2 item was used.
+  - Review decision (2026-08-02): the repository owner reviewed the complete
+    uncommitted implementation diff and approved two review fixes before
+    publication: policy-source records now pair in order with migrated
+    decisions whenever decision and successful-record counts match, instead of
+    dropping every provable link, and the unreachable legacy-audit disposition
+    fallback in V8 classification and execution refusal was replaced with
+    explicit total audit branches and refusal messages. Regression coverage for
+    both fixes was added. The owner explicitly authorized commit, direct push
+    to `origin/main`, and this tracker update.
+  - Publication evidence (2026-08-02): implementation commit
+    `d345878e50760b79e74bb4c13b223465ac97a390` (`Implement Gate 2.3 stable
+    provider identities`) was pushed directly to `origin/main` with all 138
+    deterministic tests passing.
 - [ ] Persist immutable parsed review records linked to raw attempts; make
   unreadable legacy history visible and non-silent.
 - [ ] Persist the resolved correction and escalation policy with each run.
@@ -2416,8 +2451,9 @@ role, provider-adapter, configured-route, provider-model, and display
 identities. It also gives each persisted physical attempt a stable operation ID
 so the same role can perform more than one operation without falling back to a
 presentation string. The repository owner approved this contract and its
-adversarial matrix for publication on 2026-08-02. Runtime implementation has
-not begun and remains a separate action.
+adversarial matrix for publication on 2026-08-02. The bounded runtime
+implementation is complete and published on `origin/main` as
+`d345878e50760b79e74bb4c13b223465ac97a390`.
 
 This item is a persisted-contract bridge, not the generic provider-adapter or
 configuration implementation. Current commands, models, capabilities,
