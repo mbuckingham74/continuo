@@ -88,6 +88,21 @@ def build_terra_command(prompt: str) -> list[str]:
     ]
 
 
+def build_sol_command(prompt: str) -> list[str]:
+    """Build a read-only Sol High escalation invocation."""
+
+    return [
+        "codex",
+        "exec",
+        "--model",
+        "gpt-5.6-sol",
+        "--sandbox",
+        "read-only",
+        "--",
+        prompt,
+    ]
+
+
 def build_luna_command(prompt: str) -> list[str]:
     bounded_prompt = f"{LUNA_GIT_PROHIBITIONS}\n\n{prompt}"
     return [
@@ -109,6 +124,8 @@ def build_luna_command(prompt: str) -> list[str]:
 def _provider_label(command: list[str]) -> str:
     if "gpt-5.6-luna" in command:
         return "Luna High"
+    if "gpt-5.6-sol" in command:
+        return "Sol High"
     if "gpt-5.6-terra" in command:
         return "Terra High"
     if command and Path(command[0]).name == "claude":
@@ -204,6 +221,10 @@ def run_sonnet_review(prompt: str, repo: Path = DEFAULT_REPO) -> ReviewResult:
 
 def execute_terra_resolution(prompt: str, repo: Path = DEFAULT_REPO) -> ProviderExecution:
     return _run(build_terra_command(prompt), repo)
+
+
+def execute_sol_escalation(prompt: str, repo: Path = DEFAULT_REPO) -> ProviderExecution:
+    return _run(build_sol_command(prompt), repo)
 
 
 def execute_luna_implementation(prompt: str, repo: Path = DEFAULT_REPO) -> ProviderExecution:

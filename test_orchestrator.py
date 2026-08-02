@@ -6,8 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import orchestrator
-from models import RepoState
-from providers import ProviderExecution, build_luna_command, build_sonnet_command
+from models import RepoState, ReviewResult
+from providers import ProviderExecution, build_luna_command, build_sol_command, build_sonnet_command
 
 
 def git(repo: Path, *args: str) -> str:
@@ -44,12 +44,13 @@ class ControllerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def controller(self, sonnet, terra=None, luna=None, approval=None):
+    def controller(self, sonnet, terra=None, sol=None, luna=None, approval=None):
         return orchestrator.Controller(
             self.repo,
             self.runs,
             sonnet=sonnet,
             terra=terra or (lambda prompt, repo: ProviderExecution(["codex"], 0, "resolved", "")),
+            sol=sol or (lambda prompt, repo: ProviderExecution(["codex"], 0, "GUIDANCE: inspect the remaining defect", "")),
             luna=luna or self.luna,
             approval=approval,
         )
@@ -124,29 +125,70 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(luna_calls, [])
         self.assertIn("Human must decide", run.terra_resolution)
 
-    def test_correction_count_never_exceeds_one(self) -> None:
+    def test_multiple_corrections_escalate_to_sol_and_hard_stop(self) -> None:
         review_calls = 0
-        luna_calls = 0
+        luna_prompts = []
+        sol_prompts = []
 
         def sonnet(prompt, repo):
             nonlocal review_calls
             review_calls += 1
             if review_calls == 1:
                 return review_execution("PASS", "PASS")
-            return review_execution("FAIL", "IMPLEMENTATION_DEFECT", "still defective")
+            return review_execution(
+                "FAIL",
+                "IMPLEMENTATION_DEFECT",
+                f"implementation defect {review_calls - 1}",
+            )
 
         def luna(prompt, repo):
-            nonlocal luna_calls
-            luna_calls += 1
-            (repo / f"implementation-{luna_calls}.py").write_text("# bounded change\n")
+            luna_prompts.append(prompt)
+            (repo / f"implementation-{len(luna_prompts)}.py").write_text("# bounded change\n")
             return ProviderExecution(["codex"], 0, "implemented", "")
 
-        run = self.controller(sonnet, luna=luna).new_run("009")
+        def sol(prompt, repo):
+            sol_prompts.append(prompt)
+            return ProviderExecution(
+                ["codex"],
+                0,
+                "GUIDANCE: inspect the shared clearance suppression logic",
+                "",
+            )
 
-        self.assertEqual(run.stage, "blocked_after_correction")
-        self.assertEqual(run.correction_cycles, 1)
-        self.assertEqual(luna_calls, 2)
-        self.assertEqual(review_calls, 3)  # spec + implementation + post-correction
+        run = self.controller(sonnet, sol=sol, luna=luna).new_run("009")
+
+        self.assertEqual(run.stage, "blocked_after_escalation")
+        self.assertEqual(run.correction_cycles, 3)
+        self.assertEqual(len(luna_prompts), 4)  # initial + three corrections
+        self.assertEqual(review_calls, 5)       # spec + four implementation QAs
+        self.assertEqual(len(sol_prompts), 1)
+        self.assertIn("Prior Sonnet implementation findings", sol_prompts[0])
+        self.assertIn("Sol High escalation guidance", luna_prompts[-1])
+        self.assertEqual(run.sol_guidance, "inspect the shared clearance suppression logic")
+
+    def test_legacy_one_correction_block_can_resume_under_new_policy(self) -> None:
+        run = self.controller(
+            self.passing_sonnet,
+            approval=lambda prompt: False,
+        ).new_run("009")
+
+        run.stage = "blocked_after_correction"
+        run.correction_cycles = 1
+        run.implementation_review = ReviewResult(
+            status="FAIL",
+            category="IMPLEMENTATION_DEFECT",
+            summary="legacy blocked finding",
+        )
+        run.last_error = "implementation review still fails after one correction"
+        orchestrator.persist(run, self.runs)
+
+        resumed = self.controller(
+            self.passing_sonnet,
+            approval=lambda prompt: False,
+        ).resume(run.run_id)
+
+        self.assertEqual(resumed.stage, "commit_declined")
+        self.assertEqual(resumed.correction_cycles, 2)
 
     def test_commit_prompt_defaults_to_no(self) -> None:
         prompts = []
@@ -182,6 +224,10 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn("Write", sonnet)
         self.assertNotIn("Edit", sonnet)
         self.assertNotIn("Bash", sonnet)
+
+        sol = build_sol_command("diagnose")
+        self.assertIn("gpt-5.6-sol", sol)
+        self.assertEqual(sol[sol.index("--sandbox") + 1], "read-only")
 
         luna = build_luna_command("implement")
         self.assertEqual(luna[luna.index("--sandbox") + 1], "workspace-write")

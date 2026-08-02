@@ -21,6 +21,7 @@ from providers import (
     ProviderExecution,
     execute_luna_implementation,
     execute_sonnet_review,
+    execute_sol_escalation,
     execute_terra_resolution,
     parse_sonnet_review,
 )
@@ -221,6 +222,76 @@ def _implementation_diff(repo: Path) -> str:
     return tracked + "".join(extra)
 
 
+def _implementation_review_history(run: WorkflowRun) -> list[str]:
+    findings: list[str] = []
+    for record in run.provider_runs:
+        if record.provider != "Sonnet 5 High" or record.purpose != "implementation":
+            continue
+        try:
+            result = parse_sonnet_review(
+                ProviderExecution(
+                    record.command,
+                    record.returncode,
+                    record.stdout,
+                    record.stderr,
+                )
+            )
+        except Exception:
+            continue
+        if result.category != "PASS":
+            findings.append(result.summary)
+    return findings
+
+
+def _sol_prompt(run: WorkflowRun, repo: Path) -> str:
+    findings = _implementation_review_history(run)
+    history = "\n\n".join(
+        f"Finding {index}:\n{finding}"
+        for index, finding in enumerate(findings, start=1)
+    ) or "(no parseable prior implementation findings)"
+
+    return f"""You are Sol High, the read-only escalation executive.
+
+The implementation worker has already received two bounded correction attempts.
+Do not edit files and do not perform Git operations.
+
+Diagnose why implementation QA continues to fail and give the smallest useful
+guidance for one final Luna correction.
+
+If the remaining problem is genuinely a policy or architecture ambiguity that
+requires authority rather than implementation debugging, report that instead.
+
+Return exactly one of these forms:
+GUIDANCE: <concise root-cause analysis and bounded correction guidance>
+POLICY_AMBIGUITY: <concise reason authority is required>
+
+Task specification:
+{run.specification}
+
+Prior Sonnet implementation findings:
+{history}
+
+Current implementation diff:
+{_implementation_diff(repo)}
+"""
+
+
+def _parse_sol_response(execution: ProviderExecution) -> tuple[str, str]:
+    if execution.returncode != 0:
+        raise RuntimeError(execution.stderr or "Sol escalation failed")
+
+    text = execution.stdout.strip()
+    for kind in ("GUIDANCE", "POLICY_AMBIGUITY"):
+        prefix = kind + ":"
+        if text.startswith(prefix):
+            body = text[len(prefix):].strip()
+            if not body:
+                raise ValueError("Sol returned an empty escalation result")
+            return kind, body
+
+    raise ValueError("Sol returned an invalid escalation result")
+
+
 class Controller:
     def __init__(
         self,
@@ -228,6 +299,7 @@ class Controller:
         runs_dir: Path = RUNS,
         sonnet: Callable[[str, Path], ProviderExecution] = execute_sonnet_review,
         terra: Callable[[str, Path], ProviderExecution] = execute_terra_resolution,
+        sol: Callable[[str, Path], ProviderExecution] = execute_sol_escalation,
         luna: Callable[[str, Path], ProviderExecution] = execute_luna_implementation,
         approval: Callable[[str], bool] | None = None,
     ) -> None:
@@ -235,6 +307,7 @@ class Controller:
         self.runs_dir = runs_dir
         self.sonnet = sonnet
         self.terra = terra
+        self.sol = sol
         self.luna = luna
         self.approval = approval or (lambda prompt: typer.confirm(prompt, default=False))
 
@@ -323,6 +396,11 @@ class Controller:
                 "change that addresses it; do not change policy or perform Git operations.\n"
                 + (run.implementation_review.summary if run.implementation_review else "")
             )
+            if run.correction_cycles >= 3 and run.sol_guidance:
+                prompt += (
+                    "\n\nSol High escalation guidance for this final bounded correction:\n"
+                    + run.sol_guidance
+                )
         execution = self.luna(prompt, self.repo)
         _record_provider(run, "correction" if correction else "implementation", "Luna High", execution)
         self._save(run)
@@ -332,6 +410,35 @@ class Controller:
             self._block(run, "blocked_provider_failure", "Luna failed during implementation")
             return False
         return self._verify(run)
+
+    def _escalate_to_sol(self, run: WorkflowRun) -> bool:
+        run.stage = "sol_escalating"
+        self._save(run)
+        console.print("[cyan]Stage:[/cyan] Escalation diagnosis — Sol High")
+
+        execution = self.sol(_sol_prompt(run, self.repo), self.repo)
+        _record_provider(run, "escalation guidance", "Sol High", execution)
+        self._save(run)
+
+        try:
+            kind, guidance = _parse_sol_response(execution)
+        except Exception as exc:
+            self._block(run, "blocked_provider_failure", f"invalid Sol result: {exc}")
+            return False
+
+        run.sol_guidance = guidance
+        self._save(run)
+
+        if kind == "POLICY_AMBIGUITY":
+            self._policy_stop(
+                run,
+                "Sol High escalation identified policy ambiguity: " + guidance,
+            )
+            return False
+
+        run.stage = "sol_guidance_ready"
+        self._save(run)
+        return True
 
     def _review_and_correct(self, run: WorkflowRun) -> WorkflowRun:
         result = run.implementation_review if run.stage == "implementation_reviewed" else self._review(run, "implementation")
@@ -343,14 +450,28 @@ class Controller:
             return self._approval_gates(run)
         if result.category == "POLICY_AMBIGUITY":
             return self._policy_stop(run, result.summary)
-        if run.correction_cycles >= 1:
-            return self._block(run, "blocked_after_correction", "implementation review still fails after one correction")
-        run.correction_cycles = 1
-        run.stage = "correction_pending"
-        self._save(run)
-        if not self._implement(run, correction=True):
-            return run
-        return self._review_and_correct(run)
+
+        # Two ordinary bounded Luna corrections are allowed.
+        if run.correction_cycles < 2:
+            run.correction_cycles += 1
+            run.stage = "correction_pending"
+            self._save(run)
+            if not self._implement(run, correction=True):
+                return run
+            return self._review_and_correct(run)
+
+        # After two failed correction cycles, seek read-only executive guidance.
+        if run.correction_cycles == 2 and not run.sol_guidance:
+            if not self._escalate_to_sol(run):
+                return run
+            return self._run_from(run)
+
+        # The Sol-guided third correction has already had final Sonnet QA.
+        return self._block(
+            run,
+            "blocked_after_escalation",
+            "implementation review still fails after Sol-guided final correction",
+        )
 
     def _approval_gates(self, run: WorkflowRun) -> WorkflowRun:
         self._resume_guard(run)
@@ -427,6 +548,16 @@ class Controller:
         if run.stage == "implementation_completed" or run.stage == "correction_completed":
             if not self._verify(run):
                 return run
+        if run.stage == "sol_guidance_ready":
+            if run.correction_cycles >= 3:
+                return self._block(
+                    run,
+                    "blocked_after_escalation",
+                    "invalid correction state after Sol escalation",
+                )
+            run.correction_cycles += 1
+            run.stage = "correction_pending"
+            self._save(run)
         if run.stage == "correction_pending":
             if not self._implement(run, correction=True):
                 return run
@@ -457,10 +588,20 @@ class Controller:
     def resume(self, run_id: str) -> WorkflowRun:
         run = load_run(run_id, self.runs_dir)
         self._resume_guard(run)
+        if (
+            run.stage == "blocked_after_correction"
+            and run.correction_cycles < 2
+            and run.implementation_review is not None
+            and run.implementation_review.category not in {"PASS", "POLICY_AMBIGUITY"}
+        ):
+            run.stage = "implementation_reviewed"
+            run.last_error = None
+            self._save(run)
+            return self._review_and_correct(run)
         if run.stage.startswith("blocked") or run.stage == "pushed_awaiting_merge":
             console.print(f"Stage: {run.stage}")
             return run
-        if run.stage in {"spec_reviewing", "implementing", "correcting", "reviewing", "terra_resolving"}:
+        if run.stage in {"spec_reviewing", "implementing", "correcting", "reviewing", "terra_resolving", "sol_escalating"}:
             return self._recover_provider_stage(run)
         return self._run_from(run)
 
@@ -472,6 +613,7 @@ class Controller:
         record = run.provider_runs[-1]
         expected_provider_run = {
             "terra_resolving": ("policy clarification", "Terra High"),
+            "sol_escalating": ("escalation guidance", "Sol High"),
             "spec_reviewing": ("specification", "Sonnet 5 High"),
             "reviewing": ("implementation", "Sonnet 5 High"),
             "implementing": ("implementation", "Luna High"),
@@ -487,6 +629,21 @@ class Controller:
         if run.stage == "terra_resolving":
             run.terra_resolution = execution.stdout or execution.stderr
             return self._block(run, "blocked_policy_ambiguity", "policy ambiguity requires human approval")
+        if run.stage == "sol_escalating":
+            try:
+                kind, guidance = _parse_sol_response(execution)
+            except Exception as exc:
+                return self._block(run, "blocked_provider_failure", f"invalid Sol result: {exc}")
+            run.sol_guidance = guidance
+            self._save(run)
+            if kind == "POLICY_AMBIGUITY":
+                return self._policy_stop(
+                    run,
+                    "Sol High escalation identified policy ambiguity: " + guidance,
+                )
+            run.stage = "sol_guidance_ready"
+            self._save(run)
+            return self._run_from(run)
         if run.stage == "spec_reviewing":
             try:
                 result = parse_sonnet_review(execution)

@@ -14,6 +14,7 @@ class ModelRoute:
 
 
 TERRA = ModelRoute("architecture/policy", "codex", "gpt-5.6-terra")
+SOL = ModelRoute("escalation-executive", "codex", "gpt-5.6-sol")
 LUNA = ModelRoute("implementation", "codex", "gpt-5.6-luna")
 SONNET = ModelRoute("adversarial-review", "claude", "sonnet")
 
@@ -69,7 +70,7 @@ class WorkflowRun(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 1
+    schema_version: int = 2
     run_id: str
     created_at: str
     task_ref: str
@@ -78,10 +79,11 @@ class WorkflowRun(BaseModel):
     specification: str
     repo: RepoState
     stage: str = "created"
-    correction_cycles: int = Field(default=0, ge=0, le=1)
+    correction_cycles: int = Field(default=0, ge=0, le=3)
     spec_review: ReviewResult | None = None
     implementation_review: ReviewResult | None = None
     terra_resolution: str | None = None
+    sol_guidance: str | None = None
     changed_files: list[str] = Field(default_factory=list)
     working_tree_fingerprint: str | None = None
     verification: dict[str, object] = Field(default_factory=dict)
@@ -93,5 +95,5 @@ class WorkflowRun(BaseModel):
 
 
 if __name__ == "__main__":
-    for route in (TERRA, LUNA, SONNET):
+    for route in (TERRA, SOL, LUNA, SONNET):
         print(f"{route.role}: {route.cli} -> {route.model}")
