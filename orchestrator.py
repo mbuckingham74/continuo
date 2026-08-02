@@ -183,18 +183,32 @@ def _spec_review_prompt(run: WorkflowRun) -> str:
         "You are performing a fresh-context, read-only specification review. Read the task "
         "specification below. Return PASS only when it is sufficiently precise and bounded "
         "for implementation without inventing policy. Categorize a failure as exactly one "
-        "of IMPLEMENTATION_DEFECT, POLICY_AMBIGUITY, or SCOPE_VIOLATION. Do not edit files.\n\n"
+        "of IMPLEMENTATION_DEFECT, POLICY_AMBIGUITY, or SCOPE_VIOLATION. Always return a "
+        "finding_key: use PASS when passing; otherwise use a concise stable kebab-case defect "
+        "identity. Do not edit files.\n\n"
         + _task_prompt(run)
     )
 
 
 def _implementation_review_prompt(run: WorkflowRun, diff: str) -> str:
+    prior = _implementation_review_history(run)[-8:]
+    prior_text = "\n".join(
+        f"- {_finding_key(item)}: {item.summary[:500]}"
+        for item in prior
+    ) or "(none)"
+
     return (
         "You are performing a fresh-context, read-only adversarial implementation review. "
         "Compare the actual changed files and diff to the task specification. Return PASS "
         "only if the implementation is correct. Otherwise categorize exactly one failure "
-        "as IMPLEMENTATION_DEFECT, POLICY_AMBIGUITY, or SCOPE_VIOLATION. Do not edit files.\n\n"
+        "as IMPLEMENTATION_DEFECT, POLICY_AMBIGUITY, or SCOPE_VIOLATION. Always return a "
+        "finding_key. Use PASS when passing. For a failure, use a concise stable kebab-case "
+        "defect identity. If the current failure is materially the same defect as a prior "
+        "finding below, REUSE THAT EXACT finding_key. If it is genuinely a different defect, "
+        "create a new key. Do not edit files.\n\n"
         + _task_prompt(run)
+        + "\n\nPrior implementation QA findings:\n"
+        + prior_text
         + "\n\nChanged files:\n"
         + "\n".join(run.changed_files)
         + "\n\nDiff:\n"
@@ -222,8 +236,20 @@ def _implementation_diff(repo: Path) -> str:
     return tracked + "".join(extra)
 
 
-def _implementation_review_history(run: WorkflowRun) -> list[str]:
-    findings: list[str] = []
+MAX_TOTAL_CORRECTIONS = 12
+MAX_SOL_ESCALATIONS_PER_FINDING = 2
+
+
+def _finding_key(result: ReviewResult) -> str:
+    if result.finding_key:
+        return result.finding_key
+    normalized = " ".join(result.summary.lower().split())
+    digest = hashlib.sha256(normalized.encode()).hexdigest()[:16]
+    return f"legacy-{digest}"
+
+
+def _implementation_review_history(run: WorkflowRun) -> list[ReviewResult]:
+    findings: list[ReviewResult] = []
     for record in run.provider_runs:
         if record.provider != "Sonnet 5 High" or record.purpose != "implementation":
             continue
@@ -239,24 +265,44 @@ def _implementation_review_history(run: WorkflowRun) -> list[str]:
         except Exception:
             continue
         if result.category != "PASS":
-            findings.append(result.summary)
+            findings.append(result)
     return findings
 
 
-def _sol_prompt(run: WorkflowRun, repo: Path) -> str:
-    findings = _implementation_review_history(run)
+def _current_finding_streak(run: WorkflowRun, result: ReviewResult) -> int:
+    target = _finding_key(result)
+    streak = 0
+    for prior in reversed(_implementation_review_history(run)):
+        if _finding_key(prior) != target:
+            break
+        streak += 1
+    return max(1, streak)
+
+
+def _sol_prompt(
+    run: WorkflowRun,
+    repo: Path,
+    finding_key: str,
+    escalation_round: int,
+) -> str:
+    findings = _implementation_review_history(run)[-8:]
     history = "\n\n".join(
-        f"Finding {index}:\n{finding}"
+        f"Finding {index} [{_finding_key(finding)}]:\n{finding.summary}"
         for index, finding in enumerate(findings, start=1)
     ) or "(no parseable prior implementation findings)"
 
+    prior_guidance = run.sol_guidance or "(none)"
+
     return f"""You are Sol High, the read-only escalation executive.
 
-The implementation worker has already received two bounded correction attempts.
+The SAME implementation defect has survived a Luna correction.
+This is escalation round {escalation_round} for finding_key: {finding_key}.
+
 Do not edit files and do not perform Git operations.
 
-Diagnose why implementation QA continues to fail and give the smallest useful
-guidance for one final Luna correction.
+Diagnose why this specific defect persists and give the smallest useful guidance
+for another bounded Luna correction. Focus on the current finding; do not expand
+scope merely because other unrelated defects may exist.
 
 If the remaining problem is genuinely a policy or architecture ambiguity that
 requires authority rather than implementation debugging, report that instead.
@@ -265,10 +311,13 @@ Return exactly one of these forms:
 GUIDANCE: <concise root-cause analysis and bounded correction guidance>
 POLICY_AMBIGUITY: <concise reason authority is required>
 
+Previous Sol guidance for this finding/run:
+{prior_guidance}
+
 Task specification:
 {run.specification}
 
-Prior Sonnet implementation findings:
+Recent Sonnet implementation findings:
 {history}
 
 Current implementation diff:
@@ -396,9 +445,9 @@ class Controller:
                 "change that addresses it; do not change policy or perform Git operations.\n"
                 + (run.implementation_review.summary if run.implementation_review else "")
             )
-            if run.correction_cycles >= 3 and run.sol_guidance:
+            if run.sol_guidance:
                 prompt += (
-                    "\n\nSol High escalation guidance for this final bounded correction:\n"
+                    "\n\nSol High escalation guidance for this bounded correction:\n"
                     + run.sol_guidance
                 )
         execution = self.luna(prompt, self.repo)
@@ -411,12 +460,20 @@ class Controller:
             return False
         return self._verify(run)
 
-    def _escalate_to_sol(self, run: WorkflowRun) -> bool:
+    def _escalate_to_sol(
+        self,
+        run: WorkflowRun,
+        finding_key: str,
+        escalation_round: int,
+    ) -> bool:
         run.stage = "sol_escalating"
         self._save(run)
         console.print("[cyan]Stage:[/cyan] Escalation diagnosis — Sol High")
 
-        execution = self.sol(_sol_prompt(run, self.repo), self.repo)
+        execution = self.sol(
+            _sol_prompt(run, self.repo, finding_key, escalation_round),
+            self.repo,
+        )
         _record_provider(run, "escalation guidance", "Sol High", execution)
         self._save(run)
 
@@ -451,8 +508,19 @@ class Controller:
         if result.category == "POLICY_AMBIGUITY":
             return self._policy_stop(run, result.summary)
 
-        # Two ordinary bounded Luna corrections are allowed.
-        if run.correction_cycles < 2:
+        if run.correction_cycles >= MAX_TOTAL_CORRECTIONS:
+            return self._block(
+                run,
+                "blocked_correction_budget",
+                f"implementation still failing after {MAX_TOTAL_CORRECTIONS} total corrections",
+            )
+
+        finding_key = _finding_key(result)
+        streak = _current_finding_streak(run, result)
+
+        # New defect: one ordinary bounded Luna correction.
+        if streak == 1:
+            run.sol_guidance = None
             run.correction_cycles += 1
             run.stage = "correction_pending"
             self._save(run)
@@ -460,18 +528,19 @@ class Controller:
                 return run
             return self._review_and_correct(run)
 
-        # After two failed correction cycles, seek read-only executive guidance.
-        if run.correction_cycles == 2 and not run.sol_guidance:
-            if not self._escalate_to_sol(run):
+        # Same defect survived. Escalate to Sol twice before involving a human.
+        if streak <= 1 + MAX_SOL_ESCALATIONS_PER_FINDING:
+            escalation_round = streak - 1
+            if not self._escalate_to_sol(run, finding_key, escalation_round):
                 return run
             return self._run_from(run)
 
-        # The Sol-guided third correction has already had final Sonnet QA.
         return self._block(
             run,
-            "blocked_after_escalation",
-            "implementation review still fails after Sol-guided final correction",
+            "blocked_repeated_finding",
+            f"finding {finding_key} still fails after two Sol-guided corrections",
         )
+
 
     def _approval_gates(self, run: WorkflowRun) -> WorkflowRun:
         self._resume_guard(run)
@@ -549,11 +618,11 @@ class Controller:
             if not self._verify(run):
                 return run
         if run.stage == "sol_guidance_ready":
-            if run.correction_cycles >= 3:
+            if run.correction_cycles >= MAX_TOTAL_CORRECTIONS:
                 return self._block(
                     run,
-                    "blocked_after_escalation",
-                    "invalid correction state after Sol escalation",
+                    "blocked_correction_budget",
+                    f"implementation still failing after {MAX_TOTAL_CORRECTIONS} total corrections",
                 )
             run.correction_cycles += 1
             run.stage = "correction_pending"
@@ -589,8 +658,8 @@ class Controller:
         run = load_run(run_id, self.runs_dir)
         self._resume_guard(run)
         if (
-            run.stage == "blocked_after_correction"
-            and run.correction_cycles < 2
+            run.stage in {"blocked_after_correction", "blocked_after_escalation"}
+            and run.correction_cycles < MAX_TOTAL_CORRECTIONS
             and run.implementation_review is not None
             and run.implementation_review.category not in {"PASS", "POLICY_AMBIGUITY"}
         ):

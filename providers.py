@@ -32,9 +32,10 @@ SONNET_REVIEW_SCHEMA = {
                 "SCOPE_VIOLATION",
             ],
         },
+        "finding_key": {"type": "string", "minLength": 1, "maxLength": 120},
         "summary": {"type": "string"},
     },
-    "required": ["status", "category", "summary"],
+    "required": ["status", "category", "finding_key", "summary"],
     "additionalProperties": False,
 }
 SONNET_REVIEW_SCHEMA_JSON = json.dumps(SONNET_REVIEW_SCHEMA, separators=(",", ":"))
@@ -212,6 +213,10 @@ def parse_sonnet_review(execution: ProviderExecution) -> ReviewResult:
     result = ReviewResult.model_validate(structured)
     if (result.status == "PASS") != (result.category == "PASS"):
         raise ValueError("Sonnet returned inconsistent status/category")
+    if result.category == "PASS" and result.finding_key not in (None, "PASS"):
+        raise ValueError("Sonnet PASS must use finding_key PASS")
+    if result.category != "PASS" and result.finding_key == "PASS":
+        raise ValueError("Sonnet failure cannot use finding_key PASS")
     return result
 
 

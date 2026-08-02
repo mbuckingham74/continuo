@@ -20,8 +20,22 @@ def git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def review_execution(status: str, category: str, summary: str = "ok") -> ProviderExecution:
-    payload = {"structured_output": {"status": status, "category": category, "summary": summary}}
+def review_execution(
+    status: str,
+    category: str,
+    summary: str = "ok",
+    finding_key: str | None = None,
+) -> ProviderExecution:
+    if finding_key is None:
+        finding_key = "PASS" if category == "PASS" else "test-finding"
+    payload = {
+        "structured_output": {
+            "status": status,
+            "category": category,
+            "finding_key": finding_key,
+            "summary": summary,
+        }
+    }
     return ProviderExecution(["claude"], 0, json.dumps(payload), "")
 
 
@@ -125,7 +139,50 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(luna_calls, [])
         self.assertIn("Human must decide", run.terra_resolution)
 
-    def test_multiple_corrections_escalate_to_sol_and_hard_stop(self) -> None:
+    def test_new_findings_continue_without_sol_until_pass(self) -> None:
+        review_calls = 0
+        luna_calls = 0
+        sol_calls = 0
+
+        def sonnet(prompt, repo):
+            nonlocal review_calls
+            review_calls += 1
+            if review_calls == 1:
+                return review_execution("PASS", "PASS")
+            if review_calls <= 4:
+                index = review_calls - 1
+                return review_execution(
+                    "FAIL",
+                    "IMPLEMENTATION_DEFECT",
+                    f"distinct defect {index}",
+                    f"defect-{index}",
+                )
+            return review_execution("PASS", "PASS")
+
+        def luna(prompt, repo):
+            nonlocal luna_calls
+            luna_calls += 1
+            (repo / f"implementation-{luna_calls}.py").write_text("# bounded change\n")
+            return ProviderExecution(["codex"], 0, "implemented", "")
+
+        def sol(prompt, repo):
+            nonlocal sol_calls
+            sol_calls += 1
+            return ProviderExecution(["codex"], 0, "GUIDANCE: unexpected", "")
+
+        run = self.controller(
+            sonnet,
+            sol=sol,
+            luna=luna,
+            approval=lambda prompt: False,
+        ).new_run("009")
+
+        self.assertEqual(run.stage, "commit_declined")
+        self.assertEqual(run.correction_cycles, 3)
+        self.assertEqual(luna_calls, 4)  # initial + A/B/C corrections
+        self.assertEqual(sol_calls, 0)
+
+    def test_same_finding_gets_two_sol_escalations_then_blocks(self) -> None:
         review_calls = 0
         luna_prompts = []
         sol_prompts = []
@@ -138,7 +195,8 @@ class ControllerTests(unittest.TestCase):
             return review_execution(
                 "FAIL",
                 "IMPLEMENTATION_DEFECT",
-                f"implementation defect {review_calls - 1}",
+                "same persistent defect",
+                "persistent-defect",
             )
 
         def luna(prompt, repo):
@@ -151,20 +209,54 @@ class ControllerTests(unittest.TestCase):
             return ProviderExecution(
                 ["codex"],
                 0,
-                "GUIDANCE: inspect the shared clearance suppression logic",
+                f"GUIDANCE: diagnostic round {len(sol_prompts)}",
                 "",
             )
 
         run = self.controller(sonnet, sol=sol, luna=luna).new_run("009")
 
-        self.assertEqual(run.stage, "blocked_after_escalation")
+        self.assertEqual(run.stage, "blocked_repeated_finding")
         self.assertEqual(run.correction_cycles, 3)
-        self.assertEqual(len(luna_prompts), 4)  # initial + three corrections
-        self.assertEqual(review_calls, 5)       # spec + four implementation QAs
-        self.assertEqual(len(sol_prompts), 1)
-        self.assertIn("Prior Sonnet implementation findings", sol_prompts[0])
+        self.assertEqual(len(luna_prompts), 4)  # initial + ordinary + two Sol-guided
+        self.assertEqual(len(sol_prompts), 2)
+        self.assertIn("escalation round 1", sol_prompts[0])
+        self.assertIn("escalation round 2", sol_prompts[1])
         self.assertIn("Sol High escalation guidance", luna_prompts[-1])
-        self.assertEqual(run.sol_guidance, "inspect the shared clearance suppression logic")
+
+    def test_emergency_total_correction_budget_blocks(self) -> None:
+        review_calls = 0
+        luna_calls = 0
+        sol_calls = 0
+
+        def sonnet(prompt, repo):
+            nonlocal review_calls
+            review_calls += 1
+            if review_calls == 1:
+                return review_execution("PASS", "PASS")
+            index = review_calls - 1
+            return review_execution(
+                "FAIL",
+                "IMPLEMENTATION_DEFECT",
+                f"new defect {index}",
+                f"new-defect-{index}",
+            )
+
+        def luna(prompt, repo):
+            nonlocal luna_calls
+            luna_calls += 1
+            (repo / f"implementation-{luna_calls}.py").write_text("# bounded change\n")
+            return ProviderExecution(["codex"], 0, "implemented", "")
+
+        def sol(prompt, repo):
+            nonlocal sol_calls
+            sol_calls += 1
+            return ProviderExecution(["codex"], 0, "GUIDANCE: unexpected", "")
+
+        run = self.controller(sonnet, sol=sol, luna=luna).new_run("009")
+
+        self.assertEqual(run.stage, "blocked_correction_budget")
+        self.assertEqual(run.correction_cycles, 12)
+        self.assertEqual(sol_calls, 0)
 
     def test_legacy_one_correction_block_can_resume_under_new_policy(self) -> None:
         run = self.controller(
@@ -215,6 +307,69 @@ class ControllerTests(unittest.TestCase):
 
         self.assertEqual(run.stage, "push_declined")
         self.assertEqual(prompts, [("Commit these changes?", False), ("Push this commit to origin?", False)])
+
+    def test_blocked_after_escalation_with_new_finding_resumes_normally(self) -> None:
+        luna_calls = 0
+        sol_calls = 0
+
+        run = self.controller(
+            self.passing_sonnet,
+            approval=lambda prompt: False,
+        ).new_run("009")
+
+        # Simulate prior QA history for a different defect.
+        old = review_execution(
+            "FAIL",
+            "IMPLEMENTATION_DEFECT",
+            "old attendance defect",
+            "attendance-linking",
+        )
+        run.provider_runs.append(
+            orchestrator.ProviderRecord(
+                provider="Sonnet 5 High",
+                purpose="implementation",
+                command=old.command,
+                returncode=old.returncode,
+                stdout=old.stdout,
+                stderr=old.stderr,
+            )
+        )
+
+        # Simulate the real T008-style hard stop: Sol path exhausted,
+        # but final QA has uncovered a genuinely new defect.
+        run.stage = "blocked_after_escalation"
+        run.correction_cycles = 3
+        run.implementation_review = ReviewResult(
+            status="FAIL",
+            category="IMPLEMENTATION_DEFECT",
+            finding_key="geography-modal-alternatives",
+            summary="new geography modal defect",
+        )
+        run.last_error = "implementation review still fails after Sol-guided final correction"
+        orchestrator.persist(run, self.runs)
+
+        def luna(prompt, repo):
+            nonlocal luna_calls
+            luna_calls += 1
+            (repo / "new-finding-fix.py").write_text("# bounded change\n")
+            return ProviderExecution(["codex"], 0, "implemented", "")
+
+        def sol(prompt, repo):
+            nonlocal sol_calls
+            sol_calls += 1
+            return ProviderExecution(["codex"], 0, "GUIDANCE: unexpected", "")
+
+        resumed = self.controller(
+            self.passing_sonnet,
+            sol=sol,
+            luna=luna,
+            approval=lambda prompt: False,
+        ).resume(run.run_id)
+
+        self.assertEqual(resumed.stage, "commit_declined")
+        self.assertEqual(resumed.correction_cycles, 4)
+        self.assertEqual(luna_calls, 1)
+        self.assertEqual(sol_calls, 0)
 
     def test_provider_commands_preserve_restrictions(self) -> None:
         sonnet = build_sonnet_command("review")

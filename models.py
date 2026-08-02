@@ -35,6 +35,7 @@ class ReviewResult(BaseModel):
 
     status: ReviewStatus
     category: ReviewCategory
+    finding_key: str | None = None
     summary: str
 
 
@@ -70,7 +71,7 @@ class WorkflowRun(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 2
+    schema_version: int = 3
     run_id: str
     created_at: str
     task_ref: str
@@ -79,7 +80,7 @@ class WorkflowRun(BaseModel):
     specification: str
     repo: RepoState
     stage: str = "created"
-    correction_cycles: int = Field(default=0, ge=0, le=3)
+    correction_cycles: int = Field(default=0, ge=0, le=12)
     spec_review: ReviewResult | None = None
     implementation_review: ReviewResult | None = None
     terra_resolution: str | None = None
