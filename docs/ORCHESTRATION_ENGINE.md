@@ -116,6 +116,7 @@ Owns provider command construction and subprocess execution boundaries:
 - adds Luna's Git prohibitions to every implementation prompt;
 - emits start, completion, and heartbeat messages;
 - captures duration and output per attempt;
+- enforces provider deadlines with process-group TERM/KILL cleanup;
 - classifies provider failures;
 - performs bounded same-provider unavailability retries; and
 - validates Sonnet's schema-constrained review output.
@@ -388,6 +389,8 @@ The provider boundary classifies nonzero exits deterministically using conservat
 - `auth`;
 - `rate_limit`;
 - `unavailable`;
+- `timeout`;
+- `interrupted`;
 - `configuration`; or
 - `provider_error` for an unclassified failure.
 
@@ -404,6 +407,12 @@ Only failures classified as `unavailable` are retried automatically. The delays 
 There is no automatic cross-provider fallback. A Sonnet outage is retried as Sonnet; the controller will not substitute Terra, Sol, Luna, or another vendor. After the bounded attempts, the run blocks as `blocked_provider_unavailable`.
 
 This preserves role semantics, avoids permission drift, and prevents an infrastructure problem from silently changing the review or implementation policy.
+
+### Timeout and interruption stops
+
+Read-only provider operations have a 30-minute hard deadline and workspace-writer operations have a 60-minute hard deadline. Real subprocesses run in isolated process groups. On deadline or operator interruption, the controller sends TERM, allows a five-second grace period, escalates to KILL when necessary, reaps the direct child, and captures available output plus a cleanup diagnostic.
+
+`timeout` and `interrupted` are terminal attempt outcomes. They never enter the ordinary unavailability retry and block as `blocked_provider_timeout` or `blocked_provider_interrupted`. Those blocks are deliberately not resumable until capability-aware writer reconciliation is implemented.
 
 ### Invalid structured output
 
@@ -541,7 +550,7 @@ For real subprocess calls, the provider runner prints:
 - completion duration and exit code; and
 - scheduled same-provider retry delay.
 
-The heartbeat indicates liveness only. There is no provider timeout or cancellation policy today.
+The heartbeat indicates liveness within the configured hard deadline; it does not extend the deadline. Timeout and interruption cleanup outcomes are included in the persisted attempt record.
 
 ### Run report
 
@@ -625,7 +634,7 @@ Lists recent runs or prints one run's complete JSON.
 
 ## 20. Current tests and what they cover
 
-The current suite has 31 `unittest` cases. It creates isolated temporary Git repositories and substitutes deterministic fake provider functions; it does not call live model providers or mutate the real Jobs repository.
+The current suite has 44 `unittest` cases. It creates isolated temporary Git repositories, substitutes deterministic fake provider functions, and uses real local Python child/grandchild processes for supervisor tests; it does not call live model providers or mutate the real Jobs repository.
 
 ### Preflight and repository safety
 
@@ -658,13 +667,15 @@ The current suite has 31 `unittest` cases. It creates isolated temporary Git rep
 - timing and run-report metrics are derived safely, including legacy untimed records;
 - quota failure blocks the whole run and explicit resume retries only the interrupted review stage;
 - unavailability retries only the same provider, with per-attempt audit fields;
+- real provider processes enforce deadlines, preserve partial output, and clean up process groups through TERM/KILL escalation;
+- timeout and interruption persist distinct non-resumable blocked stages without provider retry;
 - quota, billing, auth, rate-limit, unavailable, and configuration classifications are deterministic for representative messages;
 - malformed Sonnet output receives one same-provider retry;
 - provider command construction preserves Sonnet read-only tools, Sol read-only sandboxing, and Luna workspace/network/Git restrictions.
 
 ### Not covered today
 
-There are no live-provider integration tests, project-specific verification tests, CLI subprocess/end-to-end tests, concurrency tests, persistence-corruption recovery tests beyond status display, schema-migration tests, actual remote push tests, timeout tests, or tests for every blocked/recovery stage combination.
+There are no live-provider integration tests, project-specific verification tests, full CLI end-to-end tests, concurrency tests, persistence-corruption recovery tests beyond status display, schema-migration tests, actual remote push tests, Windows process-tree integration tests, or tests for every blocked/recovery stage combination.
 
 ## 21. Current limitations and technical debt
 
@@ -708,7 +719,7 @@ This is the most important generalization debt. Model/provider names must be abs
 
 - failure classification relies on output substring/regex matching;
 - retry delays and limits are hard-coded;
-- there is no timeout, cancellation, token, cost, or context-size enforcement;
+- timeout/interruption enforcement exists, but deadline values are hard-coded and token, cost, and context-size ceilings are not enforced;
 - Sonnet uses JSON Schema, while Sol and Terra rely on textual conventions;
 - provider health is local to one invocation; there is no cross-run circuit breaker;
 - there is intentionally no fallback, but there is not yet a configuration model for explicitly approved equivalent routes.

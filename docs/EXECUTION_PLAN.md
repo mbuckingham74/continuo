@@ -273,8 +273,38 @@ baseline for extraction. No live Jobs pilot occurs in this gate.
   - Review decision (2026-08-02): the repository owner approved the complete
     five-file diff and explicitly authorized commit and push. M0.1 is complete;
     M0.2 remains a separate bounded item.
-- [ ] **M0.2 / C-2:** add provider deadlines, cancellation, process-group cleanup,
+  - Publication evidence (2026-08-02): commit
+    `7aa16a7e77f0f4213c0602b11bf885bdbecb41d6` (`Fix NUL-delimited Git change
+    parsing`) was pushed directly to `origin/main` with all 31 tests passing.
+- [x] **M0.2 / C-2:** add provider deadlines, cancellation, process-group cleanup,
   partial-output capture, and real child-process failure tests.
+  - Start evidence (2026-08-02): M0.1 was published before M0.2 began. Current
+    provider execution and persistence boundaries were reviewed before M0.2
+    source changes began.
+  - Implementation evidence (2026-08-02): real provider subprocesses now run in
+    isolated process groups under approved 30/60-minute monotonic deadlines,
+    retain five-second heartbeats, capture partial output, and escalate from TERM
+    through a five-second grace to KILL before reaping the direct child.
+  - State/recovery evidence (2026-08-02): `timeout` and `interrupted` extend the
+    existing failure vocabulary without a schema bump, persist through existing
+    attempt fields, map to distinct blocked stages, and are excluded from both
+    automatic outage retry and ordinary blocked-provider resume. Recovery from a
+    saved timeout attempt recreates the same block without provider reinvocation.
+  - Adversarial evidence (2026-08-02): real local Python children cover success,
+    partial output, graceful TERM, forced KILL, grandchild cleanup,
+    `KeyboardInterrupt`, unexpected polling exceptions, inherited descendant
+    pipes, deadline-boundary arbitration, invalid timing, and launch failure.
+    Controller tests cover read-only/writer timeout, interruption, persistence,
+    non-retry, non-resume, and crash recovery. All 44 tests pass without live
+    providers.
+  - Validation (2026-08-02): Python compilation, the root CLI help check, and the
+    preserved `jobs-orchestrator` help entry point from a clean temporary
+    editable install pass. Ten local Markdown targets and all 15 ordered M0.2
+    matrix rows validate; `git diff --check` passes. No live provider, external
+    target, commit, or push was used during implementation.
+  - Review decision (2026-08-02): the repository owner approved the complete
+    seven-file diff and explicitly authorized commit and push. M0.2 is complete;
+    M0.3 remains a separate bounded item.
 - [ ] **M0.3 / C-3/C-4:** normalize failure evidence sources and distinguish Claude
   transport/envelope errors from invalid review content using recorded fixtures.
 - [ ] **M0.4 / A-1:** make the provider-attempt lifecycle capability-aware; allow
@@ -287,6 +317,122 @@ baseline for extraction. No live Jobs pilot occurs in this gate.
 
 M0.2 through M0.4 must share one designed provider-attempt vocabulary, but each
 implementation and diff remains independently reviewable.
+
+### M0.2 / C-2 bounded execution note (approved 2026-08-02)
+
+**Status and boundary.** The repository owner approved this note and its
+provisional deadline ceilings on 2026-08-02 before provider source or persisted
+models changed. M0.2 owns process lifetime and cleanup only. M0.3 will separately
+normalize provider error evidence and Claude envelopes; M0.4 will separately
+make outage retry and uncertain writer recovery capability-aware.
+
+**Invariant and current failure.** Every provider process and descendant must
+have a controller-owned terminal lifetime. Deadline, operator interruption, or
+polling cancellation must stop the complete process group, capture available
+stdout/stderr, record one terminal attempt, and prevent further workflow work.
+At `7aa16a7e77f0f4213c0602b11bf885bdbecb41d6`, `_run()` starts a provider with
+`Popen`, polls `communicate(timeout=0.2)`, and emits five-second heartbeats, but
+has no deadline, isolated process group, termination escalation, or
+`KeyboardInterrupt` cleanup. The injected test runner bypasses the real process
+boundary, and existing tests cannot prove descendant cleanup.
+
+**Shared attempt vocabulary.** M0.2 will preserve the existing
+`ProviderAttempt`/`ProviderExecution` boundary and add terminal failure kinds
+`timeout` and `interrupted`. A timed-out or interrupted attempt is neither
+`unavailable` nor eligible for automatic retry, regardless of role. The
+controller will persist captured output and duration through the existing
+`ProviderRecord` fields and map these outcomes to distinct
+`blocked_provider_timeout` and `blocked_provider_interrupted` stages. These
+stages will not be resumable until M0.4 defines capability-aware reconciliation;
+this prevents explicit resume from blindly repeating a timed-out writer.
+
+No new persisted field or schema-version change is planned. A concise
+controller-generated termination diagnostic may follow captured stderr so the
+existing audit record identifies deadline, TERM/grace outcome, and whether KILL
+was required. `failure_kind` remains authoritative, so the diagnostic is not
+reclassified as provider unavailability. Old run records remain loadable because
+the existing optional field is only gaining accepted values.
+
+**Bounded supervisor contract.** The M0.2 diff must:
+
+- route real provider subprocesses through one shared synchronous supervisor;
+  keep command construction, structured-output parsing, prompts, and provider
+  permissions unchanged;
+- require a positive finite deadline for every production provider operation,
+  use `time.monotonic()`, retain five-second heartbeats, and make the polling
+  interval independently testable without busy waiting;
+- create a new process group/session (`start_new_session=True` on POSIX and the
+  corresponding new-process-group flag on Windows) without invoking a shell;
+- on deadline or interruption, signal the process group for graceful shutdown,
+  wait a bounded grace period, force-kill the remaining group/tree, and always
+  reap the direct child;
+- preserve partial stdout/stderr without duplicating chunks across repeated
+  `communicate()` calls, including output emitted by shutdown handlers;
+- convert deadline and `KeyboardInterrupt` outcomes into terminal executions so
+  the already-armed controller stage can persist the attempt before blocking;
+  cleanup must also run before re-raising any other cancellation/base exception;
+- never schedule the existing 5/15-second same-provider outage retry for
+  `timeout` or `interrupted`; do not otherwise change unavailable retry policy in
+  this item;
+- retain launch-error behavior for `OSError`, restore any temporary signal state,
+  and avoid leaving pipes, direct children, or descendants alive; and
+- use real short-lived Python child/grandchild processes for cleanup tests. Fake
+  runners remain useful only for existing retry classification tests and cannot
+  satisfy the supervisor exit criteria.
+
+**Deadline decision required.** The five local Continuo run records contain zero
+timed provider attempts, so no measured duration distribution exists. The
+recommended initial values are conservative hard safety ceilings, explicitly
+not tuned performance targets:
+
+| Operation capability | Proposed deadline | Rationale |
+|---|---:|---|
+| Read-only review/advice | 30 minutes | Long enough for current bounded prompts while preventing an abandoned CLI from living indefinitely. |
+| Workspace writer | 60 minutes | Allows larger implementation work while still bounding uncertain side effects. |
+| TERM grace before KILL | 5 seconds | Gives CLI shutdown handlers time to flush output without materially extending a timed-out run. |
+
+These constants will live at the provider boundary only and will not become the
+future configuration schema. The repository owner approved these provisional
+ceilings on 2026-08-02; later observed durations may justify a separate
+configuration task.
+
+**Persistence, retry, crash/resume, and audit impact.** A timeout/interruption
+attempt must be appended once with command, nonzero return code, partial streams,
+duration, terminal failure kind, and `retry_scheduled=False` before the run moves
+to its distinct blocked stage. The saved provider prompt/stage remain available
+for diagnosis, but ordinary `resume` must not reinvoke it. A controller crash
+after the record save consumes that failure record and reconstructs the same
+block; a crash before any record remains `blocked_interrupted_provider` under the
+existing recovery rule. No provider substitution, correction-budget change,
+approval change, schema migration, or target-repository mutation is in scope.
+
+**Adversarial test matrix.** Tests use only local temporary directories and the
+current Python executable; no provider CLI or external target is invoked.
+
+| ID | Fixture / event | Required assertions |
+|---|---|---|
+| S1 | Child exits successfully before deadline | Exact stdout/stderr and return code are captured; duration is nonnegative; no cleanup signal or retry occurs. |
+| S2 | Child exceeds a short deadline after emitting both streams | Attempt ends as `timeout`, preserves partial output, records no retry, and returns within deadline plus grace tolerance. |
+| S3 | Child handles TERM and emits final output | Graceful output is captured, direct child is reaped, and KILL is not reported. |
+| S4 | Child ignores TERM | Supervisor waits only the configured grace, force-kills the group, reaps the child, and records that escalation. |
+| S5 | Child spawns a sleeping grandchild | Deadline cleanup leaves neither direct child nor descendant running. |
+| S6 | Descendant closes or inherits output pipes unusually | Cleanup and final collection remain bounded; no `communicate()` hang survives the grace/kill path. |
+| S7 | Operator `KeyboardInterrupt` while a real child/grandchild runs | Group cleanup completes, partial output is retained as `interrupted`, no retry occurs, and the controller persists `blocked_provider_interrupted`. |
+| S8 | Unexpected base exception during polling | Group is cleaned and reaped before the original exception propagates; no success record is fabricated. |
+| S9 | Executable is missing or launch is denied | Existing configuration/launch failure remains bounded without attempting group cleanup for a nonexistent PID. |
+| S10 | Deadline is zero, negative, NaN, or infinite | Validation rejects it before spawning a process. |
+| S11 | Provider exits near the deadline boundary | Exactly one terminal outcome and one attempt record exist; no double signal, duplicate output, or retry occurs. |
+| S12 | Existing mocked unavailable results | The 5/15-second retry sequence remains unchanged, proving M0.2 did not absorb M0.4. |
+| C1 | Read-only provider timeout reaches controller | Raw attempt persists and run blocks as `blocked_provider_timeout`; no alternate provider or structured-output retry runs. |
+| C2 | Writer timeout reaches controller | Same terminal block occurs with no automatic or explicit-resume reinvocation; repository reconciliation remains M0.4. |
+| R1 | Crash after timeout attempt save but before block save | Recovery consumes the saved timeout attempt and deterministically restores the timeout block without rerunning the provider. |
+
+**Explicit exclusions.** M0.2 does not narrow transcript-based failure
+classification, parse Claude envelopes, make ordinary outage retries
+capability-aware, fingerprint writer state before attempts, define partial-writer
+reconciliation, add async execution, adopt an event log, add route configuration,
+rename providers or compatibility identifiers, invoke live providers, or touch a
+Jobs checkout. Those remain M0.3, M0.4, or later roadmap work.
 
 **Exit criteria:** all Milestone 0 exit criteria in the roadmap pass, the full
 test suite passes without live providers, and the current Jobs-compatible

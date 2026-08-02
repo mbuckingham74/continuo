@@ -1,7 +1,13 @@
+import _thread
 import hashlib
 import json
+import math
+import os
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -1114,6 +1120,366 @@ class ControllerTests(unittest.TestCase):
         luna_prompt = luna[-1]
         for forbidden in ("commit", "push", "branch", "merge", ".git"):
             self.assertIn(forbidden, luna_prompt)
+
+    def test_read_only_timeout_persists_distinct_nonresumable_block(self) -> None:
+        calls = 0
+
+        def timed_out_sonnet(prompt, repo):
+            nonlocal calls
+            calls += 1
+            return providers._run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import time; print('review partial', flush=True); time.sleep(60)",
+                ],
+                repo,
+                deadline_seconds=0.15,
+                term_grace_seconds=0.15,
+                poll_interval_seconds=0.02,
+                heartbeat_seconds=60.0,
+            )
+
+        controller = self.controller(timed_out_sonnet)
+        run = controller.new_run("009")
+
+        self.assertEqual(run.stage, "blocked_provider_timeout")
+        self.assertEqual(calls, 1)
+        self.assertEqual(run.provider_runs[-1].failure_kind, "timeout")
+        self.assertFalse(run.provider_runs[-1].retry_scheduled)
+        self.assertIn("review partial", run.provider_runs[-1].stdout)
+
+        resumed = controller.resume(run.run_id)
+        self.assertEqual(resumed.stage, "blocked_provider_timeout")
+        self.assertEqual(calls, 1)
+
+    def test_writer_timeout_is_not_retried_or_resumed(self) -> None:
+        luna_calls = 0
+
+        def timed_out_luna(prompt, repo):
+            nonlocal luna_calls
+            luna_calls += 1
+            return providers._run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import time; print('writer partial', flush=True); time.sleep(60)",
+                ],
+                repo,
+                deadline_seconds=0.15,
+                term_grace_seconds=0.15,
+                poll_interval_seconds=0.02,
+                heartbeat_seconds=60.0,
+            )
+
+        controller = self.controller(
+            self.passing_sonnet,
+            luna=timed_out_luna,
+        )
+        run = controller.new_run("009")
+
+        self.assertEqual(run.stage, "blocked_provider_timeout")
+        self.assertEqual(luna_calls, 1)
+        self.assertEqual(run.provider_runs[-1].failure_kind, "timeout")
+        self.assertIn("writer partial", run.provider_runs[-1].stdout)
+
+        resumed = controller.resume(run.run_id)
+        self.assertEqual(resumed.stage, "blocked_provider_timeout")
+        self.assertEqual(luna_calls, 1)
+
+    def test_timeout_record_recovery_reconstructs_block_without_provider(self) -> None:
+        provider_calls = 0
+
+        def unexpected_provider(prompt, repo):
+            nonlocal provider_calls
+            provider_calls += 1
+            return review_execution("PASS", "PASS")
+
+        run = WorkflowRun(
+            run_id="timeout-recovery",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Test timeout recovery.",
+            repo=orchestrator.repo_state(self.repo),
+            stage="spec_reviewing",
+            provider_resume_stage="spec_reviewing",
+            provider_resume_prompt="saved prompt",
+        )
+        run.provider_runs.append(
+            orchestrator.ProviderRecord(
+                provider="Sonnet 5 High",
+                purpose="specification",
+                command=["claude"],
+                returncode=providers.PROVIDER_TIMEOUT_RETURN_CODE,
+                stdout="partial",
+                stderr="[continuo] deadline exceeded",
+                duration_seconds=1.0,
+                failure_kind="timeout",
+                retry_scheduled=False,
+            )
+        )
+        orchestrator.persist(run, self.runs)
+
+        recovered = self.controller(unexpected_provider).resume(run.run_id)
+
+        self.assertEqual(recovered.stage, "blocked_provider_timeout")
+        self.assertEqual(provider_calls, 0)
+        self.assertEqual(recovered.provider_runs[-1].failure_kind, "timeout")
+
+    def test_interrupted_provider_persists_distinct_nonresumable_block(self) -> None:
+        calls = 0
+
+        def interrupted_sonnet(prompt, repo):
+            nonlocal calls
+            calls += 1
+            return ProviderExecution(
+                command=["claude"],
+                returncode=providers.PROVIDER_INTERRUPTED_RETURN_CODE,
+                stdout="partial",
+                stderr="[continuo] operator interruption received",
+                duration_seconds=0.5,
+                failure_kind="interrupted",
+            )
+
+        controller = self.controller(interrupted_sonnet)
+        run = controller.new_run("009")
+
+        self.assertEqual(run.stage, "blocked_provider_interrupted")
+        self.assertEqual(run.provider_runs[-1].failure_kind, "interrupted")
+        self.assertEqual(calls, 1)
+
+        resumed = controller.resume(run.run_id)
+        self.assertEqual(resumed.stage, "blocked_provider_interrupted")
+        self.assertEqual(calls, 1)
+
+
+@unittest.skipUnless(os.name == "posix", "real process-group tests require POSIX")
+class ProviderSupervisorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temp.name)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def run_child(
+        self,
+        source: str,
+        *,
+        deadline: float = 0.2,
+        grace: float = 0.2,
+    ) -> ProviderExecution:
+        return providers._run(
+            [sys.executable, "-c", source],
+            self.repo,
+            deadline_seconds=deadline,
+            term_grace_seconds=grace,
+            poll_interval_seconds=0.02,
+            heartbeat_seconds=60.0,
+        )
+
+    def assert_process_gone(self, pid: int) -> None:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+            if not state or state.startswith("Z"):
+                return
+            time.sleep(0.02)
+        self.fail(f"process {pid} survived supervisor cleanup")
+
+    def test_success_before_deadline_preserves_streams(self) -> None:
+        execution = self.run_child(
+            "import sys; print('child stdout'); print('child stderr', file=sys.stderr)"
+        )
+
+        self.assertEqual(execution.returncode, 0)
+        self.assertEqual(execution.stdout, "child stdout\n")
+        self.assertEqual(execution.stderr, "child stderr\n")
+        self.assertIsNone(execution.failure_kind)
+        self.assertEqual(len(execution.attempts), 1)
+        self.assertFalse(execution.attempts[0].retry_scheduled)
+
+    def test_timeout_captures_partial_output_and_graceful_shutdown(self) -> None:
+        source = """
+import signal
+import sys
+import time
+
+def stop(*_):
+    print("term handled", file=sys.stderr, flush=True)
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, stop)
+print("partial stdout", flush=True)
+print("partial stderr", file=sys.stderr, flush=True)
+while True:
+    time.sleep(0.05)
+"""
+        execution = self.run_child(source)
+
+        self.assertEqual(execution.returncode, providers.PROVIDER_TIMEOUT_RETURN_CODE)
+        self.assertEqual(execution.failure_kind, "timeout")
+        self.assertEqual(execution.stdout.count("partial stdout"), 1)
+        self.assertEqual(execution.stderr.count("partial stderr"), 1)
+        self.assertIn("term handled", execution.stderr)
+        self.assertIn("exited during TERM grace", execution.stderr)
+        self.assertNotIn("forced termination", execution.stderr)
+        self.assertFalse(execution.attempts[0].retry_scheduled)
+
+    def test_timeout_force_kills_parent_and_grandchild(self) -> None:
+        source = """
+import os
+import signal
+import subprocess
+import sys
+import time
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child = subprocess.Popen([
+    sys.executable,
+    "-c",
+    "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+])
+print(f"{os.getpid()} {child.pid}", flush=True)
+print("tree partial", file=sys.stderr, flush=True)
+while True:
+    time.sleep(0.05)
+"""
+        started = time.monotonic()
+        execution = self.run_child(source, deadline=0.2, grace=0.15)
+        elapsed = time.monotonic() - started
+
+        parent_pid, child_pid = map(int, execution.stdout.strip().split())
+        self.assertEqual(execution.failure_kind, "timeout")
+        self.assertLess(elapsed, 1.5)
+        self.assertIn("tree partial", execution.stderr)
+        self.assertIn("forced termination", execution.stderr)
+        self.assert_process_gone(parent_pid)
+        self.assert_process_gone(child_pid)
+
+    def test_inherited_descendant_pipes_do_not_outlive_cleanup(self) -> None:
+        source = """
+import os
+import subprocess
+import sys
+
+child = subprocess.Popen([
+    sys.executable,
+    "-c",
+    "import os,time; print(f'grandchild {os.getpid()}', flush=True); time.sleep(60)",
+])
+print(f"parent {os.getpid()} child {child.pid}", flush=True)
+"""
+        started = time.monotonic()
+        execution = self.run_child(source, deadline=0.2, grace=0.15)
+        elapsed = time.monotonic() - started
+
+        lines = execution.stdout.strip().splitlines()
+        parent_line = next(line for line in lines if line.startswith("parent "))
+        grandchild_line = next(
+            line for line in lines if line.startswith("grandchild ")
+        )
+        parent_pid = int(parent_line.split()[1])
+        child_pid = int(parent_line.split()[3])
+        self.assertEqual(grandchild_line, f"grandchild {child_pid}")
+        self.assertEqual(execution.failure_kind, "timeout")
+        self.assertLess(elapsed, 1.5)
+        self.assert_process_gone(parent_pid)
+        self.assert_process_gone(child_pid)
+
+    def test_deadline_boundary_produces_one_terminal_attempt(self) -> None:
+        execution = self.run_child(
+            "import time; print('boundary', flush=True); time.sleep(0.2)",
+            deadline=0.2,
+            grace=0.15,
+        )
+
+        self.assertIn(
+            (execution.returncode, execution.failure_kind),
+            ((0, None), (providers.PROVIDER_TIMEOUT_RETURN_CODE, "timeout")),
+        )
+        self.assertEqual(execution.stdout.count("boundary"), 1)
+        self.assertEqual(len(execution.attempts), 1)
+        self.assertFalse(execution.attempts[0].retry_scheduled)
+
+    def test_keyboard_interrupt_cleans_real_child_and_returns_terminal_attempt(self) -> None:
+        timer = threading.Timer(0.15, _thread.interrupt_main)
+        timer.start()
+        try:
+            execution = self.run_child(
+                "import os,time; print(os.getpid(), flush=True); time.sleep(60)",
+                deadline=10.0,
+                grace=0.2,
+            )
+        finally:
+            timer.cancel()
+
+        pid = int(execution.stdout.strip())
+        self.assertEqual(
+            execution.returncode,
+            providers.PROVIDER_INTERRUPTED_RETURN_CODE,
+        )
+        self.assertEqual(execution.failure_kind, "interrupted")
+        self.assertFalse(execution.attempts[0].retry_scheduled)
+        self.assertIn("operator interruption", execution.stderr)
+        self.assert_process_gone(pid)
+
+    def test_unexpected_poll_exception_cleans_child_before_propagating(self) -> None:
+        values = iter([0.0])
+
+        def exploding_clock() -> float:
+            try:
+                return next(values)
+            except StopIteration as exc:
+                raise RuntimeError("synthetic polling cancellation") from exc
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic polling cancellation"):
+            providers._supervise_process(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                self.repo,
+                label="test provider",
+                interactive=False,
+                deadline_seconds=10.0,
+                term_grace_seconds=0.2,
+                poll_interval_seconds=0.02,
+                heartbeat_seconds=60.0,
+                monotonic=exploding_clock,
+            )
+
+    def test_invalid_timing_is_rejected_before_spawn(self) -> None:
+        invalid_values = (0.0, -1.0, math.nan, math.inf)
+        for field in ("deadline_seconds", "term_grace_seconds"):
+            for value in invalid_values:
+                with self.subTest(field=field, value=value):
+                    arguments = {field: value}
+                    expected = "deadline" if field == "deadline_seconds" else "grace"
+                    with patch.object(providers.subprocess, "Popen") as popen:
+                        with self.assertRaisesRegex(ValueError, expected):
+                            providers._run(
+                                [sys.executable, "-c", "pass"],
+                                self.repo,
+                                **arguments,
+                            )
+                        popen.assert_not_called()
+
+    def test_missing_executable_remains_bounded_launch_failure(self) -> None:
+        execution = providers._run(
+            [str(self.repo / "missing-provider")],
+            self.repo,
+            deadline_seconds=1.0,
+        )
+
+        self.assertEqual(execution.returncode, 127)
+        self.assertEqual(execution.failure_kind, "configuration")
+        self.assertEqual(len(execution.attempts), 1)
+        self.assertFalse(execution.attempts[0].retry_scheduled)
 
 
 if __name__ == "__main__":

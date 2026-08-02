@@ -55,6 +55,8 @@ ProviderFailureKind = Literal[
     "auth",
     "rate_limit",
     "unavailable",
+    "timeout",
+    "interrupted",
     "configuration",
     "provider_error",
 ]

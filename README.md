@@ -34,7 +34,7 @@ This controller moves those decisions into inspectable Python. It provides:
 - recoverable, persisted workflow stages;
 - working-tree fingerprints and resume guards;
 - separate human approval for policy, commit, and push;
-- provider attempt timing, heartbeats, and audit records; and
+- provider attempt deadlines, process-group cleanup, timing, heartbeats, and audit records; and
 - concise per-run reporting.
 
 ## Current status
@@ -47,7 +47,7 @@ tasks/<task-ref>-*.md
 
 For example, task `009` must resolve to exactly one file such as `tasks/009-example.md`. The controller persists the specification and its SHA-256, coordinates the run, and stores local run state under `runs/`.
 
-The controller and its safety behavior are implemented and covered by 31 unit tests. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
+The controller and its safety behavior are implemented and covered by 44 unit tests. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
 
 ## How it works
 
@@ -123,6 +123,8 @@ The controller snapshots repository path, branch, `HEAD`, and origin. After ever
 - Only the controller performs approved Git mutations.
 - Invalid structured output receives one same-provider retry, then blocks.
 - Provider unavailability receives two bounded same-provider retries, after 5 and 15 seconds.
+- Read-only provider attempts have a 30-minute hard deadline; Luna writer attempts have a 60-minute deadline.
+- Timeout or interruption terminates the isolated process group, preserves partial output, and blocks without retry or ordinary resume.
 - Quota, billing, authentication, rate-limit, configuration, and unclassified failures stop the current run immediately.
 - The controller never substitutes another provider automatically.
 
@@ -243,7 +245,7 @@ uv sync
 uv run python -m unittest -v
 ```
 
-The 31 tests exercise temporary repositories and fake providers. They cover preflight safety, task resolution, correction budgets, repeat-finding escalation, policy decisions, provider failures and retries, provider-stop resume behavior, sandbox command construction, reporting, Git approval defaults, and adversarial Git change parsing, fingerprinting, persistence, recovery, and staging behavior.
+The 44 tests exercise temporary repositories, fake providers, and real local child/grandchild processes. They cover preflight safety, task resolution, correction budgets, repeat-finding escalation, policy decisions, provider failures and retries, provider-stop resume behavior, bounded process cleanup, timeout/interruption output and recovery, sandbox command construction, reporting, Git approval defaults, and adversarial Git change parsing, fingerprinting, persistence, recovery, and staging behavior.
 
 Before committing changes, also check the diff:
 
@@ -273,7 +275,7 @@ git diff --check
 - Provider/model IDs, CLI commands, labels, retry values, and recovery maps are hard-coded.
 - Verification does not yet run project-specific tests, builds, or acceptance checks.
 - Workflow stages are strings rather than a typed, declared transition graph.
-- Provider processes emit heartbeats but have no timeout or cancellation policy.
+- Provider deadline values and termination grace are provisional hard-coded safety ceilings rather than configuration-backed policy.
 - Provider error classification relies on conservative output matching.
 - Run JSON is local and mutable rather than a tamper-evident event log.
 - There is no run scheduler, concurrent-run lock, shared provider circuit breaker, or cross-run reporting.

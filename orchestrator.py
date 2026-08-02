@@ -831,6 +831,8 @@ class Controller:
             "auth": "blocked_provider_auth",
             "rate_limit": "blocked_provider_rate_limit",
             "unavailable": "blocked_provider_unavailable",
+            "timeout": "blocked_provider_timeout",
+            "interrupted": "blocked_provider_interrupted",
             "configuration": "blocked_provider_configuration",
             "provider_error": "blocked_provider_failure",
         }[kind]
@@ -841,6 +843,8 @@ class Controller:
             "auth": "authentication failure",
             "rate_limit": "rate limit reached",
             "unavailable": "provider unavailable after bounded retries",
+            "timeout": "provider deadline exceeded and process group stopped",
+            "interrupted": "provider interrupted and process group stopped",
             "configuration": "provider CLI/model configuration failure",
             "provider_error": "unclassified provider failure",
         }[kind]
