@@ -248,7 +248,28 @@ Each run record can contain:
 - repository fingerprints and verification results; and
 - Git operation records.
 
-These files are intentionally excluded from Git, but they may contain sensitive project context. Treat them as audit records, apply an appropriate retention policy, and do not publish them without review.
+These files are intentionally excluded from Git, but they may contain sensitive
+project context. Continuo creates the run directory and `.target-locks/` as
+`0700`, and creates run JSON, atomic temporary files, SQLite databases, and
+SQLite journal/WAL/SHM sidecars as `0600`. It does not rely on or change the
+process umask. Every storage entry point also performs a bounded, non-recursive
+preflight: recognized legacy artifacts owned by the current UID are tightened
+to those exact modes before access. Symlinks, non-regular recognized files,
+foreign owners, and files with multiple hard links fail closed rather than
+being followed, replaced, or claimed.
+
+This is local POSIX mode-bit protection from other unprivileged UIDs. It is not
+encryption and does not protect against root/administrators, the same UID,
+provider processes with unrestricted same-UID filesystem access, backups,
+snapshots, pre-existing copies, or prior disclosure.
+
+Continuo retains full run and coordination records indefinitely and does not
+automatically purge, rotate, archive, clean, or delete them. Concise `report`
+and no-argument `status` are the preferred routine views. `status <run-id>`
+prints the complete sensitive JSON record; capturing that output or copying a
+run file is a raw export. Continuo provides no shareable/redacted export command.
+Keep any raw copy private (including `0600` permissions where applicable),
+review it explicitly before transfer, and do not publish it by default.
 
 ## Run reporting
 
@@ -275,7 +296,7 @@ uv sync
 uv run python -m unittest -v
 ```
 
-The 84 tests exercise temporary repositories, recorded sanitized fixtures, fake
+The 96 tests exercise temporary repositories, recorded sanitized fixtures, fake
 providers, and real local child/grandchild processes. They cover preflight
 safety, task resolution, correction budgets, repeat-finding escalation, policy
 decisions, trusted failure-evidence precedence, Claude envelope/content

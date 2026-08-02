@@ -6,7 +6,9 @@ import hashlib
 import os
 import re
 import sqlite3
+import stat as stat_module
 import subprocess
+import tempfile
 import uuid
 from collections import Counter
 from contextlib import contextmanager
@@ -54,6 +56,17 @@ app = typer.Typer(
 )
 console = Console()
 RUNS = Path(__file__).parent / "runs"
+
+_PRIVATE_DIRECTORY_MODE = 0o700
+_PRIVATE_FILE_MODE = 0o600
+_RUN_TEMP_PREFIX = ".continuo-run-"
+_RUN_TEMP_SUFFIX = ".tmp"
+_SQLITE_SUFFIXES = (
+    ".sqlite3",
+    ".sqlite3-journal",
+    ".sqlite3-wal",
+    ".sqlite3-shm",
+)
 
 
 class ControllerError(RuntimeError):
@@ -252,23 +265,298 @@ def diff_check(repo: Path) -> tuple[bool, str]:
     return result.returncode == 0, (result.stdout + result.stderr).strip()
 
 
-def persist(run: WorkflowRun, runs_dir: Path = RUNS) -> Path:
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    path = runs_dir / f"{run.run_id}.json"
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(run.model_dump_json(indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
+class StoragePreflight(NamedTuple):
+    runs_dir: Path
+    hardened_directories: int
+    hardened_files: int
+
+
+def _absolute_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path.expanduser())))
+
+
+def _storage_error(path: Path, problem: str) -> ControllerError:
+    return ControllerError(f"private storage rejected {path}: {problem}")
+
+
+def _lstat(path: Path) -> os.stat_result | None:
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _storage_error(path, "metadata is unavailable") from exc
+
+
+def _secure_directory(path: Path) -> bool:
+    before = _lstat(path)
+    if before is None:
+        raise _storage_error(path, "directory is missing")
+    if stat_module.S_ISLNK(before.st_mode):
+        raise _storage_error(path, "path is a symlink")
+    if not stat_module.S_ISDIR(before.st_mode):
+        raise _storage_error(path, "path is not a directory")
+    if before.st_uid != os.geteuid():
+        raise _storage_error(path, "directory has a foreign owner")
+
+    changed = stat_module.S_IMODE(before.st_mode) != _PRIVATE_DIRECTORY_MODE
+    try:
+        os.chmod(path, _PRIVATE_DIRECTORY_MODE, follow_symlinks=False)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise _storage_error(path, "directory permission check failed") from exc
+    try:
+        after = os.fstat(descriptor)
+        if (
+            not stat_module.S_ISDIR(after.st_mode)
+            or after.st_uid != os.geteuid()
+            or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise _storage_error(path, "directory identity changed during validation")
+        os.fchmod(descriptor, _PRIVATE_DIRECTORY_MODE)
+    except OSError as exc:
+        raise _storage_error(path, "directory permission check failed") from exc
+    finally:
+        os.close(descriptor)
+    return changed
+
+
+def _create_private_directory(path: Path) -> int:
+    path = _absolute_path(path)
+    if _lstat(path) is not None:
+        return int(_secure_directory(path))
+
+    missing: list[Path] = []
+    candidate = path
+    while _lstat(candidate) is None:
+        missing.append(candidate)
+        parent = candidate.parent
+        if parent == candidate:
+            raise _storage_error(path, "no existing parent directory")
+        candidate = parent
+
+    hardened = 0
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, _PRIVATE_DIRECTORY_MODE)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise _storage_error(directory, "private directory creation failed") from exc
+        hardened += int(_secure_directory(directory))
+    return hardened
+
+
+def _secure_regular_file(path: Path) -> bool:
+    before = _lstat(path)
+    if before is None:
+        raise _storage_error(path, "file is missing")
+    if stat_module.S_ISLNK(before.st_mode):
+        raise _storage_error(path, "path is a symlink")
+    if not stat_module.S_ISREG(before.st_mode):
+        raise _storage_error(path, "path is not a regular file")
+    if before.st_uid != os.geteuid():
+        raise _storage_error(path, "file has a foreign owner")
+    if before.st_nlink != 1:
+        raise _storage_error(path, "file has multiple hard links")
+
+    changed = stat_module.S_IMODE(before.st_mode) != _PRIVATE_FILE_MODE
+    try:
+        os.chmod(path, _PRIVATE_FILE_MODE, follow_symlinks=False)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise _storage_error(path, "file permission check failed") from exc
+    try:
+        after = os.fstat(descriptor)
+        if (
+            not stat_module.S_ISREG(after.st_mode)
+            or after.st_uid != os.geteuid()
+            or after.st_nlink != 1
+            or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise _storage_error(path, "file identity changed during validation")
+        os.fchmod(descriptor, _PRIVATE_FILE_MODE)
+    except OSError as exc:
+        raise _storage_error(path, "file permission check failed") from exc
+    finally:
+        os.close(descriptor)
+    return changed
+
+
+def _is_run_artifact(name: str) -> bool:
+    return name.endswith(".json") or name.endswith(".json.tmp") or (
+        name.startswith(_RUN_TEMP_PREFIX) and name.endswith(_RUN_TEMP_SUFFIX)
+    )
+
+
+def _is_sqlite_artifact(name: str) -> bool:
+    return any(name.endswith(suffix) for suffix in _SQLITE_SUFFIXES)
+
+
+def _scan_private_files(directory: Path, predicate: Callable[[str], bool]) -> int:
+    hardened = 0
+    try:
+        entries = list(os.scandir(directory))
+    except OSError as exc:
+        raise _storage_error(directory, "directory scan failed") from exc
+    for entry in entries:
+        if not predicate(entry.name):
+            continue
+        try:
+            hardened += int(_secure_regular_file(directory / entry.name))
+        except ControllerError:
+            if _lstat(directory / entry.name) is None:
+                continue
+            raise
+    return hardened
+
+
+def _prepare_private_storage(
+    runs_dir: Path,
+    *,
+    create_locks: bool = False,
+) -> StoragePreflight:
+    root = _absolute_path(runs_dir)
+    hardened_directories = _create_private_directory(root)
+    hardened_files = _scan_private_files(root, _is_run_artifact)
+
+    locks = root / ".target-locks"
+    lock_state = _lstat(locks)
+    if lock_state is not None or create_locks:
+        hardened_directories += _create_private_directory(locks)
+        hardened_files += _scan_private_files(locks, _is_sqlite_artifact)
+
+    return StoragePreflight(root, hardened_directories, hardened_files)
+
+
+def _print_storage_hardening(result: StoragePreflight) -> None:
+    if not (result.hardened_directories or result.hardened_files):
+        return
+    console.print(
+        "Hardened legacy storage permissions: "
+        f"{result.hardened_directories} director"
+        f"{'y' if result.hardened_directories == 1 else 'ies'}, "
+        f"{result.hardened_files} file"
+        f"{'s' if result.hardened_files != 1 else ''}."
+    )
+
+
+def _run_record_path(run_id: str, runs_dir: Path) -> Path:
+    if (
+        not run_id
+        or run_id in {".", ".."}
+        or "\0" in run_id
+        or "/" in run_id
+        or "\\" in run_id
+    ):
+        raise ControllerError("run id is not a single safe identifier")
+    path = runs_dir / f"{run_id}.json"
+    if path.parent != runs_dir:
+        raise ControllerError("run id escapes private storage")
     return path
 
 
+def _read_private_text(path: Path) -> str:
+    _secure_regular_file(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise _storage_error(path, "private file could not be opened") from exc
+    try:
+        current = os.fstat(descriptor)
+        if (
+            not stat_module.S_ISREG(current.st_mode)
+            or current.st_uid != os.geteuid()
+            or current.st_nlink != 1
+            or stat_module.S_IMODE(current.st_mode) != _PRIVATE_FILE_MODE
+        ):
+            raise _storage_error(path, "private file validation failed")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+            descriptor = -1
+            return stream.read()
+    except OSError as exc:
+        raise _storage_error(path, "private file could not be read") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _safe_unlink_created(path: Path, identity: tuple[int, int]) -> None:
+    state = _lstat(path)
+    if state is None:
+        return
+    if (
+        stat_module.S_ISREG(state.st_mode)
+        and state.st_uid == os.geteuid()
+        and state.st_nlink == 1
+        and (state.st_dev, state.st_ino) == identity
+    ):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def persist(run: WorkflowRun, runs_dir: Path = RUNS) -> Path:
+    root = _absolute_path(runs_dir)
+    path = _run_record_path(run.run_id, root)
+    root = _prepare_private_storage(root).runs_dir
+    temporary: Path | None = None
+    temporary_identity: tuple[int, int] | None = None
+    descriptor = -1
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f"{_RUN_TEMP_PREFIX}{run.run_id}-",
+            suffix=_RUN_TEMP_SUFFIX,
+            dir=root,
+        )
+        temporary = Path(temporary_name)
+        state = os.fstat(descriptor)
+        temporary_identity = (state.st_dev, state.st_ino)
+        if (
+            not stat_module.S_ISREG(state.st_mode)
+            or state.st_uid != os.geteuid()
+            or state.st_nlink != 1
+        ):
+            raise _storage_error(temporary, "temporary file validation failed")
+        os.fchmod(descriptor, _PRIVATE_FILE_MODE)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(run.model_dump_json(indent=2) + "\n")
+            stream.flush()
+        os.replace(temporary, path)
+        temporary = None
+        return path
+    except ControllerError:
+        raise
+    except OSError as exc:
+        raise _storage_error(path, "atomic persistence failed") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary is not None and temporary_identity is not None:
+            _safe_unlink_created(temporary, temporary_identity)
+
+
 def load_run(run_id: str, runs_dir: Path = RUNS) -> WorkflowRun:
-    path = runs_dir / f"{run_id}.json"
-    if not path.exists():
+    root = _absolute_path(runs_dir)
+    path = _run_record_path(run_id, root)
+    root = _prepare_private_storage(root).runs_dir
+    if _lstat(path) is None:
         raise ControllerError(f"unknown run {run_id}")
     try:
-        return WorkflowRun.model_validate_json(path.read_text(encoding="utf-8"))
+        return WorkflowRun.model_validate_json(_read_private_text(path))
+    except ControllerError:
+        raise
     except Exception as exc:
-        raise ControllerError(f"run state is invalid: {path}: {exc}") from exc
+        raise ControllerError(f"run state is invalid: {path}") from exc
 
 
 class TargetCoordinator:
@@ -278,16 +566,48 @@ class TargetCoordinator:
 
     def __init__(self, repo: Path, runs_dir: Path) -> None:
         self.repo = repo
-        self.runs_dir = runs_dir
+        self.runs_dir = _absolute_path(runs_dir)
         self.identity = target_identity(repo)
         self.database = (
-            runs_dir
+            self.runs_dir
             / ".target-locks"
             / f"{self.identity.target_key}.sqlite3"
         )
 
     def _connect(self) -> sqlite3.Connection:
-        self.database.parent.mkdir(parents=True, exist_ok=True)
+        _prepare_private_storage(self.runs_dir, create_locks=True)
+        if _lstat(self.database) is None:
+            try:
+                descriptor = os.open(
+                    self.database,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    _PRIVATE_FILE_MODE,
+                )
+            except FileExistsError:
+                _secure_regular_file(self.database)
+            except OSError as exc:
+                raise _storage_error(
+                    self.database, "private database creation failed"
+                ) from exc
+            else:
+                try:
+                    state = os.fstat(descriptor)
+                    if (
+                        not stat_module.S_ISREG(state.st_mode)
+                        or state.st_uid != os.geteuid()
+                        or state.st_nlink != 1
+                    ):
+                        raise _storage_error(
+                            self.database, "database validation failed"
+                        )
+                    os.fchmod(descriptor, _PRIVATE_FILE_MODE)
+                finally:
+                    os.close(descriptor)
+        else:
+            _secure_regular_file(self.database)
         try:
             connection = sqlite3.connect(
                 self.database,
@@ -296,6 +616,7 @@ class TargetCoordinator:
             )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA busy_timeout = 0")
+            _secure_regular_file(self.database)
             return connection
         except sqlite3.Error as exc:
             raise ControllerError(
@@ -365,6 +686,7 @@ class TargetCoordinator:
                     ) from exc
                 raise
             self._ensure_schema(connection)
+            _prepare_private_storage(self.runs_dir, create_locks=True)
             yield connection
             connection.commit()
         except ControllerError:
@@ -2663,7 +2985,8 @@ def report(
     """Show a concise orchestration audit and timing report."""
 
     def action() -> None:
-        _print_run_report(load_run(run_id))
+        _print_storage_hardening(_prepare_private_storage(RUNS))
+        _print_run_report(load_run(run_id, RUNS))
 
     _handle_error(action)
 
@@ -2675,10 +2998,20 @@ def status(
     """Inspect one saved run or list recent run stages."""
 
     def action() -> None:
+        preflight = _prepare_private_storage(RUNS)
+        _print_storage_hardening(preflight)
         if run_id:
-            console.print(load_run(run_id).model_dump_json(indent=2))
+            console.print(load_run(run_id, RUNS).model_dump_json(indent=2))
             return
-        paths = sorted(RUNS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
+        root = preflight.runs_dir
+        paths = []
+        for entry in os.scandir(root):
+            if not entry.name.endswith(".json"):
+                continue
+            path = root / entry.name
+            _secure_regular_file(path)
+            paths.append(path)
+        paths = sorted(paths, key=lambda p: os.lstat(p).st_mtime, reverse=True)[:10]
         table = Table(
             "Run",
             "Task",
@@ -2689,7 +3022,7 @@ def status(
         )
         for path in paths:
             try:
-                run = WorkflowRun.model_validate_json(path.read_text(encoding="utf-8"))
+                run = WorkflowRun.model_validate_json(_read_private_text(path))
             except Exception:
                 table.add_row(path.stem, "—", "INVALID", "—", "—", "—")
                 continue

@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2924,6 +2925,506 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn("force-unlock", source)
         self.assertIn("JOBS_REPO", source)
         self.assertTrue((Path(__file__).parent / "src/jobs_orchestrator").is_dir())
+
+    def test_private_storage_failure_precedes_provider_and_git_work(self) -> None:
+        self.runs.mkdir(mode=0o700)
+        target = Path(self.temp.name) / "outside.json"
+        target.write_text("outside secret\n", encoding="utf-8")
+        target.chmod(0o640)
+        (self.runs / "unsafe.json").symlink_to(target)
+        provider_calls = 0
+        before_head = git(self.repo, "rev-parse", "HEAD")
+
+        def review(prompt, repo):
+            nonlocal provider_calls
+            provider_calls += 1
+            return self.passing_sonnet(prompt, repo)
+
+        with self.assertRaisesRegex(orchestrator.ControllerError, "symlink"):
+            self.controller(review).new_run("009")
+
+        self.assertEqual(provider_calls, 0)
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), before_head)
+        self.assertEqual(git(self.repo, "status", "--porcelain=v1"), "")
+        self.assertEqual(target.read_text(encoding="utf-8"), "outside secret\n")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
+
+        safe_runs = Path(self.temp.name) / "safe-runs"
+        reader_calls = 0
+        writer_calls = 0
+
+        def assert_private_storage() -> None:
+            self.assertEqual(stat.S_IMODE(safe_runs.stat().st_mode), 0o700)
+            records = list(safe_runs.glob("*.json"))
+            self.assertEqual(len(records), 1)
+            self.assertEqual(stat.S_IMODE(records[0].stat().st_mode), 0o600)
+            coordinator = orchestrator.TargetCoordinator(self.repo, safe_runs)
+            self.assertEqual(
+                stat.S_IMODE(coordinator.database.parent.stat().st_mode), 0o700
+            )
+            self.assertEqual(stat.S_IMODE(coordinator.database.stat().st_mode), 0o600)
+
+        def safe_review(prompt, repo):
+            nonlocal reader_calls
+            reader_calls += 1
+            assert_private_storage()
+            return self.passing_sonnet(prompt, repo)
+
+        def safe_writer(prompt, repo):
+            nonlocal writer_calls
+            writer_calls += 1
+            assert_private_storage()
+            return ProviderExecution(["codex"], 1, "", "synthetic writer failure")
+
+        result = self.controller(
+            safe_review,
+            luna=safe_writer,
+            runs_dir=safe_runs,
+        ).new_run("009")
+        self.assertEqual(result.stage, "blocked_writer_retry_required")
+        self.assertEqual(reader_calls, 1)
+        self.assertEqual(writer_calls, 1)
+
+
+class PrivateStorageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "target"
+        self.repo.mkdir()
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def run_fixture(self, run_id: str = "private-run") -> WorkflowRun:
+        return WorkflowRun(
+            run_id=run_id,
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-private.md",
+            task_sha256="0" * 64,
+            specification="sensitive specification fixture",
+            repo=RepoState(
+                repo=str(self.repo),
+                branch="main",
+                head="1" * 40,
+                clean=True,
+                origin="https://example.invalid/jobs.git",
+            ),
+        )
+
+    def mode(self, path: Path) -> int:
+        return stat.S_IMODE(os.lstat(path).st_mode)
+
+    def test_private_creation_is_exact_under_hostile_umasks(self) -> None:
+        ancestor = self.root / "existing"
+        ancestor.mkdir(mode=0o755)
+        ancestor.chmod(0o755)
+        for mask in (0o000, 0o077):
+            with self.subTest(mask=oct(mask)):
+                runs = ancestor / f"nested-{mask:o}" / "runs"
+                observed = []
+                real_replace = os.replace
+
+                def observe_replace(source, destination):
+                    temporary = Path(source)
+                    observed.append((self.mode(temporary), temporary.read_text()))
+                    real_replace(source, destination)
+
+                previous = os.umask(mask)
+                try:
+                    with patch.object(orchestrator.os, "replace", observe_replace):
+                        path = orchestrator.persist(self.run_fixture(), runs)
+                finally:
+                    os.umask(previous)
+
+                self.assertEqual(self.mode(ancestor), 0o755)
+                self.assertEqual(self.mode(runs.parent), 0o700)
+                self.assertEqual(self.mode(runs), 0o700)
+                self.assertEqual(self.mode(path), 0o600)
+                self.assertEqual(observed[0][0], 0o600)
+                self.assertIn("sensitive specification fixture", observed[0][1])
+                self.assertEqual(
+                    orchestrator.load_run("private-run", runs).model_dump(),
+                    self.run_fixture().model_dump(),
+                )
+
+    def test_legacy_scan_is_bounded_content_preserving_and_idempotent(self) -> None:
+        runs = self.root / "legacy"
+        locks = runs / ".target-locks"
+        unknown_dir = runs / "unknown"
+        locks.mkdir(parents=True)
+        unknown_dir.mkdir()
+        record = runs / "legacy.json"
+        invalid = runs / "invalid.json"
+        old_temp = runs / "legacy.json.tmp"
+        database = locks / "target.sqlite3"
+        journal = locks / "target.sqlite3-journal"
+        unknown = runs / "notes.txt"
+        nested_unknown = unknown_dir / "nested.json"
+        record.write_text(self.run_fixture("legacy").model_dump_json() + "\n")
+        invalid.write_text("{ invalid schema fixture\n")
+        old_temp.write_text("private orphan fixture\n")
+        database.write_bytes(b"database fixture")
+        journal.write_bytes(b"journal fixture")
+        unknown.write_text("unknown fixture\n")
+        nested_unknown.write_text("nested unknown fixture\n")
+        for path in (runs, locks):
+            path.chmod(0o755)
+        for path in (
+            record,
+            invalid,
+            old_temp,
+            database,
+            journal,
+            unknown,
+            nested_unknown,
+        ):
+            path.chmod(0o644)
+        before = {
+            path: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in (
+                record,
+                invalid,
+                old_temp,
+                database,
+                journal,
+                unknown,
+                nested_unknown,
+            )
+        }
+
+        result = orchestrator._prepare_private_storage(runs)
+
+        self.assertEqual(result.hardened_directories, 2)
+        self.assertEqual(result.hardened_files, 5)
+        for path in (runs, locks):
+            self.assertEqual(self.mode(path), 0o700)
+        for path in (record, invalid, old_temp, database, journal):
+            self.assertEqual(self.mode(path), 0o600)
+        self.assertEqual(self.mode(unknown), 0o644)
+        self.assertEqual(self.mode(unknown_dir), 0o755)
+        self.assertEqual(self.mode(nested_unknown), 0o644)
+        for path, snapshot in before.items():
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), snapshot)
+
+        second = orchestrator._prepare_private_storage(runs)
+        self.assertEqual(second.hardened_directories, 0)
+        self.assertEqual(second.hardened_files, 0)
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError, "run state is invalid"
+        ) as raised:
+            orchestrator.load_run("invalid", runs)
+        self.assertNotIn("invalid schema fixture", str(raised.exception))
+        self.assertEqual(invalid.read_bytes(), before[invalid][0])
+        self.assertEqual(invalid.stat().st_mtime_ns, before[invalid][1])
+
+    def test_run_ids_are_rejected_before_storage_creation(self) -> None:
+        for index, run_id in enumerate(("", ".", "..", "a/b", "a\\b", "a\0b")):
+            with self.subTest(run_id=repr(run_id)):
+                runs = self.root / f"invalid-{index}"
+                run = self.run_fixture(run_id)
+                with self.assertRaisesRegex(orchestrator.ControllerError, "safe identifier"):
+                    orchestrator.persist(run, runs)
+                self.assertFalse(runs.exists())
+                with self.assertRaisesRegex(orchestrator.ControllerError, "safe identifier"):
+                    orchestrator.load_run(run_id, runs)
+                self.assertFalse(runs.exists())
+
+    def test_unsafe_directories_and_recognized_files_fail_closed(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        outside.chmod(0o755)
+        symlink_root = self.root / "symlink-runs"
+        symlink_root.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(orchestrator.ControllerError, "symlink"):
+            orchestrator.persist(self.run_fixture(), symlink_root)
+        self.assertEqual(self.mode(outside), 0o755)
+
+        nondirectory_root = self.root / "not-a-directory"
+        nondirectory_root.write_text("not a directory fixture\n")
+        with self.assertRaisesRegex(orchestrator.ControllerError, "not a directory"):
+            orchestrator.persist(self.run_fixture(), nondirectory_root)
+
+        foreign_root = self.root / "foreign-directory"
+        foreign_root.mkdir(mode=0o700)
+        real_lstat = orchestrator._lstat
+
+        def foreign_directory_lstat(path):
+            state = real_lstat(path)
+            if state is not None and Path(path) == foreign_root:
+                values = list(state)
+                values[4] = os.geteuid() + 1
+                return os.stat_result(values)
+            return state
+
+        with patch.object(
+            orchestrator, "_lstat", foreign_directory_lstat
+        ), self.assertRaisesRegex(orchestrator.ControllerError, "foreign owner"):
+            orchestrator.persist(self.run_fixture(), foreign_root)
+
+        for kind in ("symlink", "hardlink", "fifo", "foreign"):
+            with self.subTest(kind=kind):
+                runs = self.root / f"unsafe-{kind}"
+                runs.mkdir(mode=0o700)
+                artifact = runs / "unsafe.json"
+                target = self.root / f"target-{kind}.json"
+                target.write_text("target fixture\n")
+                target.chmod(0o640)
+                if kind == "symlink":
+                    artifact.symlink_to(target)
+                elif kind == "hardlink":
+                    os.link(target, artifact)
+                elif kind == "fifo":
+                    os.mkfifo(artifact, 0o600)
+                else:
+                    artifact.write_text("foreign fixture\n")
+                    real_lstat = orchestrator._lstat
+
+                    def foreign_lstat(path):
+                        state = real_lstat(path)
+                        if state is not None and Path(path) == artifact:
+                            values = list(state)
+                            values[4] = os.geteuid() + 1
+                            return os.stat_result(values)
+                        return state
+
+                context = (
+                    patch.object(orchestrator, "_lstat", foreign_lstat)
+                    if kind == "foreign"
+                    else patch.object(
+                        orchestrator, "_lstat", wraps=orchestrator._lstat
+                    )
+                )
+                with context, self.assertRaises(orchestrator.ControllerError):
+                    orchestrator._prepare_private_storage(runs)
+                self.assertEqual(target.read_text(), "target fixture\n")
+                self.assertEqual(self.mode(target), 0o640)
+
+    def test_atomic_replace_failure_preserves_old_record_and_cleans_temp(self) -> None:
+        runs = self.root / "atomic"
+        run = self.run_fixture("atomic")
+        path = orchestrator.persist(run, runs)
+        before = path.read_bytes()
+        run.stage = "changed"
+
+        with patch.object(orchestrator.os, "replace", side_effect=PermissionError):
+            with self.assertRaisesRegex(orchestrator.ControllerError, "atomic persistence"):
+                orchestrator.persist(run, runs)
+
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(list(runs.glob(".continuo-run-*.tmp")), [])
+        self.assertEqual(orchestrator.load_run("atomic", runs).stage, "created")
+
+    def test_interrupted_hardening_is_monotonic_and_resumable(self) -> None:
+        runs = self.root / "interrupted"
+        runs.mkdir(mode=0o700)
+        first = runs / "a.json"
+        second = runs / "b.json"
+        first.write_text(self.run_fixture("a").model_dump_json())
+        second.write_text(self.run_fixture("b").model_dump_json())
+        first.chmod(0o644)
+        second.chmod(0o644)
+        secure = orchestrator._secure_regular_file
+        hardened = []
+
+        def interrupt(path):
+            if hardened:
+                raise orchestrator.ControllerError(
+                    "private storage rejected b.json: synthetic permission failure"
+                )
+            result = secure(path)
+            hardened.append(Path(path))
+            return result
+
+        with patch.object(orchestrator, "_secure_regular_file", interrupt):
+            with self.assertRaisesRegex(
+                orchestrator.ControllerError, "synthetic permission failure"
+            ):
+                orchestrator._prepare_private_storage(runs)
+
+        remaining = second if hardened == [first] else first
+        self.assertEqual(self.mode(hardened[0]), 0o600)
+        self.assertEqual(self.mode(remaining), 0o644)
+        orchestrator._prepare_private_storage(runs)
+        self.assertEqual(self.mode(first), 0o600)
+        self.assertEqual(self.mode(second), 0o600)
+
+    def test_abrupt_persist_crash_leaves_private_ignored_orphan(self) -> None:
+        runs = self.root / "crash"
+        run = self.run_fixture("crash")
+        path = orchestrator.persist(run, runs)
+        before = path.read_bytes()
+        child = """
+import os
+from pathlib import Path
+import orchestrator
+from models import RepoState, WorkflowRun
+runs = Path(os.environ['CONTINUO_TEST_RUNS'])
+run = WorkflowRun(
+    run_id='crash',
+    created_at='2026-08-02T00:00:00+00:00',
+    task_ref='009',
+    task_file='tasks/009.md',
+    task_sha256='0' * 64,
+    specification='crash replacement',
+    repo=RepoState(
+        repo=os.environ['CONTINUO_TEST_REPO'],
+        branch='main',
+        head='1' * 40,
+        clean=True,
+        origin='https://example.invalid/jobs.git',
+    ),
+    stage='changed',
+)
+orchestrator.os.replace = lambda source, destination: os._exit(17)
+orchestrator.persist(run, runs)
+"""
+        environment = dict(os.environ)
+        environment["CONTINUO_TEST_RUNS"] = str(runs)
+        environment["CONTINUO_TEST_REPO"] = str(self.repo)
+        result = subprocess.run(
+            [sys.executable, "-c", child],
+            cwd=Path(orchestrator.__file__).parent,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 17)
+        self.assertEqual(path.read_bytes(), before)
+        orphans = list(runs.glob(".continuo-run-*.tmp"))
+        self.assertEqual(len(orphans), 1)
+        self.assertEqual(self.mode(orphans[0]), 0o600)
+        self.assertEqual([item.name for item in runs.glob("*.json")], ["crash.json"])
+        self.assertEqual(orchestrator.load_run("crash", runs).stage, "created")
+
+    def test_sqlite_main_rollback_and_wal_sidecars_are_private(self) -> None:
+        runs = self.root / "sqlite"
+        previous = os.umask(0o000)
+        try:
+            coordinator = orchestrator.TargetCoordinator(self.repo, runs)
+            with coordinator.transaction() as connection:
+                journal = Path(f"{coordinator.database}-journal")
+                self.assertTrue(journal.exists())
+                self.assertEqual(self.mode(runs), 0o700)
+                self.assertEqual(self.mode(coordinator.database.parent), 0o700)
+                self.assertEqual(self.mode(coordinator.database), 0o600)
+                self.assertEqual(self.mode(journal), 0o600)
+
+            wal_database = coordinator.database.parent / "fixture-wal.sqlite3"
+            descriptor = os.open(
+                wal_database,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            os.close(descriptor)
+            connection = orchestrator.sqlite3.connect(wal_database)
+            try:
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("CREATE TABLE fixture(value TEXT)")
+                connection.execute("INSERT INTO fixture VALUES ('private')")
+                connection.commit()
+                orchestrator._prepare_private_storage(runs)
+                self.assertEqual(self.mode(Path(f"{wal_database}-wal")), 0o600)
+                self.assertEqual(self.mode(Path(f"{wal_database}-shm")), 0o600)
+            finally:
+                connection.close()
+        finally:
+            os.umask(previous)
+
+    def test_legacy_and_corrupt_databases_harden_without_reset(self) -> None:
+        runs = self.root / "database-legacy"
+        coordinator = orchestrator.TargetCoordinator(self.repo, runs)
+        with coordinator.transaction() as connection:
+            connection.execute(
+                "INSERT INTO target_owner VALUES (1, ?, ?, ?, ?, ?, ?)",
+                (*coordinator.identity, "owner-run", "2026-08-02T00:00:00+00:00"),
+            )
+        coordinator.database.chmod(0o644)
+        with coordinator.transaction() as connection:
+            owner = connection.execute(
+                "SELECT run_id FROM target_owner WHERE singleton = 1"
+            ).fetchone()
+            self.assertEqual(owner["run_id"], "owner-run")
+        self.assertEqual(self.mode(coordinator.database), 0o600)
+
+        corrupt_runs = self.root / "database-corrupt"
+        corrupt_coordinator = orchestrator.TargetCoordinator(self.repo, corrupt_runs)
+        orchestrator._prepare_private_storage(corrupt_runs, create_locks=True)
+        corrupt_coordinator.database.write_bytes(b"not a sqlite database")
+        corrupt_coordinator.database.chmod(0o644)
+        before = corrupt_coordinator.database.read_bytes()
+        with self.assertRaisesRegex(orchestrator.ControllerError, "invalid or unavailable"):
+            with corrupt_coordinator.transaction():
+                pass
+        self.assertEqual(corrupt_coordinator.database.read_bytes(), before)
+        self.assertEqual(self.mode(corrupt_coordinator.database), 0o600)
+
+        linked_runs = self.root / "database-linked"
+        linked_coordinator = orchestrator.TargetCoordinator(self.repo, linked_runs)
+        orchestrator._prepare_private_storage(linked_runs, create_locks=True)
+        linked_target = self.root / "linked-target.sqlite3"
+        linked_target.write_bytes(b"external database fixture")
+        linked_target.chmod(0o640)
+        linked_coordinator.database.symlink_to(linked_target)
+        with self.assertRaisesRegex(orchestrator.ControllerError, "symlink"):
+            with linked_coordinator.transaction():
+                pass
+        self.assertEqual(linked_target.read_bytes(), b"external database fixture")
+        self.assertEqual(self.mode(linked_target), 0o640)
+
+    def test_inspection_surfaces_preserve_full_record_and_concise_redaction(self) -> None:
+        runs = self.root / "inspection"
+        run = self.run_fixture("inspection")
+        orchestrator.persist(run, runs)
+        run_path = runs / "inspection.json"
+        run_path.chmod(0o644)
+
+        with patch.object(
+            orchestrator, "RUNS", runs
+        ), orchestrator.console.capture() as capture:
+            orchestrator.status(None)
+        concise = capture.get()
+        self.assertIn("inspection", concise)
+        self.assertNotIn("sensitive specification fixture", concise)
+        self.assertEqual(self.mode(run_path), 0o600)
+
+        run_path.chmod(0o644)
+        with patch.object(
+            orchestrator, "RUNS", runs
+        ), orchestrator.console.capture() as capture:
+            orchestrator.report("inspection")
+        report = capture.get()
+        self.assertIn("Hardened legacy storage permissions", report)
+        self.assertNotIn("sensitive specification fixture", report)
+        self.assertEqual(self.mode(run_path), 0o600)
+
+        run_path.chmod(0o644)
+        with patch.object(
+            orchestrator, "RUNS", runs
+        ), orchestrator.console.capture() as capture:
+            orchestrator.status("inspection")
+        full = capture.get()
+        self.assertIn("sensitive specification fixture", full)
+        self.assertEqual(self.mode(run_path), 0o600)
+
+    def test_scope_has_no_umask_chown_cleanup_export_or_schema_change(self) -> None:
+        source = Path(orchestrator.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("os.umask", source)
+        self.assertNotIn("os.chown", source)
+        self.assertNotIn("force-unlock", source)
+        self.assertEqual(self.run_fixture().schema_version, 6)
+        command_names = {
+            command.name or command.callback.__name__.replace("_", "-")
+            for command in orchestrator.app.registered_commands
+        }
+        self.assertTrue(
+            command_names.isdisjoint(
+                {"export", "purge", "redact", "cleanup", "clean-runs"}
+            )
+        )
 
 
 class ProviderFailureContractTests(unittest.TestCase):

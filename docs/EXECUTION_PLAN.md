@@ -467,8 +467,66 @@ baseline for extraction. No live Jobs pilot occurs in this gate.
   - Publication evidence (2026-08-02): implementation commit
     `ec7fc5828c5e6877a2b59f2f191ff05fd1396021` (`Enforce target run ownership`)
     was pushed directly to `origin/main` with all 84 tests passing.
-- [ ] **M0.6 / Q-6:** make run storage private by default and define explicit
+- [~] **M0.6 / Q-6:** make run storage private by default and define explicit
   handling for legacy files, redaction, retention, and export.
+  - Planning evidence (2026-08-02): the draft bounded execution note and
+    adversarial matrix below were derived from authoritative Q-6, the current
+    schema-6 JSON persistence path, M0.5 SQLite coordination artifacts, raw and
+    concise CLI inspection surfaces, and the Milestone 0 confidentiality exit
+    criterion. This planning pass changed no storage mode, persistence,
+    controller, model, CLI, or test implementation.
+  - Contract approval (2026-08-02): the repository owner approved the complete
+    bounded execution note and adversarial matrix, including automatic legacy
+    hardening, fail-closed path rules, indefinite retention, explicit-sensitive
+    raw inspection, and deny-by-default export decisions, and authorized M0.6
+    implementation without publication.
+  - Baseline validation (2026-08-02): published `main` is clean and aligned with
+    `origin/main` at `707d4c5d90fe6a75eb540f4a7dfd417340f7b28f`; all 84 tests
+    passed in the published M0.5 validation without live providers or an
+    external target.
+  - Storage evidence (2026-08-02): mode-only inspection of Continuo's ignored
+    local storage—not the Jobs checkout—confirmed `runs/` is `0755` and its five
+    existing run JSON records are `0644`. An isolated temporary-directory probe
+    under `umask 000` produced `0777` directories, a `0666` JSON file, and
+    `0644` SQLite database/WAL/SHM artifacts. Pre-creating the SQLite database as
+    `0600` caused both rollback-journal and WAL/SHM sidecars to inherit `0600`.
+    No record contents were read during the mode inspection.
+  - Implementation evidence (2026-08-02): one standard-library private-storage
+    preflight now serves JSON persistence/loading/listing and SQLite
+    coordination. It creates all storage-owned directories as exact `0700`,
+    creates final/temporary/coordination files as exact `0600`, never mutates
+    process umask, automatically and non-recursively hardens recognized owned
+    legacy artifacts, rejects unsafe directory/file ownership and topology, and
+    validates run identifiers before storage creation. Atomic JSON replacement,
+    schema 6, SQLite schema/journal mode, M0.5 ownership, provider capabilities,
+    retry policy, and Git behavior remain unchanged. User-facing inspection
+    reports remediation counts without contents; invalid-state and permission
+    errors no longer quote record bytes.
+  - Deterministic test evidence (2026-08-02): 12 new M0.6 tests cover all 40
+    ordered matrix rows together with the existing regression suite. Fixtures
+    exercise exact modes under `umask 000` and `077`, observation before atomic
+    replace, legacy byte/mtime preservation and idempotence, traversal/link/type/
+    ownership rejection, normal and abrupt persistence failure, monotonic scan
+    resumption, live rollback-journal and test-only WAL/SHM modes, preserved and
+    corrupt SQLite databases, concise versus full inspection, and storage
+    failure before provider/Git work. All 96 tests pass using temporary local
+    repositories and files, deterministic fake/recorded providers, local SQLite,
+    and local child processes only.
+  - Local remediation evidence (2026-08-02): after implementation was
+    authorized, an inspection-path development check invoked the approved
+    preflight against Continuo's ignored local storage. It monotonically
+    tightened `runs/` from `0755` to `0700` and all five existing run JSON files
+    from `0644` to `0600`. The check inspected filesystem metadata only; it did
+    not read or rewrite record contents, alter mtimes/schema/run state/audit, or
+    access the target checkout. The permissions were not broadened afterward.
+  - Validation evidence (2026-08-02): Python compilation and the complete
+    96-test suite pass. Root and isolated editable-install CLI help expose the
+    same required commands; `jobs-orchestrator`, `JOBS_REPO`, and
+    `src/jobs_orchestrator` remain intact. All eight non-planning local
+    documentation links/anchors and 40 ordered M0.6 matrix identifiers validate;
+    `git diff --check` passes. No live provider, network service, external target,
+    Jobs access, provider/model/policy change, commit, push, merge, export,
+    cleanup, schema migration, or later-gate implementation occurred.
 
 M0.2 through M0.4 must share one designed provider-attempt vocabulary, but each
 implementation and diff remains independently reviewable.
@@ -1398,6 +1456,280 @@ has deterministic coverage; all existing and new tests pass without live
 providers; root and compatibility CLI smoke checks pass; documentation and
 `git diff --check` pass; the complete implementation diff is reviewed; and no
 M0.6 or later behavior enters the change.
+
+### M0.6 / Q-6 bounded execution note (approved 2026-08-02)
+
+**Status and boundary.** M0.6 closes the Milestone 0 local confidentiality gap
+for Continuo-owned run and coordination storage. It makes known storage
+directories private, creates and rewrites sensitive files with exact private
+mode bits, monotonically hardens recognized legacy artifacts, and defines what
+retention, redaction, and export mean before later persistence work begins. It
+does not encrypt records, build a general migration framework, add an export or
+deletion command, create redacted logs, redesign run schemas, or claim isolation
+from the same operating-system account.
+
+The repository owner approved this execution contract and its matrix on
+2026-08-02 before implementation began.
+
+**Invariant and reproduced problem.** Complete task text, prompts, provider
+stdout/stderr, human decisions, recovery notes, repository identity, and Git
+audit evidence must not be readable by group or other local accounts merely
+because Continuo persisted them. Every sensitive byte must be created inside a
+private directory and written to a private file before it can become visible.
+Crash recovery and atomic replacement must never trade confidentiality for
+durability.
+
+At baseline `707d4c5d90fe6a75eb540f4a7dfd417340f7b28f`, `persist()` calls
+`mkdir()` without an explicit private mode and uses `Path.write_text()` for the
+temporary JSON file. `TargetCoordinator._connect()` likewise creates the lock
+directory and lets `sqlite3.connect()` create the database. These paths inherit
+process/platform defaults. The ignored local Continuo storage reproduces the
+roadmap finding: its run directory is `0755` and five run records are `0644`.
+The isolated permissive-umask probe also demonstrates that relying on the caller
+is insufficient: ordinary directories/JSON become `0777`/`0666`, while SQLite
+database and sidecar files remain `0644` unless the main database is privately
+pre-created.
+
+**Threat model and claim limit.** M0.6 protects persisted artifacts using POSIX
+owner/group/other mode bits. The protected boundary is a different local UID
+that lacks privilege and has no independent copy or link. Mode `0700` prevents
+directory traversal by group/other accounts; mode `0600` prevents direct file
+read/write by them. Continuo will not claim protection from root/administrators,
+the same UID, pre-existing copies, backups, snapshots, provider processes that
+already share the operator's full filesystem authority, platform ACLs not
+represented by POSIX mode bits, kernel compromise, or storage captured before
+hardening. Encryption at rest and secret management are later designs.
+
+The implementation must use only standard-library filesystem primitives and
+must not change the process-global umask. Tests must demonstrate exact modes
+under both restrictive and deliberately permissive umasks.
+
+**Protected artifact inventory.** The following Continuo-owned paths are
+sensitive and receive exact modes:
+
+- the configured run directory and every missing directory component Continuo
+  creates for it: `0700`;
+- `runs/.target-locks/`: `0700`;
+- final run records `runs/<run-id>.json`: `0600`;
+- atomic run-record temporary files created in the run directory: `0600` from
+  creation, including any crash orphan;
+- per-target `*.sqlite3` coordination databases: `0600`; and
+- SQLite `-journal`, `-wal`, and `-shm` sidecars whenever present: `0600`.
+
+Unknown files are not interpreted, rewritten, chmodded, exported, or deleted by
+M0.6. They are nevertheless shielded from group/other traversal once the run
+directory is `0700`. Cache files, provider CLI state, target-repository content,
+Git metadata, operating-system logs, terminal scrollback, and files outside the
+configured run directory are not Continuo run storage.
+
+**Secure storage boundary.** Introduce one controller-owned storage primitive
+used by JSON persistence/loading/listing and SQLite coordination. It must:
+
+1. construct missing storage directories privately without relying on umask;
+2. reject a run directory or `.target-locks` path that is a symlink,
+   non-directory, or not owned by the effective UID;
+3. validate recognized files without following symlinks and require a
+   current-UID-owned regular file with exactly one hard link;
+4. tighten overly broad recognized modes to `0700`/`0600` before reading or
+   writing sensitive bytes;
+5. never add group/other permissions, while safely normalizing owner bits to the
+   exact usable `0700`/`0600` contract;
+6. reject NULs, path separators, `.`/`..`, or any run ID whose computed record
+   path escapes the configured run directory, without introducing a new
+   persisted run-ID schema; and
+7. report only the artifact path, type, and mode/ownership problem—never record
+   contents, prompts, provider output, diffs, notes, or secrets.
+
+Mode repair is a deliberate confidentiality exception to otherwise read-only
+inspection: `load_run`, `report`, and `status` may monotonically remove
+group/other permissions before reading. They must not rewrite JSON bytes, change
+the run schema, alter run state, update record modification time, invent audit
+history, or make any permission broader. If ownership/type/link safety cannot be
+proven, the operation fails closed rather than following, replacing, deleting,
+or taking ownership of the artifact.
+
+**Atomic JSON persistence.** Preserve the existing replace-at-commit behavior,
+but create a unique temporary file in the verified private run directory with
+mode `0600` before writing the serialized record. Validate the open descriptor,
+force its mode to `0600`, write/flush it, and atomically replace only the expected
+record path. Normal exceptions remove the controller-created temporary file when
+safe; an abrupt crash may leave a private orphan that no loader treats as a run.
+The old complete record remains loadable until replacement. Rewriting an
+existing legacy record must leave the new inode `0600` and must not follow or
+silently preserve an unsafe symlink/hard-link topology.
+
+M0.6 does not add a stronger fsync/durability contract, event journal, checksum,
+backup, or rollback mechanism. Those are persistence-architecture decisions,
+not permission fixes.
+
+**SQLite coordination storage.** Verify and privately create
+`.target-locks/` before any database open. For a missing target database,
+pre-create the main file as an exclusive `0600` regular file, validate it, then
+hand its path to `sqlite3`. For an existing database, validate and tighten the
+main file before connecting. SQLite's journal mode, schema, transaction
+boundaries, zero-wait mutex, owner row, and stale-owner policy remain unchanged.
+
+Tests must observe rollback-journal and WAL/SHM artifacts while live and require
+`0600`. The locally verified SQLite behavior derives private sidecar modes from
+a private main database, but the controller must still validate/harden any
+recognized sidecar encountered later. A permission failure, symlink, hard link,
+foreign owner, or unsafe file type blocks before `BEGIN IMMEDIATE`, owner
+claim/release, provider invocation, verification, or Git work. M0.6 never
+deletes/recreates a corrupt database or an unresolved owner to fix permissions.
+
+**Legacy hardening policy.** Every storage entry point first performs an
+idempotent, bounded scan of recognized artifacts directly under the configured
+run directory and `.target-locks/`. Existing trustworthy directories are
+tightened to `0700`; trustworthy run JSON, atomic-temporary, database, journal,
+WAL, and SHM files are tightened to `0600`. The scan does not recursively follow
+links or descend outside those two fixed directories.
+
+Hardening is monotonic and content-preserving. It may change filesystem ctime,
+but not file bytes or mtime. If interrupted, artifacts already processed remain
+more private and the next invocation safely continues. If an unsafe recognized
+artifact is found, the operation fails visibly after any earlier monotonic mode
+repairs; it does not roll permissions back. A previously `0644` artifact must be
+reported as remediated when user-facing output is appropriate, but Continuo must
+not imply that chmod revokes copies or access that occurred before remediation.
+
+No schema migration or run-content rewrite occurs. Valid legacy schema-6 records
+load exactly as before after hardening; invalid legacy records retain their
+existing visible validation failure after their containing path has been made as
+private as can safely be proven. This is permission migration only; Gate 2/C-9
+still owns versioned content migrations and unsupported historical schemas.
+
+**Retention policy.** M0.6 retains full local run and coordination artifacts
+indefinitely. There is no age-based purge, size quota, rotation, automatic
+deletion, `clean-runs`, or orphan-owner cleanup. In particular, deleting an
+unreleased run can make M0.5 ownership unrecoverable, so a future retention
+command must understand release/ownership and audit dependencies before it can
+remove anything. Private crash-temporary files may be diagnosed later but are
+not automatically swept in this item.
+
+**Redaction and inspection policy.** The authoritative local JSON remains a
+full-fidelity audit record. M0.6 does not destructively redact it because prompts
+and provider-controlled text can contain sensitive material in fields that a
+simple key denylist cannot recognize. Concise `report` and no-argument `status`
+remain the preferred routine views and must not gain raw prompts, stdout/stderr,
+diffs, specifications, or notes. Existing `status <run-id>` remains an explicit
+full-record local inspection surface and documentation must label its output as
+sensitive; piping or capturing it is operator-controlled raw disclosure, not a
+redacted export.
+
+Permission errors and legacy-hardening summaries never include record content.
+M0.6 adds no structured log sink and makes no claim that arbitrary terminal,
+shell, CI, or operating-system capture is redacted. Later typed parsed records
+and redacted structured logs can define field-aware disclosure safely.
+
+**Export policy.** M0.6 is deny-by-default: Continuo adds no shareable export
+command and does not label any generated artifact "redacted." Copying a run JSON
+or capturing `status <run-id>` is a raw, sensitive export performed outside
+Continuo. Documentation must say that raw exports require the same `0600`
+handling and an explicit human review before transfer.
+
+A future export command must use a versioned typed schema, distinguish raw from
+redacted output, default to the least-disclosing form, create output privately,
+record omission metadata, and require an explicit operator decision for raw
+content. That work depends on Gate 2 persisted-contract and parsed-record design;
+M0.6 defines the boundary but does not implement it.
+
+**Crash, retry, and ownership effects.** Storage hardening runs before provider
+and Git side effects. Failure does not consume a retry, create a provider record,
+change a workflow stage, alter correction/policy state, or release/steal target
+ownership. The only allowed partial effect is a monotonic permission reduction
+on artifacts already validated. A crash during JSON replacement retains the
+existing atomic-state behavior with a private temporary orphan. A crash while
+SQLite holds an execution transaction retains M0.5 behavior; private modes do
+not change lock release or durable owner semantics.
+
+**Read-only and writer implications.** Both read-only and workspace-write
+workflow actions require secure controller storage before invocation because
+both can persist sensitive prompts and provider results. This check does not
+grant, remove, or reinterpret provider capabilities; change sandbox/tool/network
+policy; make a writer retryable; or expose run storage to a provider. The target
+checkout remains separate from Continuo's run directory. POSIX modes do not
+protect against a provider process running as the same UID with unrestricted
+host filesystem access, so M0.6 must not be cited as provider sandboxing.
+
+**Audit and compatibility effects.** Schema version 6 and every JSON field stay
+unchanged. Permission repair is filesystem metadata, not a provider attempt,
+workflow event, policy decision, verification, recovery action, or Git record.
+Existing metrics and M0.5 coordination content remain stable. Root CLI,
+`jobs-orchestrator`, `JOBS_REPO`, `src/jobs_orchestrator`, and injectable
+temporary run directories remain compatible. Routine concise reporting may
+state that legacy modes were tightened without revealing sensitive content.
+
+**Adversarial test matrix.** Tests use only temporary directories/repositories,
+fake providers, synthetic legacy artifacts, local SQLite connections, patched
+filesystem failures, and local child processes. No live provider, network
+service, external target, or Jobs checkout is invoked.
+
+| ID | Fixture / event | Required assertions |
+|---|---|---|
+| D1 | Run directory is absent under `umask 000` | Every Continuo-created missing directory component and the run root are `0700` before a sensitive file exists. |
+| D2 | Nested injectable run directory is created | All new storage-owned components are private; existing ancestors outside the configured storage root are not chmodded. |
+| D3 | Existing run or lock directory is `0755`, `0770`, or owner-only but non-exact | Trustworthy owned directories become exactly `0700`; no content path is traversed first. |
+| D4 | Run or lock directory is a symlink, non-directory, or foreign-owned | Operation fails closed without following/chowning it, reading a record, invoking a provider, or touching Git. |
+| J1 | New run JSON is persisted under `umask 000` and `077` | Final file is exactly `0600` in both cases and round-trips unchanged. |
+| J2 | Fake observer inspects persistence while bytes are being written | Unique temporary file already exists as `0600`; no sensitive byte is ever visible in a broader-mode file. |
+| J3 | Existing valid `0644` run is loaded and later rewritten | It is tightened before read; bytes/mtime remain unchanged on load; replacement inode is `0600` and model data is identical. |
+| J4 | Exception or abrupt child exit occurs before atomic replace | Old JSON remains complete; normal failure removes its own temp; crash orphan is `0600` and never appears as a run. |
+| J5 | Run ID contains slash, backslash, NUL, `.`/`..`, or containment escape | Persist/load refuses before filesystem traversal or disclosure; no new persisted schema restriction is invented. |
+| J6 | Recognized JSON/temp path is a symlink | Controller never follows, reads, chmods through, replaces, or deletes the link target and fails visibly. |
+| J7 | Recognized path is a hard-linked file, directory/device/FIFO/socket, or foreign-owned regular file | Controller refuses rather than reading, taking ownership, unlinking, or mutating content. |
+| J8 | chmod/open/write/replace permission operation fails | Failure is sanitized, atomic old state survives where applicable, and no provider/Git action or run transition occurs. |
+| S1 | Target database is absent under permissive umask | Lock directory is `0700`; main database is exclusively pre-created and remains `0600` through schema initialization. |
+| S2 | Live rollback-journal transaction is observed | `*.sqlite3-journal` is `0600`; owner row and transaction behavior remain correct. |
+| S3 | Test-only WAL connection is observed | `*.sqlite3-wal` and `*.sqlite3-shm` are `0600` without changing production journal mode. |
+| S4 | Existing valid database/main/sidecars are `0644` | Artifacts tighten to `0600` without recreating the database, changing schema/owner rows, or releasing ownership. |
+| S5 | Two controllers contend while permission checks run | M0.5 zero-wait exclusion, owner hint, independent-target concurrency, and crash cleanup remain unchanged. |
+| S6 | Database is corrupt, wrong-schema, unsafe-linked, or cannot be hardened | Existing fail-closed outcome remains; controller never deletes/recreates it or invokes a provider. |
+| L1 | Directory contains multiple trustworthy legacy JSON and coordination artifacts with mixed broad modes | One bounded entry-point scan hardens every recognized artifact and reports counts without contents. |
+| L2 | Legacy JSON is schema-invalid or corrupt | Safe mode hardening occurs, then the same visible validation failure remains; bytes are not rewritten. |
+| L3 | Unknown files/subdirectories exist under the run root | They are not interpreted, recursively scanned, chmodded, exported, or deleted; private run-root traversal still encloses them. |
+| L4 | Hardening is repeated | Second pass is idempotent: modes, bytes, mtimes, schema, ownership rows, and workflow metrics do not change. |
+| L5 | Crash/failure interrupts a multi-artifact legacy scan | Already validated artifacts remain narrowed; none are broadened; next invocation resumes safely and surfaces the unsafe remainder. |
+| L6 | `load_run`, `report`, no-argument `status`, or full `status <run-id>` first encounters legacy modes | Each entry point applies the same security preflight before content access; only permission metadata may change. |
+| L7 | Existing artifact is already stricter than group/other access but lacks required owner usability | Controller never broadens group/other bits; it either safely normalizes exact owner-only usability or fails with a sanitized error. |
+| R1 | Released and active runs age beyond arbitrary thresholds | Nothing is automatically deleted, rotated, archived, or detached from M0.5 ownership. |
+| R2 | Unreleased owner references a run/database considered old or orphaned | Retention policy never removes it; existing conservative unknown-owner behavior remains. |
+| R3 | Concise report and run-list status render sensitive fixtures | Output contains existing metrics/identifiers only and does not add specification, prompt, stream, diff, or note content. |
+| R4 | Operator invokes `status <run-id>` | Full JSON remains available as an explicitly documented sensitive local inspection; no false redaction claim or implicit file export is made. |
+| R5 | Operator searches for export, purge, redact, retention, or cleanup commands | M0.6 adds none; documentation records deny-by-default export and indefinite retention boundaries. |
+| A1 | Read-only provider action is about to start | Storage is private before prompt/result persistence and provider invocation; existing retry/deadline policy is unchanged. |
+| A2 | Workspace-write provider action is about to start | Same storage preflight occurs without changing writer capability, single-shot policy, recovery evidence, or target files. |
+| A3 | Storage hardening fails before either provider capability | Fake provider, verification, approval, staging, commit, and push call counts remain zero. |
+| A4 | Provider process runs as the same UID in a synthetic unrestricted-host test | Contract makes no false isolation claim; provider sandbox/tool enforcement remains separate and unchanged. |
+| B1 | Source/runtime boundary inspection | No process-global umask mutation, chown, ACL tool, encryption, secret store, backup, remote storage, or same-UID sandbox is added. |
+| B2 | Persist/load current and legacy schema-6 records | JSON schema/version/content are unchanged; C-9 migrations and typed redaction remain Gate 2 work. |
+| B3 | Crash temporary, released run, corrupt record, or stale database exists | No automatic deletion, reset, cleanup, retention sweep, or owner stealing occurs. |
+| B4 | Permission/hardening errors are rendered | Messages contain only safe path/type/mode context and never quote record bytes or provider-controlled content. |
+| B5 | Root and compatibility CLI smoke checks run | `jobs-orchestrator`, `JOBS_REPO`, `src/jobs_orchestrator`, status/report/recovery/release commands, and injectable run directories remain available. |
+| B6 | Complete regression suite and scope inspection | No Jobs access, live provider, provider/model/policy change, commit, push, merge, queue, worktree, schema migration, export, or redacted-log implementation occurs. |
+
+**Explicit exclusions and later boundaries.** M0.6 does not encrypt storage;
+manage keys; remove ACLs/xattrs; protect against root, administrators, the same
+UID, backups, snapshots, terminal capture, or prior disclosure; add tamper
+evidence; migrate run content; create typed redacted records; add export, purge,
+archive, retention, or cleanup commands; change SQLite journal mode/schema;
+alter M0.5 ownership; move storage; create remote/shared storage; add structured
+logs; modify provider permissions; or access a target checkout.
+
+Gate 2/C-9 owns schema migrations and historical-content treatment. C-5/C-6
+own stable identities and typed parsed records needed for reliable redaction.
+Gate 8 owns redacted structured logs and the selected durable audit/storage
+architecture. A future retention/export item must preserve M0.5 ownership and
+explicit human disclosure authority.
+
+**Exit criteria:** the repository owner approves the POSIX threat model, exact
+directory/file modes, no-umask design, fail-closed path/link/ownership rules,
+automatic monotonic legacy hardening, private atomic replacement, private
+SQLite sidecars, indefinite retention, explicit-sensitive raw inspection, and
+deny-by-default export policy; every matrix row has deterministic coverage; all
+existing and new tests pass without live providers; root and compatibility CLI
+smoke checks pass; documentation and `git diff --check` pass; the complete
+implementation diff is reviewed; and no Gate 2 or later behavior enters the
+change.
 
 ## Gate 2 — Stabilize persisted contracts (roadmap Milestone 1)
 
