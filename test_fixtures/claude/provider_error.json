@@ -1,0 +1,14 @@
+{
+  "provenance": {
+    "kind": "recorded_sanitized",
+    "source": "approved bounded M0.3 capture",
+    "capture_date": "2026-08-02",
+    "claude_cli_version": "2.1.220",
+    "command_shape": "claude -p --model sonnet --permission-mode plan --tools Read --output-format json --json-schema <closed-review-schema> --max-turns 1 --max-budget-usd 0.10 --no-session-persistence --safe-mode",
+    "sanitization": "replaced identifiers, durations, usage, and cost; retained all top-level envelope/error fields",
+    "stdout_sha256": "3f4341a579aec3985f8add404e6addcdb71b503a3b75f2f9e7b99b828d5c3d95"
+  },
+  "returncode": 1,
+  "stdout": "{\"is_error\":true,\"duration_api_ms\":0,\"num_turns\":2,\"stop_reason\":\"tool_use\",\"session_id\":\"fixture-session\",\"total_cost_usd\":0.0,\"usage\":{},\"modelUsage\":{},\"permission_denials\":[],\"terminal_reason\":\"budget_exhausted\",\"fast_mode_state\":\"off\",\"fast_mode_disabled_reason\":\"sdk_opt_in_required\",\"subtype\":\"error_max_budget_usd\",\"errors\":[\"Reached maximum budget (fixture)\"],\"type\":\"result\",\"duration_ms\":0,\"uuid\":\"fixture-uuid\"}\n",
+  "stderr": ""
+}

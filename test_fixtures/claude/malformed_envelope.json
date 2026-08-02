@@ -1,0 +1,14 @@
+{
+  "provenance": {
+    "kind": "derived",
+    "source": "success.json",
+    "capture_date": "2026-08-02",
+    "claude_cli_version": "not applicable to derived payload",
+    "command_shape": "same protocol boundary as success.json",
+    "transformation": "truncate stdout after the result-envelope prefix",
+    "stdout_sha256": "3bfdeff3da6f3fcc5eb8292309689fecabd93794b516145cd9bb5a8bb4579d49"
+  },
+  "returncode": 0,
+  "stdout": "{\"type\":\"result\",\"subtype\":\"success\"",
+  "stderr": ""
+}

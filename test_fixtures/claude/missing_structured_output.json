@@ -1,0 +1,14 @@
+{
+  "provenance": {
+    "kind": "derived",
+    "source": "success.json",
+    "capture_date": "2026-08-02",
+    "claude_cli_version": "not applicable to derived payload",
+    "command_shape": "same protocol boundary as success.json",
+    "transformation": "remove only the structured_output field",
+    "stdout_sha256": "da651a40feea4e4ff4a39f33c3f0bf1623af4e4578e279b72bd63c18a661a4c1"
+  },
+  "returncode": 0,
+  "stdout": "{\"is_error\":false,\"duration_api_ms\":0,\"num_turns\":2,\"stop_reason\":\"end_turn\",\"session_id\":\"fixture-session\",\"total_cost_usd\":0.0,\"usage\":{},\"modelUsage\":{},\"permission_denials\":[],\"terminal_reason\":\"completed\",\"fast_mode_state\":\"off\",\"fast_mode_disabled_reason\":\"sdk_opt_in_required\",\"subtype\":\"success\",\"api_error_status\":null,\"result\":\"{\\\"status\\\":\\\"PASS\\\",\\\"category\\\":\\\"PASS\\\",\\\"finding_key\\\":\\\"PASS\\\",\\\"summary\\\":\\\"fixture pass\\\"}\",\"ttft_ms\":0,\"ttft_stream_ms\":0,\"time_to_request_ms\":0,\"type\":\"result\",\"duration_ms\":0,\"uuid\":\"fixture-uuid\"}\n",
+  "stderr": ""
+}

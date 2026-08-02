@@ -25,6 +25,9 @@ from providers import (
     execute_sol_escalation,
     execute_terra_resolution,
     classify_provider_failure,
+    execution_failed,
+    normalize_provider_execution,
+    normalize_sonnet_execution,
     parse_sonnet_review,
 )
 
@@ -237,7 +240,12 @@ def _record_provider(
     purpose: str,
     provider: str,
     execution: ProviderExecution,
-) -> None:
+) -> ProviderExecution:
+    execution = (
+        normalize_sonnet_execution(execution)
+        if provider == "Sonnet 5 High"
+        else normalize_provider_execution(execution)
+    )
     if execution.attempts:
         for attempt in execution.attempts:
             run.provider_runs.append(
@@ -250,10 +258,12 @@ def _record_provider(
                     stderr=attempt.stderr,
                     duration_seconds=attempt.duration_seconds,
                     failure_kind=attempt.failure_kind,
+                    failure_source=attempt.failure_source,
+                    failure_code=attempt.failure_code,
                     retry_scheduled=attempt.retry_scheduled,
                 )
             )
-        return
+        return execution
 
     run.provider_runs.append(
         ProviderRecord(
@@ -264,16 +274,12 @@ def _record_provider(
             stdout=execution.stdout,
             stderr=execution.stderr,
             duration_seconds=execution.duration_seconds,
-            failure_kind=(
-                execution.failure_kind
-                or classify_provider_failure(
-                    execution.returncode,
-                    execution.stdout,
-                    execution.stderr,
-                )
-            ),
+            failure_kind=execution.failure_kind,
+            failure_source=execution.failure_source,
+            failure_code=execution.failure_code,
         )
     )
+    return execution
 
 
 def _record_git(run: WorkflowRun, operation: str, result: subprocess.CompletedProcess[str]) -> None:
@@ -312,6 +318,9 @@ def _report_review_history(run: WorkflowRun) -> list[ReviewResult]:
             stdout=record.stdout,
             stderr=record.stderr,
             duration_seconds=record.duration_seconds,
+            failure_kind=record.failure_kind,
+            failure_source=record.failure_source,
+            failure_code=record.failure_code,
         )
         try:
             history.append(parse_sonnet_review(execution))
@@ -350,6 +359,7 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
         if record.provider == "Luna High"
         and record.purpose in {"implementation", "correction"}
         and record.returncode == 0
+        and record.failure_kind is None
     )
 
     wall_seconds: float | None = None
@@ -595,6 +605,9 @@ def _implementation_review_history(run: WorkflowRun) -> list[ReviewResult]:
                     record.returncode,
                     record.stdout,
                     record.stderr,
+                    failure_kind=record.failure_kind,
+                    failure_source=record.failure_source,
+                    failure_code=record.failure_code,
                 )
             )
         except Exception:
@@ -892,10 +905,12 @@ class Controller:
             "retrying the same provider once.[/yellow]"
         )
         execution = provider(prompt, self.repo)
-        _record_provider(run, purpose, provider_name, execution)
+        execution = _record_provider(
+            run, purpose, provider_name, execution
+        )
         self._save(run)
 
-        if execution.returncode != 0:
+        if execution_failed(execution):
             self._block_provider(
                 run,
                 provider_name,
@@ -975,10 +990,12 @@ class Controller:
             f"[cyan]Stage:[/cyan] Resuming {stage} — {provider_name}"
         )
         execution = provider(prompt, self.repo)
-        _record_provider(run, purpose, provider_name, execution)
+        execution = _record_provider(
+            run, purpose, provider_name, execution
+        )
         self._save(run)
 
-        if execution.returncode != 0:
+        if execution_failed(execution):
             return self._block_provider(
                 run,
                 provider_name,
@@ -1008,7 +1025,7 @@ class Controller:
 
         console.print("[cyan]Stage:[/cyan] Policy clarification — Terra High")
         execution = self.terra(prompt, self.repo)
-        _record_provider(
+        execution = _record_provider(
             run,
             "policy clarification",
             "Terra High",
@@ -1016,7 +1033,7 @@ class Controller:
         )
         self._save(run)
 
-        if execution.returncode != 0:
+        if execution_failed(execution):
             return self._block_provider(
                 run,
                 "Terra High",
@@ -1058,7 +1075,7 @@ class Controller:
             f"[cyan]Stage:[/cyan] {label} — Sonnet 5 High"
         )
         execution = self.sonnet(prompt, self.repo)
-        _record_provider(
+        execution = _record_provider(
             run,
             purpose,
             "Sonnet 5 High",
@@ -1066,7 +1083,7 @@ class Controller:
         )
         self._save(run)
 
-        if execution.returncode != 0:
+        if execution_failed(execution):
             self._block_provider(
                 run,
                 "Sonnet 5 High",
@@ -1180,7 +1197,7 @@ class Controller:
         )
         execution = self.luna(prompt, self.repo)
         purpose = "correction" if correction else "implementation"
-        _record_provider(
+        execution = _record_provider(
             run,
             purpose,
             "Luna High",
@@ -1188,7 +1205,7 @@ class Controller:
         )
         self._save(run)
 
-        if execution.returncode != 0:
+        if execution_failed(execution):
             self._block_provider(
                 run,
                 "Luna High",
@@ -1226,7 +1243,7 @@ class Controller:
             "[cyan]Stage:[/cyan] Escalation diagnosis — Sol High"
         )
         execution = self.sol(prompt, self.repo)
-        _record_provider(
+        execution = _record_provider(
             run,
             "escalation guidance",
             "Sol High",
@@ -1234,7 +1251,7 @@ class Controller:
         )
         self._save(run)
 
-        if execution.returncode != 0:
+        if execution_failed(execution):
             self._block_provider(
                 run,
                 "Sol High",
@@ -1490,8 +1507,15 @@ class Controller:
             stderr=record.stderr,
             duration_seconds=record.duration_seconds,
             failure_kind=record.failure_kind,
+            failure_source=record.failure_source,
+            failure_code=record.failure_code,
         )
-        if execution.returncode != 0:
+        execution = (
+            normalize_sonnet_execution(execution)
+            if record.provider == "Sonnet 5 High"
+            else normalize_provider_execution(execution)
+        )
+        if execution_failed(execution):
             return self._block_provider(
                 run,
                 record.provider,
@@ -1556,14 +1580,14 @@ class Controller:
         if run.stage == "correcting":
             run.stage = "correction_completed"
             self._save(run)
-            if execution.returncode != 0:
+            if execution_failed(execution):
                 return self._block(run, "blocked_provider_failure", "Luna failed during correction")
             if not self._verify(run):
                 return run
             return self._review_and_correct(run)
         run.stage = "implementation_completed"
         self._save(run)
-        if execution.returncode != 0:
+        if execution_failed(execution):
             return self._block(run, "blocked_provider_failure", "Luna failed during implementation")
         if not self._verify(run):
             return run

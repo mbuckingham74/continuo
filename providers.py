@@ -6,6 +6,7 @@ commands and parse Sonnet's closed structured response.
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
@@ -14,11 +15,15 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
-from models import ReviewResult
+from models import (
+    ProviderFailureKind,
+    ProviderFailureSource,
+    ReviewResult,
+)
 
 
 DEFAULT_REPO = Path.home() / "Documents/my-apps/jobs"
@@ -29,6 +34,7 @@ PROVIDER_POLL_INTERVAL_SECONDS = 0.2
 PROVIDER_HEARTBEAT_SECONDS = 5.0
 PROVIDER_TIMEOUT_RETURN_CODE = 124
 PROVIDER_INTERRUPTED_RETURN_CODE = 130
+PROVIDER_STDOUT_TAIL_BYTES = 8 * 1024
 
 SONNET_REVIEW_SCHEMA = {
     "type": "object",
@@ -65,7 +71,9 @@ class ProviderAttempt:
     stdout: str = ""
     stderr: str = ""
     duration_seconds: float | None = None
-    failure_kind: str | None = None
+    failure_kind: ProviderFailureKind | None = None
+    failure_source: ProviderFailureSource | None = None
+    failure_code: str | None = None
     retry_scheduled: bool = False
 
 
@@ -76,14 +84,23 @@ class ProviderExecution:
     stdout: str = ""
     stderr: str = ""
     duration_seconds: float | None = None
-    failure_kind: str | None = None
+    failure_kind: ProviderFailureKind | None = None
+    failure_source: ProviderFailureSource | None = None
+    failure_code: str | None = None
     attempts: tuple[ProviderAttempt, ...] = ()
+
+
+@dataclass(frozen=True)
+class ProviderFailureEvidence:
+    kind: ProviderFailureKind
+    source: ProviderFailureSource
+    code: str | None = None
 
 
 @dataclass(frozen=True)
 class _SupervisedResult:
     completed: subprocess.CompletedProcess[str]
-    failure_kind: str | None = None
+    failure_kind: ProviderFailureKind | None = None
 
 
 def build_sonnet_command(prompt: str) -> list[str]:
@@ -170,94 +187,263 @@ def classify_provider_failure(
     stdout: str = "",
     stderr: str = "",
 ) -> str | None:
-    """Conservatively classify provider/transport failures."""
+    """Compatibility wrapper returning only the normalized failure kind."""
+
+    evidence = normalize_provider_failure(returncode, stdout, stderr)
+    return evidence.kind if evidence is not None else None
+
+
+_HTTP_STATUS_LINE = re.compile(
+    r"^(?:error:\s*)?(?:http(?:\s+status)?|status(?:\s+code)?)"
+    r"\s*[:=]?\s*(?P<status>\d{3})\b",
+    re.IGNORECASE,
+)
+
+_DIAGNOSTIC_PREFIXES: tuple[
+    tuple[ProviderFailureKind, tuple[str, ...]], ...
+] = (
+    (
+        "quota",
+        (
+            "quota exceeded",
+            "insufficient_quota",
+            "usage limit",
+            "usage cap",
+            "you've hit your limit",
+            "you have hit your limit",
+            "you've hit your usage limit",
+            "you have hit your usage limit",
+            "insufficient credits",
+            "out of credits",
+            "credit balance",
+            "spending limit",
+            "weekly limit",
+            "monthly limit",
+        ),
+    ),
+    (
+        "billing",
+        (
+            "payment required",
+            "billing account",
+            "billing issue",
+        ),
+    ),
+    (
+        "auth",
+        (
+            "unauthorized",
+            "authentication failed",
+            "authentication error",
+            "invalid api key",
+            "invalid_api_key",
+            "not authenticated",
+        ),
+    ),
+    (
+        "rate_limit",
+        (
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+        ),
+    ),
+    (
+        "configuration",
+        (
+            "command not found",
+            "no such file or directory",
+            "model not found",
+            "unknown model",
+            "invalid model",
+        ),
+    ),
+    (
+        "unavailable",
+        (
+            "service unavailable",
+            "temporarily unavailable",
+            "bad gateway",
+            "gateway timeout",
+            "connection refused",
+            "connection reset",
+            "connection error",
+            "network error",
+            "network unavailable",
+            "timed out",
+            "timeout",
+            "internal server error",
+            "overloaded",
+            "capacity unavailable",
+        ),
+    ),
+)
+
+
+def _kind_for_http_status(status: int) -> ProviderFailureKind | None:
+    if status == 402:
+        return "billing"
+    if status in {401, 403}:
+        return "auth"
+    if status == 429:
+        return "rate_limit"
+    if status in {500, 502, 503, 504}:
+        return "unavailable"
+    return None
+
+
+def _classify_diagnostic_text(
+    text: str,
+    source: ProviderFailureSource,
+) -> ProviderFailureEvidence | None:
+    for raw_line in text.splitlines():
+        line = raw_line.strip().lower()
+        if not line:
+            continue
+        status_match = _HTTP_STATUS_LINE.match(line)
+        if status_match:
+            status = int(status_match.group("status"))
+            kind = _kind_for_http_status(status)
+            if kind is not None:
+                return ProviderFailureEvidence(kind, source, str(status))
+        if line.startswith("error:"):
+            line = line.removeprefix("error:").lstrip()
+        for kind, prefixes in _DIAGNOSTIC_PREFIXES:
+            if any(line.startswith(prefix) for prefix in prefixes):
+                return ProviderFailureEvidence(kind, source)
+    return None
+
+
+def _stdout_tail(stdout: str) -> str:
+    encoded = stdout.encode("utf-8", errors="replace")
+    return encoded[-PROVIDER_STDOUT_TAIL_BYTES:].decode(
+        "utf-8", errors="replace"
+    )
+
+
+def normalize_provider_failure(
+    returncode: int,
+    stdout: str = "",
+    stderr: str = "",
+    *,
+    allow_stdout_tail: bool = False,
+) -> ProviderFailureEvidence | None:
+    """Classify only trusted, bounded transport evidence."""
 
     if returncode == 0:
         return None
-
-    text = f"{stderr}\n{stdout}".lower()
-
-    quota_patterns = (
-        "quota exceeded",
-        "insufficient_quota",
-        "usage limit",
-        "usage cap",
-        "you've hit your limit",
-        "you have hit your limit",
-        "you've hit your usage limit",
-        "you have hit your usage limit",
-        "insufficient credits",
-        "out of credits",
-        "credit balance",
-        "spending limit",
-        "weekly limit",
-        "monthly limit",
+    evidence = _classify_diagnostic_text(stderr, "stderr")
+    if evidence is not None:
+        return evidence
+    if allow_stdout_tail:
+        evidence = _classify_diagnostic_text(
+            _stdout_tail(stdout),
+            "stdout_tail",
+        )
+        if evidence is not None:
+            return evidence
+    return ProviderFailureEvidence(
+        "provider_error",
+        "returncode",
+        str(returncode),
     )
-    if any(pattern in text for pattern in quota_patterns):
-        return "quota"
 
-    if (
-        "payment required" in text
-        or "billing account" in text
-        or "billing issue" in text
-        or re.search(r"\b402\b", text)
-    ):
-        return "billing"
 
-    auth_patterns = (
-        "unauthorized",
-        "authentication failed",
-        "authentication error",
-        "invalid api key",
-        "invalid_api_key",
-        "not authenticated",
-        "permission denied",
+def _os_failure_evidence(exc: OSError) -> ProviderFailureEvidence:
+    configuration_errnos = {
+        errno.EACCES,
+        errno.ENOENT,
+        errno.ENOEXEC,
+        errno.EPERM,
+    }
+    kind: ProviderFailureKind = (
+        "configuration"
+        if exc.errno in configuration_errnos
+        else "provider_error"
     )
-    if any(pattern in text for pattern in auth_patterns) or re.search(
-        r"\b(401|403)\b", text
-    ):
-        return "auth"
+    code = type(exc).__name__
+    if exc.errno is not None:
+        code += f":{exc.errno}"
+    return ProviderFailureEvidence(kind, "os_error", code[:120])
 
-    if (
-        "rate limit" in text
-        or "rate_limit" in text
-        or "too many requests" in text
-        or re.search(r"\b429\b", text)
-    ):
-        return "rate_limit"
 
-    configuration_patterns = (
-        "command not found",
-        "no such file or directory",
-        "model not found",
-        "unknown model",
-        "invalid model",
+def classify_claude_native_failure(
+    result: subprocess.CompletedProcess[str],
+) -> ProviderFailureEvidence | None:
+    """Read only Claude's structured result discriminator/error fields."""
+
+    try:
+        envelope = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    if envelope.get("type") != "result" or envelope.get("is_error") is not True:
+        return None
+
+    subtype = envelope.get("subtype")
+    code = (
+        subtype
+        if isinstance(subtype, str) and 0 < len(subtype) <= 120
+        else None
     )
-    if any(pattern in text for pattern in configuration_patterns):
-        return "configuration"
-
-    unavailable_patterns = (
-        "service unavailable",
-        "temporarily unavailable",
-        "bad gateway",
-        "gateway timeout",
-        "connection refused",
-        "connection reset",
-        "connection error",
-        "network error",
-        "network unavailable",
-        "timed out",
-        "timeout",
-        "internal server error",
-        "overloaded",
-        "capacity",
+    status = envelope.get("api_error_status")
+    if isinstance(status, str) and status.isdigit():
+        status = int(status)
+    kind = _kind_for_http_status(status) if isinstance(status, int) else None
+    return ProviderFailureEvidence(
+        kind or "provider_error",
+        "provider_native",
+        code,
     )
-    if any(pattern in text for pattern in unavailable_patterns) or re.search(
-        r"\b(500|502|503|504)\b", text
-    ):
-        return "unavailable"
 
-    return "provider_error"
+
+def normalize_sonnet_execution(
+    execution: ProviderExecution,
+) -> ProviderExecution:
+    """Normalize a Sonnet result before persistence or controller routing."""
+
+    if execution.failure_source in {"supervisor", "os_error"}:
+        return execution
+    completed = subprocess.CompletedProcess(
+        execution.command,
+        execution.returncode,
+        execution.stdout,
+        execution.stderr,
+    )
+    evidence = classify_claude_native_failure(completed)
+    if evidence is not None:
+        return replace(
+            execution,
+            failure_kind=evidence.kind,
+            failure_source=evidence.source,
+            failure_code=evidence.code,
+        )
+    return normalize_provider_execution(execution)
+
+
+def normalize_provider_execution(
+    execution: ProviderExecution,
+) -> ProviderExecution:
+    if execution.failure_kind is not None:
+        return execution
+    evidence = normalize_provider_failure(
+        execution.returncode,
+        execution.stdout,
+        execution.stderr,
+    )
+    if evidence is None:
+        return execution
+    return replace(
+        execution,
+        failure_kind=evidence.kind,
+        failure_source=evidence.source,
+        failure_code=evidence.code,
+    )
+
+
+def execution_failed(execution: ProviderExecution) -> bool:
+    return execution.failure_kind is not None or execution.returncode != 0
 
 
 def _validate_supervision_timing(
@@ -531,6 +717,12 @@ def _run(
     term_grace_seconds: float = PROVIDER_TERM_GRACE_SECONDS,
     poll_interval_seconds: float = PROVIDER_POLL_INTERVAL_SECONDS,
     heartbeat_seconds: float = PROVIDER_HEARTBEAT_SECONDS,
+    native_classifier: Callable[
+        [subprocess.CompletedProcess[str]],
+        ProviderFailureEvidence | None,
+    ]
+    | None = None,
+    allow_stdout_tail: bool = False,
 ) -> ProviderExecution:
     """Run one provider with bounded same-provider outage retries only."""
 
@@ -560,7 +752,8 @@ def _run(
             flush=True,
         )
 
-        terminal_failure_kind: str | None = None
+        terminal_failure_kind: ProviderFailureKind | None = None
+        direct_evidence: ProviderFailureEvidence | None = None
         try:
             if runner is not subprocess.run:
                 result = runner(
@@ -590,16 +783,26 @@ def _run(
                 "",
                 f"{type(exc).__name__}: {exc}",
             )
+            direct_evidence = _os_failure_evidence(exc)
 
         elapsed = time.monotonic() - started
-        failure_kind = (
-            terminal_failure_kind
-            or classify_provider_failure(
+        evidence = direct_evidence
+        if terminal_failure_kind is not None:
+            evidence = ProviderFailureEvidence(
+                terminal_failure_kind,
+                "supervisor",
+                terminal_failure_kind,
+            )
+        elif native_classifier is not None:
+            evidence = native_classifier(result) or evidence
+        if evidence is None:
+            evidence = normalize_provider_failure(
                 result.returncode,
                 result.stdout,
                 result.stderr,
+                allow_stdout_tail=allow_stdout_tail,
             )
-        )
+        failure_kind = evidence.kind if evidence is not None else None
 
         # Only true provider/network unavailability is retried automatically.
         # Timeout, interruption, quota, billing, auth, rate-limit,
@@ -617,6 +820,12 @@ def _run(
                 stderr=result.stderr,
                 duration_seconds=elapsed,
                 failure_kind=failure_kind,
+                failure_source=(
+                    evidence.source if evidence is not None else None
+                ),
+                failure_code=(
+                    evidence.code if evidence is not None else None
+                ),
                 retry_scheduled=retry_scheduled,
             )
         )
@@ -624,7 +833,11 @@ def _run(
         if interactive:
             print("\r\033[2K", end="", file=sys.stderr)
 
-        mark = "✓" if result.returncode == 0 else "✗"
+        mark = (
+            "✓"
+            if result.returncode == 0 and failure_kind is None
+            else "✗"
+        )
         print(
             f"{mark} {label} finished in {elapsed:0.1f}s "
             f"(exit {result.returncode})",
@@ -653,6 +866,12 @@ def _run(
                 for attempt in attempts
             ),
             failure_kind=failure_kind,
+            failure_source=(
+                evidence.source if evidence is not None else None
+            ),
+            failure_code=(
+                evidence.code if evidence is not None else None
+            ),
             attempts=tuple(attempts),
         )
 
@@ -664,14 +883,26 @@ def execute_sonnet_review(prompt: str, repo: Path = DEFAULT_REPO) -> ProviderExe
         build_sonnet_command(prompt),
         repo,
         deadline_seconds=READ_ONLY_PROVIDER_DEADLINE_SECONDS,
+        native_classifier=classify_claude_native_failure,
     )
 
 
 def parse_sonnet_review(execution: ProviderExecution) -> ReviewResult:
-    if execution.returncode != 0:
+    execution = normalize_sonnet_execution(execution)
+    if execution_failed(execution):
         raise RuntimeError(execution.stderr or "Sonnet review failed")
     envelope = json.loads(execution.stdout)
-    structured = envelope.get("structured_output", envelope)
+    if not isinstance(envelope, dict):
+        raise ValueError("Claude result envelope must be an object")
+    if (
+        envelope.get("type") != "result"
+        or envelope.get("subtype") != "success"
+        or envelope.get("is_error") is not False
+    ):
+        raise ValueError("Claude result envelope is not a recognized success")
+    if "structured_output" not in envelope:
+        raise ValueError("Claude success envelope lacks structured_output")
+    structured = envelope["structured_output"]
     result = ReviewResult.model_validate(structured)
     if (result.status == "PASS") != (result.category == "PASS"):
         raise ValueError("Sonnet returned inconsistent status/category")

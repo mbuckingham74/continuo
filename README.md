@@ -47,7 +47,7 @@ tasks/<task-ref>-*.md
 
 For example, task `009` must resolve to exactly one file such as `tasks/009-example.md`. The controller persists the specification and its SHA-256, coordinates the run, and stores local run state under `runs/`.
 
-The controller and its safety behavior are implemented and covered by 44 unit tests. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
+The controller and its safety behavior are implemented and covered by 59 unit tests. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
 
 ## How it works
 
@@ -122,6 +122,11 @@ The controller snapshots repository path, branch, `HEAD`, and origin. After ever
 - Luna's prompt explicitly prohibits commit, push, branch changes, merge, rebase, reset, and `.git` mutation.
 - Only the controller performs approved Git mutations.
 - Invalid structured output receives one same-provider retry, then blocks.
+- Provider failures use structured native errors, OS/supervisor outcomes, narrow
+  stderr diagnostics, and only explicitly enabled bounded stdout tails; model
+  prose, prompts, transcripts, and diffs are not transport evidence.
+- Claude native error envelopes are separated from successful review content and
+  never consume the invalid-content retry.
 - Provider unavailability receives two bounded same-provider retries, after 5 and 15 seconds.
 - Read-only provider attempts have a 30-minute hard deadline; Luna writer attempts have a 60-minute deadline.
 - Timeout or interruption terminates the isolated process group, preserves partial output, and blocks without retry or ordinary resume.
@@ -245,7 +250,7 @@ uv sync
 uv run python -m unittest -v
 ```
 
-The 44 tests exercise temporary repositories, fake providers, and real local child/grandchild processes. They cover preflight safety, task resolution, correction budgets, repeat-finding escalation, policy decisions, provider failures and retries, provider-stop resume behavior, bounded process cleanup, timeout/interruption output and recovery, sandbox command construction, reporting, Git approval defaults, and adversarial Git change parsing, fingerprinting, persistence, recovery, and staging behavior.
+The 59 tests exercise temporary repositories, recorded sanitized fixtures, fake providers, and real local child/grandchild processes. They cover preflight safety, task resolution, correction budgets, repeat-finding escalation, policy decisions, trusted failure-evidence precedence, Claude envelope/content separation, provider failures and retries, provider-stop resume behavior, bounded process cleanup, timeout/interruption output and recovery, sandbox command construction, reporting, Git approval defaults, and adversarial Git change parsing, fingerprinting, persistence, recovery, and staging behavior.
 
 Before committing changes, also check the diff:
 
@@ -276,7 +281,9 @@ git diff --check
 - Verification does not yet run project-specific tests, builds, or acceptance checks.
 - Workflow stages are strings rather than a typed, declared transition graph.
 - Provider deadline values and termination grace are provisional hard-coded safety ceilings rather than configuration-backed policy.
-- Provider error classification relies on conservative output matching.
+- Provider error classification still has provider-specific diagnostic-pattern
+  debt where a structured native error contract is unavailable; stdout-tail
+  classification is disabled unless a recorded provider contract enables it.
 - Run JSON is local and mutable rather than a tamper-evident event log.
 - There is no run scheduler, concurrent-run lock, shared provider circuit breaker, or cross-run reporting.
 - Pull requests, merge, rollback, deployment, and notifications are outside the current engine.

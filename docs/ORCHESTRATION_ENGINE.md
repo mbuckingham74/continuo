@@ -382,7 +382,24 @@ The controller invokes Git directly for inspection and, only after approval, sta
 
 ## 12. Provider failure and retry policy
 
-The provider boundary classifies nonzero exits deterministically using conservative output patterns:
+The provider boundary normalizes failures deterministically using this evidence
+precedence:
+
+1. provider-native structured error fields;
+2. OS launch errors and controller-owned supervisor outcomes;
+3. provider-specific, line-anchored stderr diagnostics;
+4. the final 8 KiB of stdout only when a recorded provider contract explicitly
+   enables that channel; and
+5. `provider_error` with the physical return code when no trusted evidence
+   matches.
+
+Complete stdout is never scanned. Model prose, prompts, transcripts, review
+content, code, and diffs are not transport evidence. Bare HTTP-looking numbers
+do not classify; numeric status matches require an explicit `HTTP` or `status`
+prefix. Each new attempt can persist the normalized evidence source and bounded
+native/OS code alongside the existing failure kind.
+
+The failure vocabulary remains:
 
 - `quota`;
 - `billing`;
@@ -416,7 +433,16 @@ Read-only provider operations have a 30-minute hard deadline and workspace-write
 
 ### Invalid structured output
 
-Valid transport does not imply valid protocol output. Malformed Sonnet review output or malformed Sol escalation output receives one same-provider structured-output retry. A second parse failure blocks as `blocked_provider_output`. No other role is substituted.
+Valid transport does not imply valid protocol output. Claude must return a
+recognized `type=result`, `subtype=success`, `is_error=false` envelope containing
+`structured_output`; the controller no longer treats the complete top-level
+envelope as review content. Provider-native Claude error envelopes, including
+max-turn and budget-limit results, are normalized as provider failures and never
+consume the structured-output retry. Malformed envelopes, missing
+`structured_output`, schema-invalid reviews, or malformed Sol escalation output
+receive one same-provider structured-output retry. A second parse failure blocks
+as `blocked_provider_output`. Transport and content retries are mutually
+exclusive, and no other role is substituted.
 
 ## 13. Crash recovery and exact-stage resume
 
@@ -532,7 +558,12 @@ Runs are stored as formatted JSON in `runs/<run-id>.json`. The run ID is the fir
 - Git operation records; and
 - commit hash and message.
 
-Each provider record includes provider label, purpose, full command, return code, stdout, stderr, duration, failure classification, and whether another same-provider retry was scheduled. Because prompts are command arguments, the persisted command is also an input audit record.
+Each provider record includes provider label, purpose, full command, physical
+return code, stdout, stderr, duration, failure classification, optional evidence
+source/native-or-OS code, and whether another same-provider retry was scheduled.
+Because prompts are command arguments, the persisted command is also an input
+audit record. The optional provenance fields preserve schema-6 compatibility:
+legacy records load with explicit `null` provenance and are not rewritten.
 
 Git records include the operation label, command, return code, stdout, and stderr.
 
@@ -634,7 +665,11 @@ Lists recent runs or prints one run's complete JSON.
 
 ## 20. Current tests and what they cover
 
-The current suite has 44 `unittest` cases. It creates isolated temporary Git repositories, substitutes deterministic fake provider functions, and uses real local Python child/grandchild processes for supervisor tests; it does not call live model providers or mutate the real Jobs repository.
+The current suite has 59 `unittest` cases. It creates isolated temporary Git
+repositories, loads checksummed sanitized Claude fixtures, substitutes
+deterministic fake provider functions, and uses real local Python
+child/grandchild processes for supervisor tests. The tests do not call live model
+providers or mutate the real Jobs repository.
 
 ### Preflight and repository safety
 
@@ -669,8 +704,15 @@ The current suite has 44 `unittest` cases. It creates isolated temporary Git rep
 - unavailability retries only the same provider, with per-attempt audit fields;
 - real provider processes enforce deadlines, preserve partial output, and clean up process groups through TERM/KILL escalation;
 - timeout and interruption persist distinct non-resumable blocked stages without provider retry;
-- quota, billing, auth, rate-limit, unavailable, and configuration classifications are deterministic for representative messages;
-- malformed Sonnet output receives one same-provider retry;
+- provider-native, OS, supervisor, anchored-stderr, opt-in bounded-stdout-tail,
+  and return-code evidence precedence is deterministic and auditable;
+- model prose, prompts, transcripts, code, and diffs cannot trigger transport
+  classification;
+- recorded Claude success, budget-limit, and max-turn envelopes plus documented
+  malformed/missing/schema-invalid derivatives split transport failures from
+  invalid review content;
+- malformed Sonnet output receives one same-provider content retry, while native
+  errors receive only the applicable transport path;
 - provider command construction preserves Sonnet read-only tools, Sol read-only sandboxing, and Luna workspace/network/Git restrictions.
 
 ### Not covered today
@@ -717,7 +759,9 @@ This is the most important generalization debt. Model/provider names must be abs
 
 ### Provider protocol debt
 
-- failure classification relies on output substring/regex matching;
+- providers without structured native errors still require conservative,
+  provider-specific stderr patterns; no production stdout-tail contract is
+  enabled yet;
 - retry delays and limits are hard-coded;
 - timeout/interruption enforcement exists, but deadline values are hard-coded and token, cost, and context-size ceilings are not enforced;
 - Sonnet uses JSON Schema, while Sol and Terra rely on textual conventions;

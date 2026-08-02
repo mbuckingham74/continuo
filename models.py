@@ -61,6 +61,15 @@ ProviderFailureKind = Literal[
     "provider_error",
 ]
 
+ProviderFailureSource = Literal[
+    "provider_native",
+    "os_error",
+    "supervisor",
+    "stderr",
+    "stdout_tail",
+    "returncode",
+]
+
 
 class ProviderRecord(BaseModel):
     provider: str
@@ -71,6 +80,8 @@ class ProviderRecord(BaseModel):
     stderr: str = ""
     duration_seconds: float | None = Field(default=None, ge=0)
     failure_kind: ProviderFailureKind | None = None
+    failure_source: ProviderFailureSource | None = None
+    failure_code: str | None = Field(default=None, max_length=120)
     retry_scheduled: bool = False
 
 

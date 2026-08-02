@@ -18,6 +18,9 @@ from models import RepoState, ReviewResult, WorkflowRun
 from providers import ProviderExecution, build_luna_command, build_sol_command, build_sonnet_command
 
 
+CLAUDE_FIXTURES = Path(__file__).parent / "test_fixtures/claude"
+
+
 def git(repo: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -37,6 +40,9 @@ def review_execution(
     if finding_key is None:
         finding_key = "PASS" if category == "PASS" else "test-finding"
     payload = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
         "structured_output": {
             "status": status,
             "category": category,
@@ -45,6 +51,22 @@ def review_execution(
         }
     }
     return ProviderExecution(["claude"], 0, json.dumps(payload), "")
+
+
+def claude_fixture(name: str) -> tuple[dict[str, object], ProviderExecution]:
+    fixture = json.loads(
+        (CLAUDE_FIXTURES / f"{name}.json").read_text(encoding="utf-8")
+    )
+    expected = fixture["provenance"]["stdout_sha256"]
+    actual = hashlib.sha256(fixture["stdout"].encode()).hexdigest()
+    if actual != expected:
+        raise AssertionError(f"fixture checksum mismatch: {name}")
+    return fixture, ProviderExecution(
+        ["claude"],
+        fixture["returncode"],
+        fixture["stdout"],
+        fixture["stderr"],
+    )
 
 
 class ControllerTests(unittest.TestCase):
@@ -898,13 +920,13 @@ class ControllerTests(unittest.TestCase):
                     ["claude"],
                     503,
                     "",
-                    "503 Service Unavailable",
+                    "HTTP 503 Service Unavailable",
                 ),
                 subprocess.CompletedProcess(
                     ["claude"],
                     502,
                     "",
-                    "502 Bad Gateway",
+                    "HTTP 502 Bad Gateway",
                 ),
                 subprocess.CompletedProcess(
                     ["claude"],
@@ -949,10 +971,10 @@ class ControllerTests(unittest.TestCase):
     def test_provider_failure_classification_is_deterministic(self) -> None:
         cases = (
             ("You've hit your usage limit", "quota"),
-            ("402 Payment Required", "billing"),
-            ("401 Unauthorized", "auth"),
-            ("429 Too Many Requests", "rate_limit"),
-            ("503 Service Unavailable", "unavailable"),
+            ("HTTP 402 Payment Required", "billing"),
+            ("HTTP 401 Unauthorized", "auth"),
+            ("status code: 429 Too Many Requests", "rate_limit"),
+            ("HTTP 503 Service Unavailable", "unavailable"),
             ("unknown model requested", "configuration"),
         )
 
@@ -1254,6 +1276,643 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(resumed.stage, "blocked_provider_interrupted")
         self.assertEqual(calls, 1)
 
+    def test_recorded_native_error_blocks_without_content_retry(self) -> None:
+        calls = 0
+        _, native_error = claude_fixture("provider_error")
+
+        def sonnet(prompt, repo):
+            nonlocal calls
+            calls += 1
+            return native_error
+
+        run = self.controller(sonnet).new_run("009")
+
+        self.assertEqual(run.stage, "blocked_provider_failure")
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(run.provider_runs), 1)
+        record = run.provider_runs[0]
+        self.assertEqual(record.returncode, 1)
+        self.assertEqual(record.failure_kind, "provider_error")
+        self.assertEqual(record.failure_source, "provider_native")
+        self.assertEqual(record.failure_code, "error_max_budget_usd")
+
+    def test_fixture_content_retry_then_native_error_stops_at_two_calls(self) -> None:
+        calls = 0
+        _, malformed = claude_fixture("malformed_envelope")
+        _, max_turns = claude_fixture("max_turns")
+
+        def sonnet(prompt, repo):
+            nonlocal calls
+            calls += 1
+            return malformed if calls == 1 else max_turns
+
+        run = self.controller(sonnet).new_run("009")
+
+        self.assertEqual(run.stage, "blocked_provider_failure")
+        self.assertEqual(calls, 2)
+        self.assertEqual(len(run.provider_runs), 2)
+        self.assertIsNone(run.provider_runs[0].failure_kind)
+        self.assertEqual(run.provider_runs[1].failure_source, "provider_native")
+        self.assertEqual(run.provider_runs[1].failure_code, "error_max_turns")
+
+    def test_fixture_content_retry_then_success_advances(self) -> None:
+        calls = 0
+        _, malformed = claude_fixture("malformed_envelope")
+        _, success = claude_fixture("success")
+
+        def sonnet(prompt, repo):
+            nonlocal calls
+            calls += 1
+            return malformed if calls == 1 else success
+
+        run = self.controller(
+            sonnet,
+            approval=lambda prompt: False,
+        ).new_run("009")
+
+        self.assertEqual(run.stage, "commit_declined")
+        self.assertEqual(calls, 3)
+        self.assertEqual(run.spec_review.status, "PASS")
+        self.assertEqual(run.implementation_review.status, "PASS")
+
+    def test_native_failure_crash_recovery_uses_saved_evidence(self) -> None:
+        provider_calls = 0
+        _, native_error = claude_fixture("provider_error")
+
+        def unexpected_provider(prompt, repo):
+            nonlocal provider_calls
+            provider_calls += 1
+            return review_execution("PASS", "PASS")
+
+        run = WorkflowRun(
+            run_id="native-failure-recovery",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Test native failure recovery.",
+            repo=orchestrator.repo_state(self.repo),
+            stage="spec_reviewing",
+            provider_resume_stage="spec_reviewing",
+            provider_resume_prompt="saved prompt",
+        )
+        normalized = orchestrator._record_provider(
+            run,
+            "specification",
+            "Sonnet 5 High",
+            native_error,
+        )
+        self.assertTrue(providers.execution_failed(normalized))
+        orchestrator.persist(run, self.runs)
+
+        recovered = self.controller(unexpected_provider).resume(run.run_id)
+
+        self.assertEqual(recovered.stage, "blocked_provider_failure")
+        self.assertEqual(provider_calls, 0)
+        self.assertEqual(
+            recovered.provider_runs[-1].failure_source,
+            "provider_native",
+        )
+
+        _, malformed = claude_fixture("malformed_envelope")
+        malformed_run = WorkflowRun(
+            run_id="malformed-content-recovery",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Test malformed content recovery.",
+            repo=orchestrator.repo_state(self.repo),
+            stage="spec_reviewing",
+            provider_resume_stage="spec_reviewing",
+            provider_resume_prompt="saved prompt",
+        )
+        orchestrator._record_provider(
+            malformed_run,
+            "specification",
+            "Sonnet 5 High",
+            malformed,
+        )
+        orchestrator.persist(malformed_run, self.runs)
+
+        recovered_malformed = self.controller(unexpected_provider).resume(
+            malformed_run.run_id
+        )
+
+        self.assertEqual(
+            recovered_malformed.stage,
+            "blocked_provider_output",
+        )
+        self.assertEqual(provider_calls, 0)
+
+        _, success = claude_fixture("success")
+        success_run = WorkflowRun(
+            run_id="successful-content-recovery",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Test successful content recovery.",
+            repo=orchestrator.repo_state(self.repo),
+            stage="spec_reviewing",
+            provider_resume_stage="spec_reviewing",
+            provider_resume_prompt="saved prompt",
+        )
+        orchestrator._record_provider(
+            success_run,
+            "specification",
+            "Sonnet 5 High",
+            success,
+        )
+        orchestrator.persist(success_run, self.runs)
+
+        recovered_success = self.controller(
+            unexpected_provider,
+            approval=lambda prompt: False,
+        ).resume(success_run.run_id)
+
+        self.assertEqual(recovered_success.stage, "commit_declined")
+        self.assertEqual(provider_calls, 1)
+        self.assertEqual(
+            [
+                record.purpose
+                for record in recovered_success.provider_runs
+                if record.provider == "Sonnet 5 High"
+            ],
+            ["specification", "implementation"],
+        )
+
+    def test_legacy_failure_recovery_does_not_scan_model_stdout(self) -> None:
+        run = WorkflowRun(
+            run_id="legacy-model-prose",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Test conservative legacy recovery.",
+            repo=orchestrator.repo_state(self.repo),
+            stage="implementing",
+            provider_resume_stage="implementing",
+            provider_resume_prompt="saved prompt",
+        )
+        run.provider_runs.append(
+            orchestrator.ProviderRecord(
+                provider="Luna High",
+                purpose="implementation",
+                command=["codex"],
+                returncode=1,
+                stdout=(
+                    "Model transcript and diff:\n"
+                    "HTTP 503 Service Unavailable\n"
+                    "+ status code: 429\n"
+                ),
+                stderr="",
+            )
+        )
+        orchestrator.persist(run, self.runs)
+
+        recovered = self.controller(self.passing_sonnet).resume(run.run_id)
+
+        self.assertEqual(recovered.stage, "blocked_provider_failure")
+        self.assertEqual(recovered.provider_runs[-1].failure_kind, None)
+        self.assertNotIn("implementation.py", orchestrator.changed_files(self.repo))
+
+
+class ProviderFailureContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temp.name)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_recorded_and_derived_fixtures_verify_and_split_protocol_outcomes(self) -> None:
+        fixture, success = claude_fixture("success")
+        self.assertEqual(fixture["provenance"]["kind"], "recorded_sanitized")
+        self.assertEqual(providers.parse_sonnet_review(success).status, "PASS")
+
+        for name in (
+            "malformed_envelope",
+            "missing_structured_output",
+            "schema_invalid",
+        ):
+            with self.subTest(name=name):
+                fixture, execution = claude_fixture(name)
+                self.assertEqual(fixture["provenance"]["kind"], "derived")
+                with self.assertRaises(Exception):
+                    providers.parse_sonnet_review(execution)
+
+        for name, code in (
+            ("provider_error", "error_max_budget_usd"),
+            ("max_turns", "error_max_turns"),
+        ):
+            with self.subTest(name=name):
+                fixture, execution = claude_fixture(name)
+                self.assertEqual(
+                    fixture["provenance"]["kind"],
+                    "recorded_sanitized",
+                )
+                normalized = providers.normalize_sonnet_execution(execution)
+                self.assertEqual(normalized.returncode, 1)
+                self.assertEqual(normalized.failure_kind, "provider_error")
+                self.assertEqual(normalized.failure_source, "provider_native")
+                self.assertEqual(normalized.failure_code, code)
+                with self.assertRaises(RuntimeError):
+                    providers.parse_sonnet_review(normalized)
+
+    def test_review_semantics_reject_every_inconsistent_pass_key_variant(self) -> None:
+        invalid_results = (
+            {
+                "category": "PASS",
+                "finding_key": "PASS",
+                "summary": "missing status",
+            },
+            {
+                "status": "UNKNOWN",
+                "category": "PASS",
+                "finding_key": "PASS",
+                "summary": "invalid enum",
+            },
+            {
+                "status": "PASS",
+                "category": "PASS",
+                "finding_key": "PASS",
+                "summary": "extra field",
+                "unexpected": True,
+            },
+            {
+                "status": "PASS",
+                "category": "IMPLEMENTATION_DEFECT",
+                "finding_key": "defect",
+                "summary": "quota exceeded",
+            },
+            {
+                "status": "FAIL",
+                "category": "PASS",
+                "finding_key": "PASS",
+                "summary": "HTTP 503 Service Unavailable",
+            },
+            {
+                "status": "PASS",
+                "category": "PASS",
+                "finding_key": "not-pass",
+                "summary": "status code: 429",
+            },
+            {
+                "status": "FAIL",
+                "category": "SCOPE_VIOLATION",
+                "finding_key": "PASS",
+                "summary": "authentication failed",
+            },
+        )
+        for structured in invalid_results:
+            with self.subTest(structured=structured):
+                execution = ProviderExecution(
+                    ["claude"],
+                    0,
+                    json.dumps(
+                        {
+                            "type": "result",
+                            "subtype": "success",
+                            "is_error": False,
+                            "structured_output": structured,
+                        }
+                    ),
+                    "",
+                )
+                self.assertIsNone(
+                    providers.normalize_sonnet_execution(execution).failure_kind
+                )
+                with self.assertRaises(ValueError):
+                    providers.parse_sonnet_review(execution)
+
+    def test_native_envelope_precedes_conflicting_stream_text_and_zero_exit(self) -> None:
+        _, recorded = claude_fixture("max_turns")
+        envelope = json.loads(recorded.stdout)
+        envelope["result"] = (
+            "FileNotFoundError: permission denied; prompt says HTTP 401; "
+            "diff says service unavailable"
+        )
+        execution = ProviderExecution(
+            recorded.command,
+            0,
+            json.dumps(envelope),
+            "HTTP 503 Service Unavailable\n",
+        )
+
+        normalized = providers.normalize_sonnet_execution(execution)
+
+        self.assertEqual(normalized.returncode, 0)
+        self.assertTrue(providers.execution_failed(normalized))
+        self.assertEqual(normalized.failure_kind, "provider_error")
+        self.assertEqual(normalized.failure_source, "provider_native")
+        self.assertEqual(normalized.failure_code, "error_max_turns")
+        with self.assertRaises(RuntimeError):
+            providers.parse_sonnet_review(execution)
+
+    def test_os_launch_errors_are_configuration_not_provider_auth(self) -> None:
+        for error in (
+            FileNotFoundError(2, "No such file or directory"),
+            PermissionError(13, "Permission denied"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                def runner(command, **kwargs):
+                    raise error
+
+                execution = providers._run(
+                    ["missing-provider"],
+                    self.repo,
+                    runner=runner,
+                    sleeper=lambda seconds: None,
+                )
+                self.assertEqual(execution.failure_kind, "configuration")
+                self.assertEqual(execution.failure_source, "os_error")
+                self.assertTrue(
+                    execution.failure_code.startswith(type(error).__name__)
+                )
+                self.assertEqual(len(execution.attempts), 1)
+
+    def test_stderr_requires_anchored_phrases_and_explicit_http_prefix(self) -> None:
+        trusted = (
+            ("HTTP 401 Unauthorized", "auth", "401"),
+            ("status code: 429 Too Many Requests", "rate_limit", "429"),
+            ("Error: service unavailable", "unavailable", None),
+        )
+        for message, kind, code in trusted:
+            with self.subTest(message=message):
+                evidence = providers.normalize_provider_failure(1, "", message)
+                self.assertEqual(evidence.kind, kind)
+                self.assertEqual(evidence.source, "stderr")
+                self.assertEqual(evidence.code, code)
+
+        for status in (401, 402, 403, 429, 500, 502, 503, 504):
+            with self.subTest(status=status):
+                evidence = providers.normalize_provider_failure(
+                    1,
+                    "",
+                    f"{status} appears on source line {status}",
+                )
+                self.assertEqual(evidence.kind, "provider_error")
+                self.assertEqual(evidence.source, "returncode")
+
+    def test_stdout_tail_is_bounded_and_requires_explicit_contract(self) -> None:
+        inside = "x" * 9000 + "\nHTTP 503 Service Unavailable\n"
+        outside = "HTTP 503 Service Unavailable\n" + "x" * 9000
+
+        disabled = providers.normalize_provider_failure(1, inside, "")
+        enabled = providers.normalize_provider_failure(
+            1,
+            inside,
+            "",
+            allow_stdout_tail=True,
+        )
+        out_of_tail = providers.normalize_provider_failure(
+            1,
+            outside,
+            "",
+            allow_stdout_tail=True,
+        )
+
+        self.assertEqual(disabled.kind, "provider_error")
+        self.assertEqual(disabled.source, "returncode")
+        self.assertEqual(enabled.kind, "unavailable")
+        self.assertEqual(enabled.source, "stdout_tail")
+        self.assertEqual(out_of_tail.kind, "provider_error")
+
+    def test_model_prose_prompt_transcript_and_diff_never_classify(self) -> None:
+        prose = """Prompt: diagnose quota exceeded and HTTP 503.
+Transcript: authentication failed; status code: 429.
+Diff:
++ HTTP 401 Unauthorized
++ service unavailable
+"""
+        evidence = providers.normalize_provider_failure(1, prose, "")
+        self.assertEqual(evidence.kind, "provider_error")
+        self.assertEqual(evidence.source, "returncode")
+
+        success = ProviderExecution(
+            ["claude"],
+            0,
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": prose,
+                    "structured_output": {
+                        "status": "PASS",
+                        "category": "PASS",
+                        "finding_key": "PASS",
+                        "summary": prose,
+                    },
+                }
+            ),
+            "",
+        )
+        self.assertIsNone(
+            providers.normalize_sonnet_execution(success).failure_kind
+        )
+        self.assertEqual(providers.parse_sonnet_review(success).status, "PASS")
+
+    def test_native_http_status_retries_before_success_without_content_retry(self) -> None:
+        _, native = claude_fixture("provider_error")
+        _, success = claude_fixture("success")
+        envelope = json.loads(native.stdout)
+        for status, expected_kind in (
+            (401, "auth"),
+            (402, "billing"),
+            (403, "auth"),
+            (429, "rate_limit"),
+            (500, "unavailable"),
+            (502, "unavailable"),
+            (503, "unavailable"),
+            (504, "unavailable"),
+        ):
+            with self.subTest(status=status):
+                candidate = dict(envelope, api_error_status=status)
+                evidence = providers.classify_claude_native_failure(
+                    subprocess.CompletedProcess(
+                        ["claude"],
+                        1,
+                        json.dumps(candidate),
+                        "quota exceeded",
+                    )
+                )
+                self.assertEqual(evidence.kind, expected_kind)
+                self.assertEqual(evidence.source, "provider_native")
+
+        envelope["subtype"] = "error_during_execution"
+        envelope["api_error_status"] = 503
+        results = iter(
+            (
+                subprocess.CompletedProcess(
+                    ["claude"],
+                    1,
+                    json.dumps(envelope),
+                    "authentication failed",
+                ),
+                subprocess.CompletedProcess(
+                    ["claude"],
+                    0,
+                    success.stdout,
+                    "",
+                ),
+            )
+        )
+        calls = 0
+
+        def runner(command, **kwargs):
+            nonlocal calls
+            calls += 1
+            return next(results)
+
+        execution = providers._run(
+            ["claude"],
+            self.repo,
+            runner=runner,
+            sleeper=lambda seconds: None,
+            native_classifier=providers.classify_claude_native_failure,
+        )
+
+        self.assertEqual(calls, 2)
+        self.assertFalse(providers.execution_failed(execution))
+        self.assertEqual(len(execution.attempts), 2)
+        self.assertEqual(execution.attempts[0].failure_kind, "unavailable")
+        self.assertEqual(
+            execution.attempts[0].failure_source,
+            "provider_native",
+        )
+        self.assertEqual(
+            execution.attempts[0].failure_code,
+            "error_during_execution",
+        )
+        self.assertTrue(execution.attempts[0].retry_scheduled)
+
+    def test_audit_fields_round_trip_and_legacy_defaults_remain_none(self) -> None:
+        run = WorkflowRun(
+            run_id="failure-audit",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Audit failure provenance.",
+            repo=RepoState(
+                repo=str(self.repo),
+                branch="main",
+                head="0" * 40,
+                clean=True,
+                origin="https://example.invalid/repo.git",
+            ),
+        )
+        sources = (
+            ("provider_native", "provider_error", "error_max_turns", 1),
+            ("os_error", "configuration", "FileNotFoundError:2", 127),
+            ("supervisor", "timeout", "timeout", 124),
+            ("stderr", "auth", "401", 1),
+            ("stdout_tail", "unavailable", "503", 1),
+            ("returncode", "provider_error", "9", 9),
+        )
+        for index, (source, kind, code, returncode) in enumerate(sources):
+            run.provider_runs.append(
+                orchestrator.ProviderRecord(
+                    provider="fixture provider",
+                    purpose=f"source-{source}",
+                    command=["fixture", str(index)],
+                    returncode=returncode,
+                    stdout=f"raw stdout {source}",
+                    stderr=f"raw stderr {source}",
+                    duration_seconds=index + 0.25,
+                    failure_kind=kind,
+                    failure_source=source,
+                    failure_code=code,
+                    retry_scheduled=source == "stdout_tail",
+                )
+            )
+        run.provider_runs.extend(
+            (
+                orchestrator.ProviderRecord(
+                    provider="fixture provider",
+                    purpose="success",
+                    command=["fixture", "success"],
+                    returncode=0,
+                    stdout="successful raw output",
+                    duration_seconds=7.25,
+                ),
+                orchestrator.ProviderRecord(
+                    provider="Sonnet 5 High",
+                    purpose="legacy failure",
+                    command=["claude"],
+                    returncode=1,
+                    failure_kind="provider_error",
+                ),
+            )
+        )
+        orchestrator.persist(run, self.repo / "runs")
+
+        loaded = orchestrator.load_run(run.run_id, self.repo / "runs")
+
+        self.assertEqual(
+            [record.model_dump() for record in loaded.provider_runs],
+            [record.model_dump() for record in run.provider_runs],
+        )
+        self.assertIsNone(loaded.provider_runs[-1].failure_source)
+        self.assertIsNone(loaded.provider_runs[-1].failure_code)
+
+    def test_writer_stdout_prose_is_not_retried_but_trusted_outage_still_is(self) -> None:
+        prose_calls = 0
+
+        def prose_runner(command, **kwargs):
+            nonlocal prose_calls
+            prose_calls += 1
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "HTTP 503 Service Unavailable in a model-generated diff",
+                "",
+            )
+
+        prose_execution = providers._run(
+            ["codex", "exec", "--model", "gpt-5.6-luna"],
+            self.repo,
+            runner=prose_runner,
+            sleeper=lambda seconds: None,
+        )
+        self.assertEqual(prose_calls, 1)
+        self.assertEqual(prose_execution.failure_kind, "provider_error")
+
+        results = iter(
+            (
+                subprocess.CompletedProcess(
+                    ["codex"],
+                    1,
+                    "partial writer output",
+                    "HTTP 503 Service Unavailable",
+                ),
+                subprocess.CompletedProcess(
+                    ["codex"],
+                    0,
+                    "writer repeated under pre-M0.4 policy",
+                    "",
+                ),
+            )
+        )
+        trusted_calls = 0
+
+        def trusted_runner(command, **kwargs):
+            nonlocal trusted_calls
+            trusted_calls += 1
+            return next(results)
+
+        trusted_execution = providers._run(
+            ["codex", "exec", "--model", "gpt-5.6-luna"],
+            self.repo,
+            runner=trusted_runner,
+            sleeper=lambda seconds: None,
+        )
+        self.assertEqual(trusted_calls, 2)
+        self.assertFalse(providers.execution_failed(trusted_execution))
+        self.assertTrue(trusted_execution.attempts[0].retry_scheduled)
+
 
 @unittest.skipUnless(os.name == "posix", "real process-group tests require POSIX")
 class ProviderSupervisorTests(unittest.TestCase):
@@ -1317,8 +1976,8 @@ def stop(*_):
     raise SystemExit(0)
 
 signal.signal(signal.SIGTERM, stop)
-print("partial stdout", flush=True)
-print("partial stderr", file=sys.stderr, flush=True)
+print("quota exceeded in untrusted model stdout", flush=True)
+print("HTTP 503 Service Unavailable", file=sys.stderr, flush=True)
 while True:
     time.sleep(0.05)
 """
@@ -1326,8 +1985,10 @@ while True:
 
         self.assertEqual(execution.returncode, providers.PROVIDER_TIMEOUT_RETURN_CODE)
         self.assertEqual(execution.failure_kind, "timeout")
-        self.assertEqual(execution.stdout.count("partial stdout"), 1)
-        self.assertEqual(execution.stderr.count("partial stderr"), 1)
+        self.assertEqual(execution.failure_source, "supervisor")
+        self.assertEqual(execution.failure_code, "timeout")
+        self.assertEqual(execution.stdout.count("quota exceeded"), 1)
+        self.assertEqual(execution.stderr.count("HTTP 503"), 1)
         self.assertIn("term handled", execution.stderr)
         self.assertIn("exited during TERM grace", execution.stderr)
         self.assertNotIn("forced termination", execution.stderr)
@@ -1427,6 +2088,8 @@ print(f"parent {os.getpid()} child {child.pid}", flush=True)
             providers.PROVIDER_INTERRUPTED_RETURN_CODE,
         )
         self.assertEqual(execution.failure_kind, "interrupted")
+        self.assertEqual(execution.failure_source, "supervisor")
+        self.assertEqual(execution.failure_code, "interrupted")
         self.assertFalse(execution.attempts[0].retry_scheduled)
         self.assertIn("operator interruption", execution.stderr)
         self.assert_process_gone(pid)
