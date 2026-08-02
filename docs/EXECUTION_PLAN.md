@@ -408,7 +408,7 @@ baseline for extraction. No live Jobs pilot occurs in this gate.
     `b7ca3cab3d0fef780c773ffd67903af3bd568270` (`Make writer recovery
     capability-aware`) was pushed directly to `origin/main` with all 75 tests
     passing.
-- [~] **M0.5 / Q-2:** enforce one active run per canonical target and test clean
+- [x] **M0.5 / Q-2:** enforce one active run per canonical target and test clean
   release, crash recovery, stale ownership, and approval-pending ownership.
   - Planning evidence (2026-08-02): the draft bounded execution note and
     adversarial matrix below were derived from authoritative Q-2, A-2, the
@@ -460,6 +460,13 @@ baseline for extraction. No live Jobs pilot occurs in this gate.
     passes. No live provider,
     external target, Jobs access, commit, push, merge, or M0.6 permission change
     occurred during implementation or validation.
+  - Review decision (2026-08-02): the repository owner approved the complete
+    five-file implementation diff and explicitly authorized commit, direct push
+    to `origin/main`, and this tracker update. M0.5 is complete; M0.6 remains a
+    separate bounded item.
+  - Publication evidence (2026-08-02): implementation commit
+    `ec7fc5828c5e6877a2b59f2f191ff05fd1396021` (`Enforce target run ownership`)
+    was pushed directly to `origin/main` with all 84 tests passing.
 - [ ] **M0.6 / Q-6:** make run storage private by default and define explicit
   handling for legacy files, redaction, retention, and export.
 
