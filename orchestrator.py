@@ -28,7 +28,10 @@ from providers import (
     parse_sonnet_review,
 )
 
-app = typer.Typer(no_args_is_help=True, help="Safely orchestrate one jobs task at a time.")
+app = typer.Typer(
+    no_args_is_help=True,
+    help="Continuo — deterministic notation for probabilistic work.",
+)
 console = Console()
 RUNS = Path(__file__).parent / "runs"
 

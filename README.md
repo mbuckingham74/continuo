@@ -1,6 +1,8 @@
-# Orchestration Engine
+# Continuo
 
-An early-stage, deterministic controller for coordinating specialized AI roles through bounded implementation, adversarial review, escalation, recovery, and human approval gates.
+*Deterministic notation for probabilistic work.*
+
+Continuo is an early-stage controller for coordinating specialized AI roles through bounded implementation, adversarial review, escalation, recovery, and human approval gates.
 
 The engine is designed around a simple principle: **models do the probabilistic work; deterministic code controls the workflow**. Providers can implement, review, diagnose, and recommend, but they cannot decide their own authority, silently change roles, bypass correction limits, or publish repository changes.
 
@@ -8,6 +10,14 @@ The engine is designed around a simple principle: **models do the probabilistic 
 > The current code is a working Jobs-specific reference implementation, not yet a project-agnostic framework. Repository conventions, provider commands, model names, and role labels are still hard-coded. The architecture deliberately documents these as implementation details to be replaced with role-based configuration and adapters.
 
 For the complete behavioral reference and generalization roadmap, read [docs/ORCHESTRATION_ENGINE.md](docs/ORCHESTRATION_ENGINE.md).
+
+## Why Continuo?
+
+In musical performance, the continuo provides a persistent structural foundation while players realize their parts within the notation. That is the intended relationship between this controller and its model roles:
+
+> **The notation constrains the improviser. The improviser cannot renegotiate the notation.**
+
+The task specification and deterministic workflow form the score. Providers may interpret, implement, review, and diagnose within their assigned parts, but they cannot rewrite their authority, safety boundaries, escalation rules, or human approval gates.
 
 ## Why this exists
 
@@ -144,13 +154,13 @@ Inspect the CLI:
 uv run python orchestrator.py --help
 ```
 
-The project also installs an equivalent entry point:
+The project currently installs an equivalent legacy entry point:
 
 ```sh
 uv run jobs-orchestrator --help
 ```
 
-The installed command retains its original Jobs-specific name until the package and configuration layers are generalized.
+The installed command retains its original Jobs-specific name until Continuo's package and configuration layers are generalized.
 
 ## Quick start
 
@@ -273,7 +283,7 @@ git diff --check
 
 The generalization path centers on preserving the existing safety invariants while extracting hard-coded details:
 
-- role-based configuration so model changes do not alter orchestration policy;
+- role-based provider and model selection so route changes do not alter orchestration policy;
 - provider adapters with normalized errors and structured-output contracts;
 - machine-checkable provider capability profiles;
 - project and repository adapters;

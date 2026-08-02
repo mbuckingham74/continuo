@@ -1,13 +1,18 @@
-# Jobs Orchestration Engine
+# Continuo
 
-## Current architecture and future-generalization roadmap
+## Current orchestration architecture and future-generalization roadmap
+
+*Deterministic notation for probabilistic work.*
 
 - **Implementation status:** current source on 2026-08-01
+- **Product identity:** Continuo
 - **Persisted run schema:** version 6
 - **Primary implementation:** `orchestrator.py`, `providers.py`, and `models.py`
 - **Test suite:** `test_orchestrator.py`
 
 This document describes the behavior that exists in the repository today and then separates it from a proposed path toward a reusable orchestration framework. It is an architecture reference, not a claim that the roadmap features are already implemented.
+
+Continuo takes its name from the musical relationship between written structure and bounded realization: **the notation constrains the improviser, and the improviser cannot renegotiate the notation**. The deterministic controller is the notation; providers and models perform their assigned parts without gaining authority to rewrite the score.
 
 ## 1. Purpose
 

@@ -1,9 +1,11 @@
-# Engine stabilization and enhancement roadmap
+# Continuo stabilization and enhancement roadmap
 
 ## Status and scope
 
 - **Status:** validated planning baseline
 - **Review date:** 2026-08-01
+- **Product name:** Continuo
+- **Tagline:** *Deterministic notation for probabilistic work.*
 - **Implementation authorized:** no
 
 This document organizes two external analyses against the current repository and records which recommendations are accepted, revised, deferred, rejected, or still need evidence. It is the decision layer between raw ideas and implementation tickets.
@@ -14,6 +16,8 @@ Preserved source material:
 - [Enhancements intake](planning/2026-08-01-enhancements-intake.md)
 
 The intake files are evidence, not requirements. When they conflict with the current source or this document, this document controls planning.
+
+Continuo is now the public product identity. Existing package, import, environment-variable, repository-slug, and CLI identifiers remain compatibility names until the generic-core migration gives them explicit aliases and a safe transition path.
 
 ## 1. Executive assessment
 
@@ -352,9 +356,10 @@ Recommended order:
 1. stable role/provider/route IDs and schema migration;
 2. versioned resolved policy/config persisted per run;
 3. provider adapter interface and normalized result/error types;
-4. provider capability profiles with startup enforcement;
-5. repository/project and task-spec adapters;
-6. compatibility renames and deprecated aliases.
+4. provider/model catalogs and explicit role-route selection;
+5. provider capability profiles with startup enforcement;
+6. repository/project and task-spec adapters;
+7. compatibility renames and deprecated aliases.
 
 Prefer `ORCHESTRATION_TARGET_REPO` over ambiguous `ORCHESTRATOR_REPO`. Keep `JOBS_REPO` and `jobs-orchestrator` as deprecated aliases for a defined transition period.
 
@@ -368,6 +373,52 @@ Prefer `ORCHESTRATION_TARGET_REPO` over ambiguous `ORCHESTRATOR_REPO`. Keep `JOB
 | `doctor` command | Accept | P1 | Adapter-driven checks for binaries, auth, route capabilities, config, target state, and storage permissions. Never print secrets. |
 | Structured log sink | Accept | P2 | Can precede full event sourcing; define a stable redacted schema. |
 | Run cost ceiling | Accept after telemetry | P2 | Enforce between calls and disclose that an in-flight call can exceed the ceiling. |
+
+### E-11 — Provider and model picker
+
+- **Decision:** Accept and elevate
+- **Priority:** P1, delivered in the generic-core milestone
+
+The engine needs an explicit provider/model selection layer so a model retirement, provider change, or preferred-model update does not require controller edits. The picker is the operator-facing surface; the underlying requirement is a stable role-routing system.
+
+Keep these concepts separate:
+
+- **role:** the orchestration responsibility, such as `implementation` or `policy_authority`;
+- **provider adapter:** the execution integration, such as a Codex CLI or Claude CLI adapter;
+- **model ID:** the provider-specific model identifier;
+- **route profile:** provider, model, sandbox/tool policy, effort, timeout, and structured-output settings for one role; and
+- **display name:** human-readable text with no control-flow meaning.
+
+Selection should be available through versioned configuration and a CLI command. An interactive picker can make configuration easier, but it must write/validate the same configuration contract used by non-interactive automation. A future UI may consume that contract rather than introduce another routing mechanism.
+
+Required behavior:
+
+1. List configured provider adapters and their locally supported/discovered models where reliable discovery exists.
+2. Let the operator assign one validated route profile to each required role.
+3. Reject a selection whose declared capabilities do not satisfy the role or exceed its permission ceiling.
+4. Support global defaults, project configuration, and explicit run-time overrides with a documented precedence order.
+5. Resolve the complete routing table at run creation, hash it, and persist it with the run.
+6. Keep a resumed run pinned to its saved routes unless a human performs a separate, audited route migration.
+7. Make `doctor` detect missing adapters, unavailable models, expired authentication, and incomplete role assignments before provider work begins.
+8. Preserve deprecated provider/model aliases only in the configuration-migration layer, never in workflow policy.
+
+Provider/model selection does not authorize automatic fallback. If a selected model disappears during a run, the run blocks with a configuration/provider-availability reason. A human may update future defaults or approve an audited route migration; the controller must not silently substitute another model.
+
+Initial configuration shape, for design discussion only:
+
+```toml
+[routes.implementation]
+provider = "codex_cli"
+model = "provider-model-id"
+profile = "workspace_writer"
+
+[routes.adversarial_review]
+provider = "claude_cli"
+model = "provider-model-id"
+profile = "read_only_structured_reviewer"
+```
+
+The route profile should own capability and invocation policy. The workflow should refer only to the abstract role and resolved route ID.
 
 ## 8. Recommended milestone roadmap
 
@@ -411,16 +462,20 @@ Exit criteria:
 
 1. Define and validate a versioned configuration file.
 2. Add provider adapters and normalized invocation results.
-3. Add machine-checkable capability profiles and least-authority validation.
-4. Extract the current Git behavior behind a repository/project adapter.
-5. Extract local Markdown behind a task-spec adapter and normalized task envelope.
-6. Add acceptance-criteria representation.
-7. Consolidate the package under `src/orchestration_engine/`.
-8. Introduce `orchestration-engine` and `ORCHESTRATION_TARGET_REPO` with compatibility aliases.
+3. Add provider/model catalogs and the configuration-backed CLI picker (E-11).
+4. Add machine-checkable capability profiles and least-authority validation.
+5. Persist the resolved role-routing table and configuration hash with each run.
+6. Extract the current Git behavior behind a repository/project adapter.
+7. Extract local Markdown behind a task-spec adapter and normalized task envelope.
+8. Add acceptance-criteria representation.
+9. Consolidate the package under `src/orchestration_engine/`.
+10. Introduce `orchestration-engine` and `ORCHESTRATION_TARGET_REPO` with compatibility aliases.
 
 Exit criteria:
 
 - changing a model or provider route requires configuration, not controller-policy edits;
+- every required role has an explicit, capability-valid route selected before a run starts;
+- run resume uses the exact persisted routing table rather than newly changed defaults;
 - a non-Jobs project can supply a task and repository policy through adapters;
 - config is validated, hashed, persisted, and protected from writer modification; and
 - role capability violations fail at startup.
@@ -522,6 +577,9 @@ These questions should become ADRs or time-boxed spikes, not implicit implementa
 8. What constitutes one provider account for a cross-run circuit breaker?
 9. Which verification failures can trigger automatic correction, and how are they assigned stable identity?
 10. Does the first UI need remote/phone access, or is asynchronous CLI/TUI approval sufficient?
+11. Can each provider adapter reliably discover available models, or must catalogs be configured and refreshed explicitly?
+12. What is the precedence among user defaults, project routes, task risk profiles, and per-run provider/model overrides?
+13. Under what conditions, if any, may a blocked run migrate to a different route without invalidating its audit and review assumptions?
 
 ## 12. Explicitly deferred or rejected assumptions
 
@@ -532,6 +590,7 @@ These questions should become ADRs or time-boxed spikes, not implicit implementa
 - No silently truncated diff can receive review PASS.
 - No full event-sourcing rewrite is approved by this roadmap alone.
 - No model/provider rename occurs before stable role IDs and migrations.
+- No provider/model picker may silently change the persisted routes of an existing run.
 - No implementation work is included in this documentation-ingestion change.
 
 ## 13. Next planning action

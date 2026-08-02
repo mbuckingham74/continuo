@@ -1,7 +1,7 @@
 [project]
 name = "jobs-orchestrator"
 version = "0.1.0"
-description = "Add your description here"
+description = "Continuo — deterministic notation for probabilistic work"
 readme = "README.md"
 authors = [
     { name = "Michael Buuckingham", email = "michael.buckingham74@gmail.com" }
