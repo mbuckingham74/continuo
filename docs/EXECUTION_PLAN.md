@@ -305,6 +305,9 @@ baseline for extraction. No live Jobs pilot occurs in this gate.
   - Review decision (2026-08-02): the repository owner approved the complete
     seven-file diff and explicitly authorized commit and push. M0.2 is complete;
     M0.3 remains a separate bounded item.
+  - Publication evidence (2026-08-02): commit
+    `fdcfa930e5570e9b667d0005a01c21a3551c5bbf` (`Supervise provider process
+    lifetimes`) was pushed directly to `origin/main` with all 44 tests passing.
 - [ ] **M0.3 / C-3/C-4:** normalize failure evidence sources and distinguish Claude
   transport/envelope errors from invalid review content using recorded fixtures.
 - [ ] **M0.4 / A-1:** make the provider-attempt lifecycle capability-aware; allow
