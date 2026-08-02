@@ -1,0 +1,806 @@
+"""Strict historical run classification and pure adjacent migrations."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import re
+from dataclasses import dataclass
+from typing import Any, Callable, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from models import (
+    CURRENT_RUN_SCHEMA_VERSION,
+    GitRecord,
+    OLDEST_MIGRATABLE_RUN_SCHEMA_VERSION,
+    PolicyDecision,
+    ProviderCapability,
+    ProviderFailureKind,
+    ProviderFailureSource,
+    RepoState,
+    ReviewCategory,
+    ReviewStatus,
+    RunMigrationDisposition,
+    RunStructuralClass,
+    TargetOwnership,
+    WorkflowRun,
+    WriterAttemptState,
+    WriterRecoveryDecision,
+)
+
+
+RecordTreatment = Literal["current", "migrate", "archive", "unsupported"]
+RecordState = Literal[
+    "CURRENT",
+    "MIGRATION_REQUIRED",
+    "RESUME_BLOCKED",
+    "ARCHIVE_ONLY",
+    "UNSUPPORTED",
+]
+
+
+class MigrationError(RuntimeError):
+    """A bounded migration failure safe to show without source content."""
+
+    def __init__(self, reason_code: str, field_path: str | None = None) -> None:
+        self.reason_code = reason_code
+        self.field_path = field_path
+        detail = reason_code if field_path is None else f"{reason_code}:{field_path}"
+        super().__init__(detail)
+
+
+class _ClosedModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class _ReviewV1(_ClosedModel):
+    status: ReviewStatus
+    category: ReviewCategory
+    summary: str
+
+
+class _ReviewV3(_ReviewV1):
+    finding_key: str | None = None
+
+
+class _ProviderV1(_ClosedModel):
+    provider: str
+    purpose: str
+    command: list[str]
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+
+
+class _ProviderV5(_ProviderV1):
+    duration_seconds: float | None = Field(default=None, ge=0)
+
+
+class _ProviderV6(_ProviderV5):
+    failure_kind: ProviderFailureKind | None = None
+    failure_source: ProviderFailureSource | None = None
+    failure_code: str | None = Field(default=None, max_length=120)
+    capability: ProviderCapability | None = None
+    repository_fingerprint_before: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+    )
+    repository_fingerprint_after: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+    )
+    retry_scheduled: bool = False
+
+
+class _RunV1(_ClosedModel):
+    schema_version: Literal[1] = 1
+    run_id: str
+    created_at: str
+    task_ref: str
+    task_file: str
+    task_sha256: str
+    specification: str
+    repo: RepoState
+    stage: str = "created"
+    correction_cycles: int = Field(default=0, ge=0, le=1)
+    spec_review: _ReviewV1 | None = None
+    implementation_review: _ReviewV1 | None = None
+    terra_resolution: str | None = None
+    changed_files: list[str] = Field(default_factory=list)
+    working_tree_fingerprint: str | None = None
+    verification: dict[str, object] = Field(default_factory=dict)
+    provider_runs: list[_ProviderV1] = Field(default_factory=list)
+    git_operations: list[GitRecord] = Field(default_factory=list)
+    commit_hash: str | None = None
+    commit_message: str | None = None
+    last_error: str | None = None
+
+
+class _RunV2(_RunV1):
+    schema_version: Literal[2] = 2
+    correction_cycles: int = Field(default=0, ge=0, le=3)
+    sol_guidance: str | None = None
+
+
+class _RunV3(_RunV2):
+    schema_version: Literal[3] = 3
+    correction_cycles: int = Field(default=0, ge=0, le=12)
+    spec_review: _ReviewV3 | None = None
+    implementation_review: _ReviewV3 | None = None
+
+
+class _RunV4(_RunV3):
+    schema_version: Literal[4] = 4
+    policy_decisions: list[PolicyDecision] = Field(default_factory=list)
+
+
+class _RunV5(_RunV4):
+    schema_version: Literal[5] = 5
+    updated_at: str | None = None
+    provider_runs: list[_ProviderV5] = Field(default_factory=list)
+
+
+class _RunV6(_RunV5):
+    schema_version: Literal[6] = 6
+    provider_resume_stage: str | None = None
+    provider_resume_prompt: str | None = None
+    target_ownership: TargetOwnership | None = None
+    active_writer_attempt: WriterAttemptState | None = None
+    writer_recovery_decisions: list[WriterRecoveryDecision] = Field(
+        default_factory=list
+    )
+    provider_runs: list[_ProviderV6] = Field(default_factory=list)
+
+
+_HISTORICAL_MODELS: dict[int, type[BaseModel]] = {
+    1: _RunV1,
+    2: _RunV2,
+    3: _RunV3,
+    4: _RunV4,
+    5: _RunV5,
+    6: _RunV6,
+}
+
+
+@dataclass(frozen=True)
+class RecordClassification:
+    treatment: RecordTreatment
+    record_state: RecordState
+    source_sha256: str
+    schema_version: int | None
+    structural_class: RunStructuralClass | None
+    disposition: RunMigrationDisposition | None
+    reason_code: str
+    field_path: str | None
+    run_id: str | None
+    task_ref: str | None
+    stage: str | None
+    payload: dict[str, Any] | None
+    current_run: WorkflowRun | None = None
+
+
+@dataclass(frozen=True)
+class MigrationResult:
+    run: WorkflowRun
+    source_sha256: str
+    source_schema_version: int
+    source_structural_class: RunStructuralClass
+    applied_steps: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MigrationContext:
+    migration_id: str
+    migrated_at: str
+    source_schema_version: int
+    source_structural_class: RunStructuralClass
+    source_sha256: str
+    disposition: RunMigrationDisposition
+    applied_steps: tuple[str, ...]
+    reason_codes: tuple[str, ...]
+
+
+def _reject_constant(value: str) -> None:
+    raise MigrationError("invalid_envelope", "numeric_token")
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise MigrationError("invalid_envelope", "duplicate_key")
+        result[key] = value
+    return result
+
+
+def strict_json_object(source: bytes) -> dict[str, Any]:
+    try:
+        text = source.decode("utf-8", errors="strict")
+        value = json.loads(
+            text,
+            parse_constant=_reject_constant,
+            object_pairs_hook=_unique_object,
+        )
+    except MigrationError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MigrationError("invalid_envelope") from exc
+    if not isinstance(value, dict):
+        raise MigrationError("invalid_envelope", "top_level")
+    return value
+
+
+def _bounded_identity(value: object) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > 128:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", value):
+        return None
+    return value
+
+
+def _bounded_field_path(error: ValidationError) -> str | None:
+    details = error.errors(include_url=False, include_context=False, include_input=False)
+    if not details:
+        return None
+    segments = []
+    for segment in details[0].get("loc", ()):
+        rendered = str(segment)
+        if re.fullmatch(r"[A-Za-z0-9_-]+", rendered):
+            segments.append(rendered)
+    return ".".join(segments)[:240] or None
+
+
+def _classify_invalid_known(
+    *,
+    source_sha256: str,
+    schema_version: int,
+    payload: dict[str, Any],
+    reason_code: str,
+    field_path: str | None = None,
+) -> RecordClassification:
+    run_id = _bounded_identity(payload.get("run_id"))
+    treatment: RecordTreatment = "archive" if run_id is not None else "unsupported"
+    state: RecordState = "ARCHIVE_ONLY" if treatment == "archive" else "UNSUPPORTED"
+    return RecordClassification(
+        treatment=treatment,
+        record_state=state,
+        source_sha256=source_sha256,
+        schema_version=schema_version,
+        structural_class=None,
+        disposition="inspection_only" if treatment == "archive" else None,
+        reason_code=reason_code,
+        field_path=field_path,
+        run_id=run_id,
+        task_ref=_bounded_identity(payload.get("task_ref")),
+        stage=_bounded_identity(payload.get("stage")),
+        payload=payload,
+    )
+
+
+def _v6_structural_class(payload: dict[str, Any]) -> RunStructuralClass:
+    providers = payload.get("provider_runs")
+    provider_dicts = providers if isinstance(providers, list) else []
+    current_top_level = {
+        "target_ownership",
+        "active_writer_attempt",
+        "writer_recovery_decisions",
+    }.issubset(payload)
+    current_providers = all(
+        isinstance(record, dict)
+        and {
+            "failure_source",
+            "failure_code",
+            "capability",
+            "repository_fingerprint_before",
+            "repository_fingerprint_after",
+        }.issubset(record)
+        for record in provider_dicts
+    )
+    if current_top_level and current_providers:
+        return "V6-current"
+    if "target_ownership" in payload:
+        return "V6-owner"
+    if (
+        "active_writer_attempt" in payload
+        or "writer_recovery_decisions" in payload
+        or any(
+            isinstance(record, dict)
+            and (
+                "capability" in record
+                or "repository_fingerprint_before" in record
+                or "repository_fingerprint_after" in record
+            )
+            for record in provider_dicts
+        )
+    ):
+        return "V6-writer"
+    if any(
+        isinstance(record, dict)
+        and ("failure_source" in record or "failure_code" in record)
+        for record in provider_dicts
+    ):
+        return "V6-provenance"
+    if any(
+        isinstance(record, dict)
+        and record.get("failure_kind") in {"timeout", "interrupted"}
+        for record in provider_dicts
+    ):
+        return "V6-supervisor"
+    return "V6-base"
+
+
+def _v6_coherence_reason(run: _RunV6) -> tuple[str, str | None] | None:
+    ownership = run.target_ownership
+    if ownership is not None:
+        if ownership.canonical_repo != run.repo.repo:
+            return "ownership_evidence_incoherent", "target_ownership.canonical_repo"
+    writer_stages = {
+        "implementing",
+        "correcting",
+        "blocked_writer_retry_required",
+        "blocked_writer_partial_changes",
+        "blocked_writer_state_unknown",
+    }
+    active = run.active_writer_attempt
+    if run.stage in writer_stages and active is None:
+        return "writer_evidence_incoherent", "active_writer_attempt"
+    if active is None:
+        return None
+    if run.stage in {"implementing", "correcting"} and active.stage != run.stage:
+        return "writer_evidence_incoherent", "active_writer_attempt.stage"
+    index = active.provider_record_index
+    if index is None:
+        if active.post_fingerprint is not None:
+            return "writer_evidence_incoherent", "provider_record_index"
+        return None
+    if index >= len(run.provider_runs):
+        return "writer_evidence_incoherent", "provider_record_index"
+    record = run.provider_runs[index]
+    if (
+        record.provider != "Luna High"
+        or record.purpose != active.purpose
+        or record.capability != "workspace_write"
+    ):
+        return "writer_evidence_incoherent", "provider_record_index"
+    if record.repository_fingerprint_before != active.pre_fingerprint:
+        return "writer_evidence_incoherent", "repository_fingerprint_before"
+    if (
+        active.post_fingerprint is not None
+        and record.repository_fingerprint_after != active.post_fingerprint
+    ):
+        return "writer_evidence_incoherent", "repository_fingerprint_after"
+    return None
+
+
+def _migration_disposition(
+    payload: dict[str, Any],
+    schema_version: int,
+) -> RunMigrationDisposition:
+    if schema_version < 6:
+        return "resume_eligibility_deferred"
+    blocked_stages = {
+        "blocked_provider_timeout",
+        "blocked_provider_interrupted",
+        "blocked_writer_state_unknown",
+        "blocked_repeated_finding",
+        "blocked_correction_budget",
+    }
+    providers = payload.get("provider_runs")
+    supervisor_stop = isinstance(providers, list) and any(
+        isinstance(record, dict)
+        and record.get("failure_kind") in {"timeout", "interrupted"}
+        for record in providers
+    )
+    return (
+        "resume_blocked"
+        if payload.get("stage") in blocked_stages or supervisor_stop
+        else "resume_eligibility_deferred"
+    )
+
+
+def classify_run_bytes(source: bytes) -> RecordClassification:
+    source_sha256 = hashlib.sha256(source).hexdigest()
+    try:
+        payload = strict_json_object(source)
+    except MigrationError as exc:
+        return RecordClassification(
+            treatment="unsupported",
+            record_state="UNSUPPORTED",
+            source_sha256=source_sha256,
+            schema_version=None,
+            structural_class=None,
+            disposition=None,
+            reason_code=exc.reason_code,
+            field_path=exc.field_path,
+            run_id=None,
+            task_ref=None,
+            stage=None,
+            payload=None,
+        )
+
+    version = payload.get("schema_version")
+    if type(version) is not int or version <= 0:
+        return RecordClassification(
+            treatment="unsupported",
+            record_state="UNSUPPORTED",
+            source_sha256=source_sha256,
+            schema_version=None,
+            structural_class=None,
+            disposition=None,
+            reason_code="invalid_schema_version",
+            field_path="schema_version",
+            run_id=_bounded_identity(payload.get("run_id")),
+            task_ref=_bounded_identity(payload.get("task_ref")),
+            stage=_bounded_identity(payload.get("stage")),
+            payload=payload,
+        )
+    if version > CURRENT_RUN_SCHEMA_VERSION:
+        return RecordClassification(
+            treatment="unsupported",
+            record_state="UNSUPPORTED",
+            source_sha256=source_sha256,
+            schema_version=version,
+            structural_class=None,
+            disposition=None,
+            reason_code="future_schema",
+            field_path="schema_version",
+            run_id=_bounded_identity(payload.get("run_id")),
+            task_ref=_bounded_identity(payload.get("task_ref")),
+            stage=_bounded_identity(payload.get("stage")),
+            payload=payload,
+        )
+    if version < OLDEST_MIGRATABLE_RUN_SCHEMA_VERSION:
+        return _classify_invalid_known(
+            source_sha256=source_sha256,
+            schema_version=version,
+            payload=payload,
+            reason_code="unknown_schema",
+            field_path="schema_version",
+        )
+
+    if version == CURRENT_RUN_SCHEMA_VERSION:
+        try:
+            run = WorkflowRun.model_validate(payload)
+        except ValidationError as exc:
+            return _classify_invalid_known(
+                source_sha256=source_sha256,
+                schema_version=version,
+                payload=payload,
+                reason_code="archive_only",
+                field_path=_bounded_field_path(exc),
+            )
+        if run.migration_audit is None:
+            state: RecordState = "CURRENT"
+            disposition = None
+        else:
+            state = "RESUME_BLOCKED"
+            disposition = run.migration_audit.disposition
+        return RecordClassification(
+            treatment="current",
+            record_state=state,
+            source_sha256=source_sha256,
+            schema_version=version,
+            structural_class=(
+                run.migration_audit.source_structural_class
+                if run.migration_audit is not None
+                else None
+            ),
+            disposition=disposition,
+            reason_code=(
+                "current"
+                if run.migration_audit is None
+                else run.migration_audit.disposition
+            ),
+            field_path=None,
+            run_id=run.run_id,
+            task_ref=run.task_ref,
+            stage=run.stage,
+            payload=payload,
+            current_run=run,
+        )
+
+    model = _HISTORICAL_MODELS.get(version)
+    if model is None:
+        return RecordClassification(
+            treatment="unsupported",
+            record_state="UNSUPPORTED",
+            source_sha256=source_sha256,
+            schema_version=version,
+            structural_class=None,
+            disposition=None,
+            reason_code="unknown_schema",
+            field_path="schema_version",
+            run_id=_bounded_identity(payload.get("run_id")),
+            task_ref=_bounded_identity(payload.get("task_ref")),
+            stage=_bounded_identity(payload.get("stage")),
+            payload=payload,
+        )
+    try:
+        historical = model.model_validate(payload)
+    except ValidationError as exc:
+        return _classify_invalid_known(
+            source_sha256=source_sha256,
+            schema_version=version,
+            payload=payload,
+            reason_code="archive_only",
+            field_path=_bounded_field_path(exc),
+        )
+
+    structural_class: RunStructuralClass = (
+        _v6_structural_class(payload) if version == 6 else f"V{version}"  # type: ignore[assignment]
+    )
+    if version == 6:
+        coherence = _v6_coherence_reason(historical)  # type: ignore[arg-type]
+        if coherence is not None:
+            reason, field_path = coherence
+            return RecordClassification(
+                treatment="archive",
+                record_state="ARCHIVE_ONLY",
+                source_sha256=source_sha256,
+                schema_version=version,
+                structural_class=structural_class,
+                disposition="inspection_only",
+                reason_code=reason,
+                field_path=field_path,
+                run_id=_bounded_identity(payload.get("run_id")),
+                task_ref=_bounded_identity(payload.get("task_ref")),
+                stage=_bounded_identity(payload.get("stage")),
+                payload=payload,
+            )
+
+    disposition = _migration_disposition(payload, version)
+    return RecordClassification(
+        treatment="migrate",
+        record_state=(
+            "RESUME_BLOCKED"
+            if disposition == "resume_blocked"
+            else "MIGRATION_REQUIRED"
+        ),
+        source_sha256=source_sha256,
+        schema_version=version,
+        structural_class=structural_class,
+        disposition=disposition,
+        reason_code="migration_required",
+        field_path=None,
+        run_id=_bounded_identity(payload.get("run_id")),
+        task_ref=_bounded_identity(payload.get("task_ref")),
+        stage=_bounded_identity(payload.get("stage")),
+        payload=payload,
+    )
+
+
+def _validate_historical(payload: dict[str, Any], version: int) -> None:
+    model = _HISTORICAL_MODELS[version]
+    try:
+        model.model_validate(payload)
+    except ValidationError as exc:
+        raise MigrationError(
+            "migration_step_failed",
+            _bounded_field_path(exc),
+        ) from exc
+
+
+def _step_1_to_2(
+    payload: dict[str, Any], _: MigrationContext
+) -> tuple[dict[str, Any], list[str]]:
+    result = copy.deepcopy(payload)
+    result["schema_version"] = 2
+    result.setdefault("sol_guidance", None)
+    return result, ["missing_sol_guidance"]
+
+
+def _step_2_to_3(
+    payload: dict[str, Any], _: MigrationContext
+) -> tuple[dict[str, Any], list[str]]:
+    result = copy.deepcopy(payload)
+    result["schema_version"] = 3
+    for key in ("spec_review", "implementation_review"):
+        review = result.get(key)
+        if isinstance(review, dict):
+            review.setdefault("finding_key", None)
+    return result, ["missing_finding_identity"]
+
+
+def _step_3_to_4(
+    payload: dict[str, Any], _: MigrationContext
+) -> tuple[dict[str, Any], list[str]]:
+    result = copy.deepcopy(payload)
+    result["schema_version"] = 4
+    result.setdefault("policy_decisions", [])
+    return result, ["missing_policy_decision_audit"]
+
+
+def _step_4_to_5(
+    payload: dict[str, Any], _: MigrationContext
+) -> tuple[dict[str, Any], list[str]]:
+    result = copy.deepcopy(payload)
+    result["schema_version"] = 5
+    result.setdefault("updated_at", None)
+    for record in result.get("provider_runs", []):
+        if isinstance(record, dict):
+            record.setdefault("duration_seconds", None)
+    return result, ["missing_timing_audit"]
+
+
+def _step_5_to_6(
+    payload: dict[str, Any], _: MigrationContext
+) -> tuple[dict[str, Any], list[str]]:
+    result = copy.deepcopy(payload)
+    result["schema_version"] = 6
+    result.setdefault("provider_resume_stage", None)
+    result.setdefault("provider_resume_prompt", None)
+    result.setdefault("target_ownership", None)
+    result.setdefault("active_writer_attempt", None)
+    result.setdefault("writer_recovery_decisions", [])
+    for record in result.get("provider_runs", []):
+        if isinstance(record, dict):
+            record.setdefault("failure_kind", None)
+            record.setdefault("failure_source", None)
+            record.setdefault("failure_code", None)
+            record.setdefault("capability", None)
+            record.setdefault("repository_fingerprint_before", None)
+            record.setdefault("repository_fingerprint_after", None)
+            record.setdefault("retry_scheduled", False)
+    return result, [
+        "missing_failure_provenance",
+        "missing_capability_audit",
+        "missing_writer_audit",
+        "missing_ownership_audit",
+        "missing_retry_audit",
+    ]
+
+
+def _step_6_to_7(
+    payload: dict[str, Any], context: MigrationContext
+) -> tuple[dict[str, Any], list[str]]:
+    result = copy.deepcopy(payload)
+    result["schema_version"] = CURRENT_RUN_SCHEMA_VERSION
+    result["migration_audit"] = {
+        "migration_id": context.migration_id,
+        "migrated_at": context.migrated_at,
+        "source_schema_version": context.source_schema_version,
+        "target_schema_version": CURRENT_RUN_SCHEMA_VERSION,
+        "source_structural_class": context.source_structural_class,
+        "source_sha256": context.source_sha256,
+        "applied_steps": list(context.applied_steps),
+        "reason_codes": sorted(set(context.reason_codes)),
+        "disposition": context.disposition,
+    }
+    return result, []
+
+
+MigrationStep = Callable[
+    [dict[str, Any], MigrationContext],
+    tuple[dict[str, Any], list[str]],
+]
+MIGRATION_REGISTRY: dict[tuple[int, int], MigrationStep] = {
+    (1, 2): _step_1_to_2,
+    (2, 3): _step_2_to_3,
+    (3, 4): _step_3_to_4,
+    (4, 5): _step_4_to_5,
+    (5, 6): _step_5_to_6,
+    (6, 7): _step_6_to_7,
+}
+
+
+def migration_steps(source_version: int) -> tuple[str, ...]:
+    if not (
+        OLDEST_MIGRATABLE_RUN_SCHEMA_VERSION
+        <= source_version
+        < CURRENT_RUN_SCHEMA_VERSION
+    ):
+        return ()
+    return tuple(
+        f"{version}_to_{version + 1}"
+        for version in range(source_version, CURRENT_RUN_SCHEMA_VERSION)
+    )
+
+
+def migrate_classification(
+    classification: RecordClassification,
+    *,
+    migration_id: str,
+    migrated_at: str,
+) -> MigrationResult:
+    if (
+        classification.treatment != "migrate"
+        or classification.schema_version is None
+        or classification.structural_class is None
+        or classification.disposition is None
+        or classification.payload is None
+    ):
+        raise MigrationError(classification.reason_code, classification.field_path)
+
+    payload = copy.deepcopy(classification.payload)
+    source_version = classification.schema_version
+    reason_codes: list[str] = []
+    applied_steps: list[str] = []
+    if source_version == 6:
+        missing_reason_map = {
+            "failure_source": "missing_failure_provenance",
+            "capability": "missing_capability_audit",
+            "repository_fingerprint_before": "missing_writer_audit",
+        }
+        source_providers = classification.payload.get("provider_runs", [])
+        for key, reason in missing_reason_map.items():
+            if any(
+                isinstance(record, dict) and key not in record
+                for record in source_providers
+            ):
+                reason_codes.append(reason)
+        if "target_ownership" not in classification.payload:
+            reason_codes.append("missing_ownership_audit")
+
+        # Materialize typed absence for current validation while the audit
+        # preserves which schema-6 facts were not present in the source.
+        payload.setdefault("target_ownership", None)
+        payload.setdefault("active_writer_attempt", None)
+        payload.setdefault("writer_recovery_decisions", [])
+        payload.setdefault("provider_resume_stage", None)
+        payload.setdefault("provider_resume_prompt", None)
+        for record in payload.get("provider_runs", []):
+            if isinstance(record, dict):
+                for key in (
+                    "failure_kind",
+                    "failure_source",
+                    "failure_code",
+                    "capability",
+                    "repository_fingerprint_before",
+                    "repository_fingerprint_after",
+                ):
+                    record.setdefault(key, None)
+                record.setdefault("retry_scheduled", False)
+    version = source_version
+    while version < CURRENT_RUN_SCHEMA_VERSION:
+        step = MIGRATION_REGISTRY.get((version, version + 1))
+        if step is None:
+            raise MigrationError("migration_registry_invalid")
+        next_step = f"{version}_to_{version + 1}"
+        context = MigrationContext(
+            migration_id=migration_id,
+            migrated_at=migrated_at,
+            source_schema_version=source_version,
+            source_structural_class=classification.structural_class,
+            source_sha256=classification.source_sha256,
+            disposition=classification.disposition,
+            applied_steps=tuple([*applied_steps, next_step]),
+            reason_codes=tuple(reason_codes),
+        )
+        payload, reasons = step(payload, context)
+        version += 1
+        if version <= 6:
+            _validate_historical(payload, version)
+        reason_codes.extend(reasons)
+        applied_steps.append(next_step)
+
+    if version != CURRENT_RUN_SCHEMA_VERSION:
+        raise MigrationError("migration_registry_invalid")
+    try:
+        run = WorkflowRun.model_validate(payload)
+    except ValidationError as exc:
+        raise MigrationError(
+            "migration_step_failed",
+            _bounded_field_path(exc),
+        ) from exc
+    audit = run.migration_audit
+    if (
+        audit is None
+        or audit.source_schema_version != source_version
+        or audit.target_schema_version != CURRENT_RUN_SCHEMA_VERSION
+        or audit.source_structural_class != classification.structural_class
+        or audit.source_sha256 != classification.source_sha256
+        or audit.applied_steps != tuple(applied_steps)
+        or audit.disposition != classification.disposition
+    ):
+        raise MigrationError("migration_audit_invalid")
+    return MigrationResult(
+        run=run,
+        source_sha256=classification.source_sha256,
+        source_schema_version=source_version,
+        source_structural_class=classification.structural_class,
+        applied_steps=tuple(applied_steps),
+    )

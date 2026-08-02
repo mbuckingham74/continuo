@@ -6,9 +6,9 @@
 
 - **Implementation status:** current source on 2026-08-02
 - **Product identity:** Continuo
-- **Persisted run schema:** version 6
-- **Primary implementation:** `orchestrator.py`, `providers.py`, and `models.py`
-- **Test suite:** `test_orchestrator.py`
+- **Persisted run schema:** version 7 (`CURRENT_RUN_SCHEMA_VERSION`)
+- **Primary implementation:** `orchestrator.py`, `providers.py`, `models.py`, and `run_migrations.py`
+- **Test suite:** `test_orchestrator.py`, `test_schema_inventory.py`, and `test_run_migrations.py`
 
 This document describes the behavior that exists in the repository today and then separates it from a proposed path toward a reusable orchestration framework. It is an architecture reference, not a claim that the roadmap features are already implemented.
 
@@ -252,7 +252,10 @@ Current named block classes include:
   `blocked_writer_partial_changes`, `blocked_writer_state_unknown`; and
 - Git: `blocked_git_failure`.
 
-Legacy `blocked_after_correction` and `blocked_after_escalation` runs have a compatibility resume path when their saved state qualifies under the current correction policy.
+Ordinary schema-7 records in the legacy-named `blocked_after_correction` and
+`blocked_after_escalation` stages retain their compatibility resume path when
+their saved state qualifies under the current correction policy. A record
+migrated from schemas 1--6 is refused earlier by its migration disposition.
 
 ## 7. Specification review
 
@@ -595,7 +598,9 @@ A successful push ends at `pushed_awaiting_merge`. Merge is a separate manual or
 
 Runs are stored as formatted JSON in `runs/<run-id>.json`. The run ID is the first 12 hexadecimal characters of a UUID4. Saves update a UTC timestamp and use a temporary file plus atomic replacement to reduce partial-write risk.
 
-`WorkflowRun` currently uses schema version 6 and forbids unknown top-level fields. Its state includes:
+`WorkflowRun` accepts only schema version 7 and forbids unknown top-level
+fields. Nested review, repository, provider, Git, ownership, policy, writer, and
+migration-audit records are closed as well. Its state includes:
 
 - identity and timestamps;
 - task reference, filename, SHA-256, and full specification;
@@ -606,6 +611,8 @@ Runs are stored as formatted JSON in `runs/<run-id>.json`. The run ID is the fir
 - Terra resolution and Sol guidance;
 - appended human policy decisions;
 - provider resume stage and exact prompt;
+- an immutable migration audit and execution disposition for explicitly
+  migrated historical records;
 - active writer attempt with pre/post fingerprints, paths, inspection error, and
   provider-record linkage;
 - immutable writer-recovery decisions with operator note and observed state;
@@ -620,18 +627,38 @@ return code, stdout, stderr, duration, failure classification, optional evidence
 source/native-or-OS code, declared capability, optional writer pre/post
 fingerprints, and whether another same-provider retry was scheduled.
 Because prompts are command arguments, the persisted command is also an input
-audit record. The optional provenance fields preserve schema-6 compatibility:
-legacy records load with explicit `null` provenance and are not rewritten.
+audit record. Optional provenance fields in historical schema-6 records are
+handled only by the explicit migration boundary; ordinary load never defaults
+or rewrites historical JSON.
 
 Git records include the operation label, command, return code, stdout, and stderr.
 
-The M0.4 fields are additive schema-6 compatibility fields: historical records
-load with `None` capability/fingerprints and empty writer state/decisions; no
-facts are invented and no historical JSON is rewritten.
+The historical migration registry is closed and adjacent:
+`1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7`. Strict dispatch rejects duplicate keys,
+non-standard numbers, invalid UTF-8, non-object envelopes, invalid version
+types, and unknown/future versions before current-model validation. Every
+recognized transform copies its input, validates each intermediate historical
+contract, and records the exact source hash, structural class, ordered steps,
+absence reason codes, timestamp, migration ID, and final disposition.
+
+Migration is available only through `migrate-run <run-id>`. Classification is
+read-only apart from monotonic private-mode hardening, confirmation defaults to
+no, and approval re-reads the source before transforming. The final schema-7
+replacement is written as a private temporary file and source identity, bytes,
+and SHA-256 are rechecked under a local migration write lock immediately before
+atomic replacement. A failure or crash before replacement leaves the source
+unchanged; a crash afterward leaves one complete current record. Repeating the
+command is idempotent.
+
+Migrated records remain `resume_eligibility_deferred` or `resume_blocked`.
+Every controller mutation refuses their non-null migration audit before target
+coordination, providers, verification, policy mutation, or Git. Gate 2.2 has no
+override or audit-clearing command.
 
 Persistence is local and inspectable, but it is not yet a tamper-evident event
-log, database transaction system, concurrent-run lock, encrypted secret store,
-or formal schema-migration framework.
+log, general database transaction system, general concurrent-run lock, or
+encrypted secret store. The migration machinery covers run JSON only; it is not
+a generic persistence backend or event migration system.
 
 ## 18. Observability, heartbeats, reporting, and metrics
 
@@ -649,7 +676,10 @@ The heartbeat indicates liveness within the configured hard deadline; it does no
 
 ### Run report
 
-`report <run-id>` derives a concise audit summary from persisted state:
+`report <run-id>` derives a concise audit summary only from a valid ordinary
+current record. Historical, migrated-deferred, archive-only, unsupported, and
+corrupt records receive a bounded refusal rather than provider-history parsing.
+For an accepted record it reports:
 
 - wall-clock span between creation and latest update;
 - total provider attempts;
@@ -671,7 +701,13 @@ Wall-clock time and summed provider time answer different questions and may over
 
 ### Status inspection
 
-`status <run-id>` prints the complete saved JSON. `status` without an ID lists the ten most recently modified run files with run ID, task reference, stage, correction count, and policy-decision count. Invalid JSON files are shown as invalid rather than crashing the listing.
+`status <run-id>` prints complete saved JSON only for a valid ordinary current
+record. Every other class prints bounded version, structural class, record
+state, reason/field code, and source SHA-256 without raw content. `status`
+without an ID lists the ten most recently modified run files and distinguishes
+`CURRENT`, `MIGRATION_REQUIRED`, `RESUME_BLOCKED`, `ARCHIVE_ONLY`, and
+`UNSUPPORTED`. Current rows retain task, stage, ownership, correction, and
+policy counts; other rows do not infer those workflow metrics.
 
 ## 19. CLI reference
 
@@ -682,6 +718,9 @@ uv run python orchestrator.py <command>
 ```
 
 An installed `jobs-orchestrator` entry point exposes the same Typer application.
+On macOS development environments where editable `.pth` files acquire
+`UF_HIDDEN`, set `UV_NO_EDITABLE=1` for uv sync/run commands as documented in
+the README; the compatibility package resolves the local direct-URL checkout.
 
 ### Start a run
 
@@ -739,6 +778,18 @@ uv run python orchestrator.py report <run-id>
 Prints derived timing, provider, correction, policy, writer-recovery, review,
 and Git metrics, including a pending writer-state classification when present.
 
+### Migrate one historical record
+
+```sh
+uv run python orchestrator.py migrate-run <run-id>
+```
+
+Prints a bounded classification and ordered migration plan, then asks for
+default-no confirmation. Only a recognized valid schema-1 through schema-6
+record can be replaced. A successful migration does not make the run resumable,
+claim a target, call a provider, or grant commit/push authority. The installed
+`jobs-orchestrator migrate-run` command exposes the same action.
+
 ### Inspect status
 
 ```sh
@@ -746,11 +797,12 @@ uv run python orchestrator.py status
 uv run python orchestrator.py status <run-id>
 ```
 
-Lists recent runs or prints one run's complete JSON.
+Lists recent schema/record states or prints complete JSON only for an ordinary
+current record; other records receive bounded classification output.
 
 ## 20. Current tests and what they cover
 
-The current suite has 75 `unittest` cases. It creates isolated temporary Git
+The current suite has 123 `unittest` cases. It creates isolated temporary Git
 repositories, loads checksummed sanitized Claude fixtures, substitutes
 deterministic fake provider functions, and uses real local Python
 child/grandchild processes for supervisor tests. The tests do not call live model
@@ -779,8 +831,8 @@ providers or mutate the real Jobs repository.
 - genuinely new findings receive ordinary corrections without unnecessary Sol escalation;
 - one persistent finding gets exactly two Sol escalations/two Sol-guided corrections and then blocks;
 - twelve distinct corrections exhaust the global budget;
-- eligible legacy one-correction blocks resume under the current policy;
-- an eligible legacy post-escalation run with a genuinely new finding receives a normal correction rather than being treated as the old defect.
+- ordinary schema-7 records in legacy-named correction blocks retain their
+  compatibility behavior, while migrated historical records remain refused;
 
 ### Provider safety and observability
 
@@ -797,8 +849,12 @@ providers or mutate the real Jobs repository.
   preconditioned, and never perform automatic cleanup;
 - interrupted writer markers and saved failed/successful results recover
   deterministically without repeating completed or uncertain work;
-- additive schema-6 capability, writer-state, and recovery-decision fields
-  round-trip while legacy records retain safe defaults;
+- committed synthetic V1--V6 fixtures classify deterministically, migrate only
+  through ordered adjacent transforms, preserve supplied values and missing
+  evidence, and remain execution-deferred or blocked;
+- strict envelope/version dispatch, bounded read surfaces, default-no action,
+  immutable audit, atomic replacement, source races, concurrent writers, and
+  crash/idempotency boundaries fail closed;
 - real provider processes enforce deadlines, preserve partial output, and clean up process groups through TERM/KILL escalation;
 - timeout and interruption persist distinct non-resumable blocked stages without provider retry;
 - provider-native, OS, supervisor, anchored-stderr, opt-in bounded-stdout-tail,
@@ -815,9 +871,8 @@ providers or mutate the real Jobs repository.
 ### Not covered today
 
 There are no live-provider integration tests, project-specific verification
-tests, full CLI end-to-end tests, concurrency/locking tests,
-persistence-corruption recovery tests beyond status display, general
-schema-migration tests, actual remote push tests, Windows process-tree
+tests, full CLI end-to-end tests, general workflow concurrency/locking tests,
+automatic corruption repair, migration of private production records, actual remote push tests, Windows process-tree
 integration tests, or tests for every blocked/recovery stage combination.
 
 ## 21. Current limitations and technical debt
@@ -852,7 +907,8 @@ This is the most important generalization debt. Model/provider names must be abs
 
 - stages are free-form strings rather than an enum with an explicit transition table;
 - orchestration is concentrated in one large controller module;
-- JSON schema versioning exists, but there is no migration machinery;
+- run JSON has strict version dispatch and explicit adjacent migration, but
+  later persisted-contract changes still need their own version and transform;
 - mutable run JSON is not signed or tamper-evident;
 - there is no run lock, scheduler, queue, or enforced single-active-run invariant;
 - full prompts and outputs can make run files large and may retain sensitive content;

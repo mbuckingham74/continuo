@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import orchestrator
 import providers
+import run_migrations
 from models import (
     RepoState,
     ReviewResult,
@@ -2361,7 +2362,15 @@ class ControllerTests(unittest.TestCase):
                 }
             ],
         }
-        legacy = WorkflowRun.model_validate(legacy_payload)
+        classification = run_migrations.classify_run_bytes(
+            json.dumps(legacy_payload).encode()
+        )
+        self.assertEqual(classification.treatment, "migrate")
+        legacy = run_migrations.migrate_classification(
+            classification,
+            migration_id="test-migration",
+            migrated_at="2026-08-02T00:00:00+00:00",
+        ).run
         self.assertIsNone(legacy.active_writer_attempt)
         self.assertEqual(legacy.writer_recovery_decisions, [])
         self.assertIsNone(legacy.provider_runs[0].capability)
@@ -2921,7 +2930,9 @@ class ControllerTests(unittest.TestCase):
         coordinator = orchestrator.TargetCoordinator(self.repo, legacy_runs)
         self.assertEqual(coordinator.database.parent, legacy_runs / ".target-locks")
         source = Path(orchestrator.__file__).read_text(encoding="utf-8")
-        self.assertNotIn("flock", source)
+        target_source = source[source.index("class TargetCoordinator") :]
+        self.assertNotIn("flock", target_source)
+        self.assertIn("def _migration_write_lock", source)
         self.assertNotIn("force-unlock", source)
         self.assertIn("JOBS_REPO", source)
         self.assertTrue((Path(__file__).parent / "src/jobs_orchestrator").is_dir())
@@ -3415,7 +3426,7 @@ orchestrator.persist(run, runs)
         self.assertNotIn("os.umask", source)
         self.assertNotIn("os.chown", source)
         self.assertNotIn("force-unlock", source)
-        self.assertEqual(self.run_fixture().schema_version, 6)
+        self.assertEqual(self.run_fixture().schema_version, 7)
         command_names = {
             command.name or command.callback.__name__.replace("_", "-")
             for command in orchestrator.app.registered_commands

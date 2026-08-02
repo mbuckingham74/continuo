@@ -34,7 +34,8 @@ This controller moves those decisions into inspectable Python. It provides:
 - recoverable, persisted workflow stages;
 - working-tree fingerprints and resume guards;
 - separate human approval for policy, commit, and push;
-- provider attempt deadlines, process-group cleanup, timing, heartbeats, and audit records; and
+- provider attempt deadlines, process-group cleanup, timing, heartbeats, and audit records;
+- explicit, audited schema migration with fail-closed historical execution; and
 - concise per-run reporting.
 
 ## Current status
@@ -47,7 +48,7 @@ tasks/<task-ref>-*.md
 
 For example, task `009` must resolve to exactly one file such as `tasks/009-example.md`. The controller persists the specification and its SHA-256, coordinates the run, and stores local run state under `runs/`.
 
-The controller and its safety behavior are implemented and covered by 84 unit tests. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
+The controller and its safety behavior are implemented and covered by 123 unit tests. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
 
 ## How it works
 
@@ -207,9 +208,10 @@ The target repository must contain exactly one matching task specification, be c
 | `recover-writer <run-id>` | Explicitly retry an exactly restored writer state or adopt trustworthy current changes, with an audited note |
 | `release-target <run-id>` | Deliberately release a clean blocked or declined target, with an audited operator note |
 | `approve-policy <run-id>` | Record an explicit human policy decision and resume |
+| `migrate-run <run-id>` | Classify and, after default-no confirmation, atomically migrate one recognized historical record to schema 7 |
 | `report <run-id>` | Show provider timing, failures, retries, corrections, decisions, review, and Git status |
-| `status` | List the ten most recently updated local runs |
-| `status <run-id>` | Print the complete persisted JSON for one run |
+| `status` | List the ten most recently updated local records with schema and record state |
+| `status <run-id>` | Print complete JSON for a valid ordinary current run; otherwise print a bounded classification |
 
 Examples:
 
@@ -217,6 +219,7 @@ Examples:
 uv run python orchestrator.py status
 uv run python orchestrator.py status <run-id>
 uv run python orchestrator.py report <run-id>
+uv run python orchestrator.py migrate-run <run-id>
 uv run python orchestrator.py resume <run-id>
 uv run python orchestrator.py recover-writer <run-id> \
   --action retry-restored --note "Repository restored to the saved pre-attempt state."
@@ -266,8 +269,10 @@ snapshots, pre-existing copies, or prior disclosure.
 Continuo retains full run and coordination records indefinitely and does not
 automatically purge, rotate, archive, clean, or delete them. Concise `report`
 and no-argument `status` are the preferred routine views. `status <run-id>`
-prints the complete sensitive JSON record; capturing that output or copying a
-run file is a raw export. Continuo provides no shareable/redacted export command.
+prints the complete sensitive JSON only for an ordinary valid current record;
+historical, migrated-deferred, archive-only, unsupported, and corrupt records
+receive bounded classification output. Capturing current-record output or
+copying a run file is a raw export. Continuo provides no shareable/redacted export command.
 Keep any raw copy private (including `0600` permissions where applicable),
 review it explicitly before transfer, and do not publish it by default.
 
@@ -292,11 +297,18 @@ Reporting is currently per-run. Cross-run reliability, cost, token use, throughp
 Install dependencies and run the suite:
 
 ```sh
+export UV_NO_EDITABLE=1  # macOS: avoid UF_HIDDEN editable .pth files
 uv sync
 uv run python -m unittest -v
 ```
 
-The 96 tests exercise temporary repositories, recorded sanitized fixtures, fake
+On macOS, Python skips editable-install `.pth` files carrying `UF_HIDDEN`.
+Using uv's supported `UV_NO_EDITABLE=1` mode avoids that platform failure. The
+compatibility package resolves the local checkout from installed direct-URL
+metadata, so `uv run jobs-orchestrator` remains the same command in that mode.
+
+The 123 tests exercise temporary repositories, committed synthetic historical
+run fixtures, recorded sanitized provider fixtures, fake
 providers, and real local child/grandchild processes. They cover preflight
 safety, task resolution, correction budgets, repeat-finding escalation, policy
 decisions, trusted failure-evidence precedence, Claude envelope/content
@@ -305,8 +317,9 @@ restoration/adoption, crash recovery, provider-stop resume behavior, bounded
 process cleanup, timeout/interruption output, sandbox command construction,
 target identity, cross-controller mutex contention, durable ownership, clean
 release, stale/corrupt coordination recovery, reporting, Git approval defaults,
-and adversarial Git change parsing, fingerprinting, persistence, recovery, and
-staging behavior.
+strict schema dispatch, adjacent migrations, audit preservation, rollback and
+concurrency boundaries, and adversarial Git change parsing, fingerprinting,
+persistence, recovery, and staging behavior.
 
 Before committing changes, also check the diff:
 
@@ -321,7 +334,9 @@ git diff --check
 ├── orchestrator.py                 # Deterministic controller and CLI
 ├── providers.py                    # Provider commands, execution, retries, parsing
 ├── models.py                       # Persisted run and audit models
+├── run_migrations.py               # Strict classification and adjacent migrations
 ├── test_orchestrator.py            # Isolated controller test suite
+├── test_run_migrations.py          # Gate 2.2 migration contract tests
 ├── docs/
 │   └── ORCHESTRATION_ENGINE.md     # Full architecture and roadmap
 ├── src/jobs_orchestrator/
@@ -341,7 +356,7 @@ git diff --check
   debt where a structured native error contract is unavailable; stdout-tail
   classification is disabled unless a recorded provider contract enables it.
 - Run JSON is local and mutable rather than a tamper-evident event log.
-- There is no run scheduler, concurrent-run lock, shared provider circuit breaker, or cross-run reporting.
+- There is no run scheduler, general concurrent-run lock, shared provider circuit breaker, or cross-run reporting. Explicit migration alone serializes its final local replacement.
 - Pull requests, merge, rollback, deployment, and notifications are outside the current engine.
 
 ## Roadmap
@@ -356,7 +371,7 @@ The generalization path centers on preserving the existing safety invariants whi
 - deterministic verification plugins;
 - configurable, versioned escalation policy;
 - a typed state machine and append-only event log;
-- durable persistence, locking, redaction, and schema migrations; and
+- durable persistence backends, broader locking, redaction, and later schema evolution; and
 - reporting across runs, projects, providers, and model generations.
 
 See the [validated stabilization and enhancement roadmap](docs/ENGINE_ROADMAP.md) for triaged priorities and corrected sequencing. The [full architecture roadmap](docs/ORCHESTRATION_ENGINE.md#22-future-generalization-architecture) describes the broader proposed abstractions and invariants.

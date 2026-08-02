@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import re
@@ -22,6 +23,7 @@ from rich.console import Console
 from rich.table import Table
 
 from models import (
+    CURRENT_RUN_SCHEMA_VERSION,
     GitRecord,
     PolicyDecision,
     ProviderCapability,
@@ -48,6 +50,14 @@ from providers import (
     normalize_provider_execution,
     normalize_sonnet_execution,
     parse_sonnet_review,
+)
+from run_migrations import (
+    MigrationError,
+    MigrationResult,
+    RecordClassification,
+    classify_run_bytes,
+    migrate_classification,
+    migration_steps,
 )
 
 app = typer.Typer(
@@ -271,6 +281,13 @@ class StoragePreflight(NamedTuple):
     hardened_files: int
 
 
+class RunRecordSnapshot(NamedTuple):
+    content: bytes
+    device: int
+    inode: int
+    mtime_ns: int
+
+
 def _absolute_path(path: Path) -> Path:
     return Path(os.path.abspath(os.fspath(path.expanduser())))
 
@@ -462,7 +479,7 @@ def _run_record_path(run_id: str, runs_dir: Path) -> Path:
     return path
 
 
-def _read_private_text(path: Path) -> str:
+def _read_private_bytes(path: Path) -> RunRecordSnapshot:
     _secure_regular_file(path)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -478,14 +495,26 @@ def _read_private_text(path: Path) -> str:
             or stat_module.S_IMODE(current.st_mode) != _PRIVATE_FILE_MODE
         ):
             raise _storage_error(path, "private file validation failed")
-        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+        with os.fdopen(descriptor, "rb") as stream:
             descriptor = -1
-            return stream.read()
+            return RunRecordSnapshot(
+                content=stream.read(),
+                device=current.st_dev,
+                inode=current.st_ino,
+                mtime_ns=current.st_mtime_ns,
+            )
     except OSError as exc:
         raise _storage_error(path, "private file could not be read") from exc
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def _read_private_text(path: Path) -> str:
+    try:
+        return _read_private_bytes(path).content.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise _storage_error(path, "private file is not valid UTF-8") from exc
 
 
 def _safe_unlink_created(path: Path, identity: tuple[int, int]) -> None:
@@ -505,6 +534,11 @@ def _safe_unlink_created(path: Path, identity: tuple[int, int]) -> None:
 
 
 def persist(run: WorkflowRun, runs_dir: Path = RUNS) -> Path:
+    if (
+        type(run.schema_version) is not int
+        or run.schema_version != CURRENT_RUN_SCHEMA_VERSION
+    ):
+        raise ControllerError("run schema is not current")
     root = _absolute_path(runs_dir)
     path = _run_record_path(run.run_id, root)
     root = _prepare_private_storage(root).runs_dir
@@ -551,12 +585,199 @@ def load_run(run_id: str, runs_dir: Path = RUNS) -> WorkflowRun:
     root = _prepare_private_storage(root).runs_dir
     if _lstat(path) is None:
         raise ControllerError(f"unknown run {run_id}")
+    classification = classify_run_bytes(_read_private_bytes(path).content)
+    if classification.treatment != "current" or classification.current_run is None:
+        raise _classification_error(classification, path)
+    if classification.current_run.run_id != run_id:
+        raise ControllerError(f"run record identity_mismatch: {path}")
+    return classification.current_run
+
+
+def _classification_error(
+    classification: RecordClassification,
+    path: Path,
+) -> ControllerError:
+    detail = classification.reason_code
+    if classification.field_path:
+        detail = f"{detail}:{classification.field_path}"
+    return ControllerError(f"run state is invalid ({detail}): {path}")
+
+
+def inspect_run_record(
+    run_id: str,
+    runs_dir: Path = RUNS,
+) -> tuple[Path, RunRecordSnapshot, RecordClassification]:
+    root = _absolute_path(runs_dir)
+    path = _run_record_path(run_id, root)
+    root = _prepare_private_storage(root).runs_dir
+    if _lstat(path) is None:
+        raise ControllerError(f"unknown run {run_id}")
+    snapshot = _read_private_bytes(path)
+    classification = classify_run_bytes(snapshot.content)
+    if classification.run_id is not None and classification.run_id != run_id:
+        classification = RecordClassification(
+            treatment="archive",
+            record_state="ARCHIVE_ONLY",
+            source_sha256=classification.source_sha256,
+            schema_version=classification.schema_version,
+            structural_class=classification.structural_class,
+            disposition="inspection_only",
+            reason_code="identity_mismatch",
+            field_path="run_id",
+            run_id=classification.run_id,
+            task_ref=classification.task_ref,
+            stage=classification.stage,
+            payload=classification.payload,
+            current_run=None,
+        )
+    return path, snapshot, classification
+
+
+@contextmanager
+def _migration_write_lock(root: Path) -> Iterator[None]:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = -1
     try:
-        return WorkflowRun.model_validate_json(_read_private_text(path))
-    except ControllerError:
+        descriptor = os.open(root, flags)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    except OSError as exc:
+        raise _storage_error(root, "migration lock failed") from exc
+    finally:
+        if descriptor >= 0:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+def _write_migrated_run(
+    path: Path,
+    expected: RunRecordSnapshot,
+    result: MigrationResult,
+) -> None:
+    with _migration_write_lock(path.parent):
+        _write_migrated_run_locked(path, expected, result)
+
+
+def _write_migrated_run_locked(
+    path: Path,
+    expected: RunRecordSnapshot,
+    result: MigrationResult,
+) -> None:
+    root = path.parent
+    temporary: Path | None = None
+    temporary_identity: tuple[int, int] | None = None
+    descriptor = -1
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f"{_RUN_TEMP_PREFIX}{result.run.run_id}-",
+            suffix=_RUN_TEMP_SUFFIX,
+            dir=root,
+        )
+        temporary = Path(temporary_name)
+        state = os.fstat(descriptor)
+        temporary_identity = (state.st_dev, state.st_ino)
+        if (
+            not stat_module.S_ISREG(state.st_mode)
+            or state.st_uid != os.geteuid()
+            or state.st_nlink != 1
+        ):
+            raise _storage_error(temporary, "temporary file validation failed")
+        os.fchmod(descriptor, _PRIVATE_FILE_MODE)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(result.run.model_dump_json(indent=2).encode("utf-8") + b"\n")
+            stream.flush()
+
+        current = _read_private_bytes(path)
+        if (
+            (current.device, current.inode) != (expected.device, expected.inode)
+            or current.content != expected.content
+            or hashlib.sha256(current.content).hexdigest() != result.source_sha256
+        ):
+            raise ControllerError("run record source_changed")
+        os.replace(temporary, path)
+        temporary = None
+    except (ControllerError, MigrationError):
         raise
-    except Exception as exc:
-        raise ControllerError(f"run state is invalid: {path}") from exc
+    except OSError as exc:
+        raise _storage_error(path, "atomic migration persistence failed") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary is not None and temporary_identity is not None:
+            _safe_unlink_created(temporary, temporary_identity)
+
+
+def migrate_run_record(
+    run_id: str,
+    runs_dir: Path = RUNS,
+    *,
+    approval: Callable[[str], bool] | None = None,
+    now: Callable[[], str] | None = None,
+    migration_id: Callable[[], str] | None = None,
+) -> WorkflowRun | None:
+    path, first_snapshot, first = inspect_run_record(run_id, runs_dir)
+    console.print(f"Run: {run_id}")
+    console.print(f"Source schema: {first.schema_version or 'unsupported'}")
+    console.print(f"Structural class: {first.structural_class or 'unknown'}")
+    console.print(f"Source SHA-256: {first.source_sha256}")
+    console.print(f"Treatment: {first.treatment}")
+    console.print(f"Record state: {first.record_state}")
+    if first.schema_version is not None:
+        steps = migration_steps(first.schema_version)
+        console.print(f"Steps: {', '.join(steps) if steps else '(none)'}")
+    if first.disposition is not None:
+        console.print(f"Final disposition: {first.disposition}")
+
+    if first.treatment == "current":
+        console.print("Run record is already current; no rewrite was performed.")
+        return first.current_run
+    if first.treatment != "migrate":
+        raise _classification_error(first, path)
+
+    confirm = approval or (
+        lambda prompt: typer.confirm(prompt, default=False)
+    )
+    if not confirm("Migrate this run record to the current schema?"):
+        console.print("Migration not approved; source record was not changed.")
+        return None
+
+    path, second_snapshot, second = inspect_run_record(run_id, runs_dir)
+    if (
+        second.source_sha256 != first.source_sha256
+        or (second_snapshot.device, second_snapshot.inode)
+        != (first_snapshot.device, first_snapshot.inode)
+    ):
+        raise ControllerError("run record source_changed")
+    try:
+        result = migrate_classification(
+            second,
+            migration_id=(migration_id or (lambda: uuid.uuid4().hex))(),
+            migrated_at=(
+                now
+                or (lambda: datetime.now(timezone.utc).isoformat())
+            )(),
+        )
+        _write_migrated_run(path, second_snapshot, result)
+    except MigrationError as exc:
+        detail = exc.reason_code
+        if exc.field_path:
+            detail = f"{detail}:{exc.field_path}"
+        raise ControllerError(f"run migration {detail}") from exc
+    audit = result.run.migration_audit
+    if audit is None:
+        raise ControllerError("run migration migration_audit_invalid")
+    console.print(
+        f"Migrated run {run_id} to schema {CURRENT_RUN_SCHEMA_VERSION}; "
+        f"disposition is {audit.disposition}."
+    )
+    return result.run
 
 
 class TargetCoordinator:
@@ -1541,13 +1762,27 @@ class Controller:
         self.luna = luna
         self.approval = approval or (lambda prompt: typer.confirm(prompt, default=False))
 
+    @staticmethod
+    def _require_executable(run: WorkflowRun) -> None:
+        if run.migration_audit is not None:
+            raise ControllerError(
+                "run execution refused: migrated record disposition is "
+                f"{run.migration_audit.disposition}"
+            )
+
     def _save(self, run: WorkflowRun) -> None:
-        run.schema_version = 6
+        self._require_executable(run)
+        if (
+            type(run.schema_version) is not int
+            or run.schema_version != CURRENT_RUN_SCHEMA_VERSION
+        ):
+            raise ControllerError("run schema is not current")
         run.updated_at = datetime.now(timezone.utc).isoformat()
         persist(run, self.runs_dir)
 
     def approve_policy(self, run_id: str, approved_text: str) -> WorkflowRun:
         run = load_run(run_id, self.runs_dir)
+        self._require_executable(run)
         coordinator = TargetCoordinator(self.repo, self.runs_dir)
         if run.target_ownership is None:
             self._resume_guard(run)
@@ -1626,6 +1861,7 @@ class Controller:
         note: str,
     ) -> WorkflowRun:
         run = load_run(run_id, self.runs_dir)
+        self._require_executable(run)
         coordinator = TargetCoordinator(self.repo, self.runs_dir)
         if run.target_ownership is None:
             self._resume_guard(run)
@@ -1747,6 +1983,7 @@ class Controller:
 
     def release_target(self, run_id: str, note: str) -> WorkflowRun:
         run = load_run(run_id, self.runs_dir)
+        self._require_executable(run)
         note = note.strip()
         if not note:
             raise ControllerError("target release note cannot be empty")
@@ -2560,6 +2797,7 @@ class Controller:
 
     def resume(self, run_id: str) -> WorkflowRun:
         run = load_run(run_id, self.runs_dir)
+        self._require_executable(run)
         coordinator = TargetCoordinator(self.repo, self.runs_dir)
         if run.target_ownership is None:
             self._resume_guard(run)
@@ -2937,6 +3175,7 @@ def approve_policy_command(
 
     def action() -> None:
         saved = load_run(run_id)
+        Controller._require_executable(saved)
         if saved.stage != "blocked_policy_ambiguity":
             raise ControllerError("run is not awaiting policy approval")
 
@@ -2986,9 +3225,24 @@ def report(
 
     def action() -> None:
         _print_storage_hardening(_prepare_private_storage(RUNS))
-        _print_run_report(load_run(run_id, RUNS))
+        path, _, classification = inspect_run_record(run_id, RUNS)
+        if (
+            classification.record_state != "CURRENT"
+            or classification.current_run is None
+        ):
+            raise _classification_error(classification, path)
+        _print_run_report(classification.current_run)
 
     _handle_error(action)
+
+
+@app.command("migrate-run")
+def migrate_run_command(
+    run_id: str = typer.Argument(..., help="Historical saved run id."),
+) -> None:
+    """Explicitly migrate one historical record; defaults to no rewrite."""
+
+    _handle_error(lambda: migrate_run_record(run_id, RUNS))
 
 
 @app.command()
@@ -3001,7 +3255,26 @@ def status(
         preflight = _prepare_private_storage(RUNS)
         _print_storage_hardening(preflight)
         if run_id:
-            console.print(load_run(run_id, RUNS).model_dump_json(indent=2))
+            _, _, classification = inspect_run_record(run_id, RUNS)
+            if (
+                classification.record_state == "CURRENT"
+                and classification.current_run is not None
+            ):
+                console.print(classification.current_run.model_dump_json(indent=2))
+                return
+            console.print(f"Run: {classification.run_id or run_id}")
+            console.print(
+                f"Schema: {classification.schema_version or 'unsupported'}"
+            )
+            console.print(
+                "Structural class: "
+                f"{classification.structural_class or 'unknown'}"
+            )
+            console.print(f"Record state: {classification.record_state}")
+            console.print(f"Reason: {classification.reason_code}")
+            if classification.field_path:
+                console.print(f"Field: {classification.field_path}")
+            console.print(f"Source SHA-256: {classification.source_sha256}")
             return
         root = preflight.runs_dir
         paths = []
@@ -3012,36 +3285,59 @@ def status(
             _secure_regular_file(path)
             paths.append(path)
         paths = sorted(paths, key=lambda p: os.lstat(p).st_mtime, reverse=True)[:10]
+        console.print(
+            "Record states: CURRENT | MIGRATION_REQUIRED | RESUME_BLOCKED | "
+            "ARCHIVE_ONLY | UNSUPPORTED"
+        )
         table = Table(
             "Run",
+            "Sch",
+            "State",
+            "Reason",
             "Task",
             "Stage",
-            "Ownership",
-            "Corrections",
-            "Policies",
+            "Own",
+            "Corr",
+            "Policy",
+            box=None,
+            padding=(0, 1),
+            collapse_padding=True,
         )
         for path in paths:
-            try:
-                run = WorkflowRun.model_validate_json(_read_private_text(path))
-            except Exception:
-                table.add_row(path.stem, "—", "INVALID", "—", "—", "—")
-                continue
-            ownership = (
-                "legacy"
-                if run.target_ownership is None
-                else (
-                    "released"
-                    if run.target_ownership.released_at is not None
-                    else "active"
+            classification = classify_run_bytes(_read_private_bytes(path).content)
+            run = classification.current_run
+            if classification.record_state == "CURRENT" and run is not None:
+                ownership = (
+                    "legacy"
+                    if run.target_ownership is None
+                    else (
+                        "released"
+                        if run.target_ownership.released_at is not None
+                        else "active"
+                    )
                 )
-            )
+                table.add_row(
+                    run.run_id,
+                    str(run.schema_version),
+                    classification.record_state,
+                    classification.reason_code,
+                    run.task_ref,
+                    run.stage,
+                    ownership,
+                    str(run.correction_cycles),
+                    str(len(run.policy_decisions)),
+                )
+                continue
             table.add_row(
-                run.run_id,
-                run.task_ref,
-                run.stage,
-                ownership,
-                str(run.correction_cycles),
-                str(len(run.policy_decisions)),
+                classification.run_id or path.stem,
+                str(classification.schema_version or "—"),
+                classification.record_state,
+                classification.reason_code,
+                classification.task_ref or "—",
+                classification.stage or "—",
+                "—",
+                "—",
+                "—",
             )
         console.print(table)
     _handle_error(action)
