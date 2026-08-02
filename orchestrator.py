@@ -1,0 +1,582 @@
+"""Deterministic jobs-repository orchestration controller."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import subprocess
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from models import GitRecord, ProviderRecord, RepoState, ReviewResult, WorkflowRun
+from providers import (
+    DEFAULT_REPO,
+    ProviderExecution,
+    execute_luna_implementation,
+    execute_sonnet_review,
+    execute_terra_resolution,
+    parse_sonnet_review,
+)
+
+app = typer.Typer(no_args_is_help=True, help="Safely orchestrate one jobs task at a time.")
+console = Console()
+RUNS = Path(__file__).parent / "runs"
+
+
+class ControllerError(RuntimeError):
+    pass
+
+
+def configured_repo(explicit: Path | None = None) -> Path:
+    return (explicit or Path(os.environ.get("JOBS_REPO", str(DEFAULT_REPO)))).expanduser().resolve()
+
+
+def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise ControllerError(f"git {' '.join(args)} failed: {detail}")
+    return result
+
+
+def git_text(repo: Path, *args: str) -> str:
+    return _git(repo, *args).stdout.strip()
+
+
+def repo_state(repo: Path) -> RepoState:
+    if not repo.exists() or not repo.is_dir():
+        raise ControllerError(f"jobs repo does not exist: {repo}")
+    root = Path(git_text(repo, "rev-parse", "--show-toplevel")).resolve()
+    if root != repo.resolve():
+        raise ControllerError(f"configured jobs repo is not the Git root: {repo}")
+    branch = git_text(repo, "branch", "--show-current")
+    if not branch:
+        raise ControllerError("jobs repo must be on a named branch; detached HEAD is unsafe")
+    origin = git_text(repo, "remote", "get-url", "origin")
+    return RepoState(
+        repo=str(repo),
+        branch=branch,
+        head=git_text(repo, "rev-parse", "HEAD"),
+        clean=not bool(git_text(repo, "status", "--porcelain=v1", "--untracked-files=all")),
+        origin=origin,
+    )
+
+
+def resolve_task(repo: Path, task_ref: str) -> tuple[str, Path, str]:
+    """Resolve exactly one tasks/<ref>-*.md and return its relative name/content."""
+
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", task_ref or ""):
+        raise ControllerError("task-ref must be a single task identifier, such as 009")
+    task_dir = repo / "tasks"
+    matches = sorted(task_dir.glob(f"{task_ref}-*.md"))
+    if len(matches) == 0:
+        raise ControllerError(f"no task specification matches tasks/{task_ref}-*.md")
+    if len(matches) > 1:
+        names = ", ".join(str(p.relative_to(repo)) for p in matches)
+        raise ControllerError(f"task-ref is ambiguous; matches: {names}")
+    path = matches[0]
+    content = path.read_text(encoding="utf-8")
+    return str(path.relative_to(repo)), path, content
+
+
+def changed_files(repo: Path) -> list[str]:
+    result = _git(repo, "status", "--porcelain=v1", "--untracked-files=all")
+    files: list[str] = []
+    for line in result.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        value = line[3:]
+        if " -> " in value:
+            old, new = value.split(" -> ", 1)
+            files.extend([old, new])
+        else:
+            files.append(value)
+    return sorted(set(files))
+
+
+def working_tree_fingerprint(repo: Path) -> str:
+    digest = hashlib.sha256()
+    status = _git(repo, "status", "--porcelain=v1", "--untracked-files=all").stdout
+    digest.update(status.encode())
+    for command in (("diff", "--no-ext-diff", "--binary"), ("diff", "--cached", "--no-ext-diff", "--binary")):
+        digest.update(_git(repo, *command).stdout.encode())
+    for relative in changed_files(repo):
+        path = repo / relative
+        if path.is_file():
+            digest.update(relative.encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def diff_check(repo: Path) -> tuple[bool, str]:
+    result = _git(repo, "diff", "--check", check=False)
+    return result.returncode == 0, (result.stdout + result.stderr).strip()
+
+
+def persist(run: WorkflowRun, runs_dir: Path = RUNS) -> Path:
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    path = runs_dir / f"{run.run_id}.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(run.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def load_run(run_id: str, runs_dir: Path = RUNS) -> WorkflowRun:
+    path = runs_dir / f"{run_id}.json"
+    if not path.exists():
+        raise ControllerError(f"unknown run {run_id}")
+    try:
+        return WorkflowRun.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ControllerError(f"run state is invalid: {path}: {exc}") from exc
+
+
+def _record_provider(run: WorkflowRun, purpose: str, provider: str, execution: ProviderExecution) -> None:
+    run.provider_runs.append(
+        ProviderRecord(
+            provider=provider,
+            purpose=purpose,
+            command=execution.command,
+            returncode=execution.returncode,
+            stdout=execution.stdout,
+            stderr=execution.stderr,
+        )
+    )
+
+
+def _record_git(run: WorkflowRun, operation: str, result: subprocess.CompletedProcess[str]) -> None:
+    run.git_operations.append(
+        GitRecord(
+            operation=operation,
+            command=["git", *result.args[3:]] if isinstance(result.args, list) else ["git"],
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
+    )
+
+
+def _task_prompt(run: WorkflowRun) -> str:
+    return (
+        f"Task specification ({run.task_file}):\n\n{run.specification}\n\n"
+        "Implement only this task in the jobs repository. Preserve useful existing code. "
+        "Use deterministic Python for workflow/control decisions; do not invent policy."
+    )
+
+
+def _spec_review_prompt(run: WorkflowRun) -> str:
+    return (
+        "You are performing a fresh-context, read-only specification review. Read the task "
+        "specification below. Return PASS only when it is sufficiently precise and bounded "
+        "for implementation without inventing policy. Categorize a failure as exactly one "
+        "of IMPLEMENTATION_DEFECT, POLICY_AMBIGUITY, or SCOPE_VIOLATION. Do not edit files.\n\n"
+        + _task_prompt(run)
+    )
+
+
+def _implementation_review_prompt(run: WorkflowRun, diff: str) -> str:
+    return (
+        "You are performing a fresh-context, read-only adversarial implementation review. "
+        "Compare the actual changed files and diff to the task specification. Return PASS "
+        "only if the implementation is correct. Otherwise categorize exactly one failure "
+        "as IMPLEMENTATION_DEFECT, POLICY_AMBIGUITY, or SCOPE_VIOLATION. Do not edit files.\n\n"
+        + _task_prompt(run)
+        + "\n\nChanged files:\n"
+        + "\n".join(run.changed_files)
+        + "\n\nDiff:\n"
+        + diff
+    )
+
+
+def _terra_prompt(run: WorkflowRun, reason: str) -> str:
+    return (
+        "Read-only policy/architecture clarification. Do not edit files, run Git mutations, "
+        "or decide whether to proceed. Identify the precise missing policy decision and "
+        "propose a narrowly worded resolution for a human to approve.\n\n"
+        f"Reason: {reason}\n\n{_task_prompt(run)}"
+    )
+
+
+def _implementation_diff(repo: Path) -> str:
+    tracked = _git(repo, "diff", "HEAD", "--no-ext-diff").stdout
+    untracked = [f for f in changed_files(repo) if not _git(repo, "ls-files", "--error-unmatch", f, check=False).stdout.strip()]
+    extra = []
+    for relative in untracked:
+        path = repo / relative
+        if path.is_file():
+            extra.append(f"\n--- untracked: {relative}\n{path.read_text(encoding='utf-8', errors='replace')}")
+    return tracked + "".join(extra)
+
+
+class Controller:
+    def __init__(
+        self,
+        repo: Path,
+        runs_dir: Path = RUNS,
+        sonnet: Callable[[str, Path], ProviderExecution] = execute_sonnet_review,
+        terra: Callable[[str, Path], ProviderExecution] = execute_terra_resolution,
+        luna: Callable[[str, Path], ProviderExecution] = execute_luna_implementation,
+        approval: Callable[[str], bool] | None = None,
+    ) -> None:
+        self.repo = repo
+        self.runs_dir = runs_dir
+        self.sonnet = sonnet
+        self.terra = terra
+        self.luna = luna
+        self.approval = approval or (lambda prompt: typer.confirm(prompt, default=False))
+
+    def _save(self, run: WorkflowRun) -> None:
+        persist(run, self.runs_dir)
+
+    def _block(self, run: WorkflowRun, stage: str, message: str) -> WorkflowRun:
+        run.stage = stage
+        run.last_error = message
+        self._save(run)
+        console.print(f"[red]BLOCKED:[/red] {message}")
+        return run
+
+    def _policy_stop(self, run: WorkflowRun, reason: str) -> WorkflowRun:
+        run.stage = "terra_resolving"
+        self._save(run)
+        execution = self.terra(_terra_prompt(run, reason), self.repo)
+        _record_provider(run, "policy clarification", "Terra High", execution)
+        self._save(run)
+        run.terra_resolution = execution.stdout or execution.stderr
+        return self._block(run, "blocked_policy_ambiguity", "policy ambiguity requires human approval")
+
+    def _review(self, run: WorkflowRun, purpose: str) -> ReviewResult | None:
+        run.stage = "spec_reviewing" if purpose == "specification" else "reviewing"
+        self._save(run)
+        prompt = _spec_review_prompt(run) if purpose == "specification" else _implementation_review_prompt(run, _implementation_diff(self.repo))
+        execution = self.sonnet(prompt, self.repo)
+        _record_provider(run, purpose, "Sonnet 5 High", execution)
+        self._save(run)
+        if execution.returncode != 0:
+            self._block(run, "blocked_provider_failure", f"Sonnet failed during {purpose} review")
+            return None
+        try:
+            result = parse_sonnet_review(execution)
+        except Exception as exc:
+            self._block(run, "blocked_provider_failure", f"invalid Sonnet result: {exc}")
+            return None
+        if purpose == "specification":
+            run.spec_review = result
+            run.stage = "spec_review_passed" if result.category == "PASS" else "spec_review_failed"
+        else:
+            run.implementation_review = result
+            run.stage = "implementation_reviewed"
+        self._save(run)
+        return result
+
+    def _verify(self, run: WorkflowRun) -> bool:
+        run.stage = "verifying"
+        self._save(run)
+        current = repo_state(self.repo)
+        checks: dict[str, object] = {
+            "branch_matches": current.branch == run.repo.branch,
+            "head_matches": current.head == run.repo.head,
+            "origin_matches": current.origin == run.repo.origin,
+        }
+        files = changed_files(self.repo)
+        clean_diff, diff_message = diff_check(self.repo)
+        run.changed_files = files
+        run.working_tree_fingerprint = working_tree_fingerprint(self.repo)
+        checks.update({"diff_check": clean_diff, "diff_check_output": diff_message, "changed_files": files})
+        run.verification = checks
+        self._save(run)
+        if not all(value for key, value in checks.items() if key != "diff_check_output" and key != "changed_files"):
+            self._block(run, "blocked_unexpected_repo_state", "repository changed unexpectedly during orchestration")
+            return False
+        if not files:
+            self._block(run, "blocked_no_changes", "implementation produced no changed files")
+            return False
+        run.stage = "implementation_verified"
+        self._save(run)
+        return True
+
+    def _implement(self, run: WorkflowRun, correction: bool = False) -> bool:
+        run.stage = "correcting" if correction else "implementing"
+        self._save(run)
+        prompt = _task_prompt(run)
+        if correction:
+            prompt += (
+                "\n\nCorrect the implementation for this review finding. Make the smallest bounded "
+                "change that addresses it; do not change policy or perform Git operations.\n"
+                + (run.implementation_review.summary if run.implementation_review else "")
+            )
+        execution = self.luna(prompt, self.repo)
+        _record_provider(run, "correction" if correction else "implementation", "Luna High", execution)
+        self._save(run)
+        run.stage = "correction_completed" if correction else "implementation_completed"
+        self._save(run)
+        if execution.returncode != 0:
+            self._block(run, "blocked_provider_failure", "Luna failed during implementation")
+            return False
+        return self._verify(run)
+
+    def _review_and_correct(self, run: WorkflowRun) -> WorkflowRun:
+        result = run.implementation_review if run.stage == "implementation_reviewed" else self._review(run, "implementation")
+        if result is None:
+            return run
+        if result.category == "PASS":
+            run.stage = "awaiting_commit_approval"
+            self._save(run)
+            return self._approval_gates(run)
+        if result.category == "POLICY_AMBIGUITY":
+            return self._policy_stop(run, result.summary)
+        if run.correction_cycles >= 1:
+            return self._block(run, "blocked_after_correction", "implementation review still fails after one correction")
+        run.correction_cycles = 1
+        run.stage = "correction_pending"
+        self._save(run)
+        if not self._implement(run, correction=True):
+            return run
+        return self._review_and_correct(run)
+
+    def _approval_gates(self, run: WorkflowRun) -> WorkflowRun:
+        self._resume_guard(run)
+        if run.stage in {"awaiting_commit_approval", "commit_declined"}:
+            console.print("\n[cyan]Commit approval gate[/cyan]")
+            console.print("Changed files: " + ", ".join(run.changed_files))
+            if run.implementation_review:
+                console.print("Review: " + run.implementation_review.summary)
+            if not self.approval("Commit these changes?"):
+                run.stage = "commit_declined"
+                self._save(run)
+                console.print("Commit not approved; no Git commit was made.")
+                return run
+            self._resume_guard(run)
+            add = _git(self.repo, "add", "-A", "--", *run.changed_files, check=False)
+            _record_git(run, "stage changed files", add)
+            if add.returncode != 0:
+                return self._block(run, "blocked_git_failure", add.stderr.strip() or "git add failed")
+            message = f"Implement task {run.task_ref}"
+            commit = _git(self.repo, "commit", "-m", message, check=False)
+            _record_git(run, "commit", commit)
+            if commit.returncode != 0:
+                return self._block(run, "blocked_git_failure", commit.stderr.strip() or "git commit failed")
+            run.commit_hash = git_text(self.repo, "rev-parse", "HEAD")
+            run.commit_message = message
+            run.stage = "awaiting_push_approval"
+            self._save(run)
+        if run.stage in {"awaiting_push_approval", "push_declined"}:
+            console.print("\n[cyan]Push approval gate[/cyan]")
+            if not self.approval("Push this commit to origin?"):
+                run.stage = "push_declined"
+                self._save(run)
+                console.print("Push not approved; no Git push was made.")
+                return run
+            self._resume_guard(run)
+            push = _git(self.repo, "push", "origin", run.repo.branch, check=False)
+            _record_git(run, "push", push)
+            if push.returncode != 0:
+                return self._block(run, "blocked_git_failure", push.stderr.strip() or "git push failed")
+            run.stage = "pushed_awaiting_merge"
+            self._save(run)
+            console.print("Pushed. Merge remains a separate manual/future gate.")
+        return run
+
+    def new_run(self, task_ref: str) -> WorkflowRun:
+        state = repo_state(self.repo)
+        relative, _, specification = resolve_task(self.repo, task_ref)
+        run = WorkflowRun(
+            run_id=uuid.uuid4().hex[:12],
+            created_at=datetime.now(timezone.utc).isoformat(),
+            task_ref=task_ref,
+            task_file=relative,
+            task_sha256=hashlib.sha256(specification.encode()).hexdigest(),
+            specification=specification,
+            repo=state,
+        )
+        self._save(run)
+        if not state.clean:
+            return self._block(run, "blocked_dirty_repo", "jobs repo must be clean before starting")
+        return self._run_from(run)
+
+    def _run_from(self, run: WorkflowRun) -> WorkflowRun:
+        if run.stage == "created":
+            result = self._review(run, "specification")
+            if result is None:
+                return run
+            if result.category == "POLICY_AMBIGUITY":
+                return self._policy_stop(run, result.summary)
+            if result.category != "PASS":
+                return self._block(run, "blocked_spec_review", f"specification review failed: {result.summary}")
+        if run.stage == "spec_review_passed":
+            if not self._implement(run):
+                return run
+        if run.stage == "implementation_completed" or run.stage == "correction_completed":
+            if not self._verify(run):
+                return run
+        if run.stage == "correction_pending":
+            if not self._implement(run, correction=True):
+                return run
+        if run.stage == "implementation_verified":
+            return self._review_and_correct(run)
+        if run.stage == "implementation_reviewed":
+            return self._review_and_correct(run)
+        if run.stage in {"awaiting_commit_approval", "commit_declined", "awaiting_push_approval", "push_declined"}:
+            return self._approval_gates(run)
+        return run
+
+    def _resume_guard(self, run: WorkflowRun) -> None:
+        current = repo_state(self.repo)
+        if current.repo != run.repo.repo:
+            raise ControllerError("resume refused: configured repository differs from saved run")
+        if current.branch != run.repo.branch or current.origin != run.repo.origin:
+            raise ControllerError("resume refused: branch or origin no longer matches saved snapshot")
+        if run.commit_hash:
+            if current.head != run.commit_hash or not current.clean:
+                raise ControllerError("resume refused: committed repository state no longer matches saved run")
+        elif current.head != run.repo.head:
+            raise ControllerError("resume refused: HEAD no longer matches saved snapshot")
+        elif run.working_tree_fingerprint and working_tree_fingerprint(self.repo) != run.working_tree_fingerprint:
+            raise ControllerError("resume refused: working tree no longer matches saved run")
+        elif run.stage in {"created", "spec_reviewing", "spec_review_passed"} and not current.clean:
+            raise ControllerError("resume refused: repository is dirty before implementation")
+
+    def resume(self, run_id: str) -> WorkflowRun:
+        run = load_run(run_id, self.runs_dir)
+        self._resume_guard(run)
+        if run.stage.startswith("blocked") or run.stage == "pushed_awaiting_merge":
+            console.print(f"Stage: {run.stage}")
+            return run
+        if run.stage in {"spec_reviewing", "implementing", "correcting", "reviewing", "terra_resolving"}:
+            return self._recover_provider_stage(run)
+        return self._run_from(run)
+
+    def _recover_provider_stage(self, run: WorkflowRun) -> WorkflowRun:
+        """Consume a provider result already persisted before a process crash."""
+
+        if not run.provider_runs:
+            return self._block(run, "blocked_interrupted_provider", "provider stage was interrupted before output was recorded")
+        record = run.provider_runs[-1]
+        expected_provider_run = {
+            "terra_resolving": ("policy clarification", "Terra High"),
+            "spec_reviewing": ("specification", "Sonnet 5 High"),
+            "reviewing": ("implementation", "Sonnet 5 High"),
+            "implementing": ("implementation", "Luna High"),
+            "correcting": ("correction", "Luna High"),
+        }[run.stage]
+        if (record.purpose, record.provider) != expected_provider_run:
+            return self._block(
+                run,
+                "blocked_interrupted_provider",
+                "provider stage was interrupted before matching output was recorded",
+            )
+        execution = ProviderExecution(record.command, record.returncode, record.stdout, record.stderr)
+        if run.stage == "terra_resolving":
+            run.terra_resolution = execution.stdout or execution.stderr
+            return self._block(run, "blocked_policy_ambiguity", "policy ambiguity requires human approval")
+        if run.stage == "spec_reviewing":
+            try:
+                result = parse_sonnet_review(execution)
+            except Exception as exc:
+                return self._block(run, "blocked_provider_failure", f"invalid Sonnet result: {exc}")
+            run.spec_review = result
+            run.stage = "spec_review_passed" if result.category == "PASS" else "spec_review_failed"
+            self._save(run)
+            if result.category == "POLICY_AMBIGUITY":
+                return self._policy_stop(run, result.summary)
+            if result.category != "PASS":
+                return self._block(run, "blocked_spec_review", f"specification review failed: {result.summary}")
+            return self._run_from(run)
+        if run.stage == "reviewing":
+            try:
+                result = parse_sonnet_review(execution)
+            except Exception as exc:
+                return self._block(run, "blocked_provider_failure", f"invalid Sonnet result: {exc}")
+            run.implementation_review = result
+            run.stage = "implementation_reviewed"
+            self._save(run)
+            return self._review_and_correct(run)
+        if run.stage == "correcting":
+            run.stage = "correction_completed"
+            self._save(run)
+            if execution.returncode != 0:
+                return self._block(run, "blocked_provider_failure", "Luna failed during correction")
+            if not self._verify(run):
+                return run
+            return self._review_and_correct(run)
+        run.stage = "implementation_completed"
+        self._save(run)
+        if execution.returncode != 0:
+            return self._block(run, "blocked_provider_failure", "Luna failed during implementation")
+        if not self._verify(run):
+            return run
+        return self._review_and_correct(run)
+
+
+def _handle_error(action: Callable[[], object]) -> None:
+    try:
+        action()
+    except (ControllerError, OSError, subprocess.SubprocessError) as exc:
+        console.print(f"[red]BLOCKED:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+
+@app.command("run")
+def run_task(
+    task_ref: str = typer.Argument(..., help="Task identifier resolved as tasks/<task-ref>-*.md."),
+    repo: Path | None = typer.Option(None, "--repo", help="Override the jobs repository path."),
+) -> None:
+    """Run orchestration through review, correction, and human approval gates."""
+
+    def action() -> None:
+        result = Controller(configured_repo(repo)).new_run(task_ref)
+        console.print(f"Run {result.run_id}: {result.stage}")
+    _handle_error(action)
+
+
+@app.command()
+def resume(
+    run_id: str = typer.Argument(..., help="Saved run id."),
+    repo: Path | None = typer.Option(None, "--repo", help="Override the jobs repository path."),
+) -> None:
+    """Safely continue a saved run without repeating completed provider stages."""
+
+    def action() -> None:
+        saved = load_run(run_id)
+        result = Controller(configured_repo(repo) if repo else Path(saved.repo.repo)).resume(run_id)
+        console.print(f"Run {result.run_id}: {result.stage}")
+    _handle_error(action)
+
+
+@app.command()
+def status(
+    run_id: str | None = typer.Argument(None, help="Run id; omit to list recent runs."),
+) -> None:
+    """Inspect one saved run or list recent run stages."""
+
+    def action() -> None:
+        if run_id:
+            console.print(load_run(run_id).model_dump_json(indent=2))
+            return
+        paths = sorted(RUNS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
+        table = Table("Run", "Task", "Stage", "Corrections")
+        for path in paths:
+            try:
+                run = WorkflowRun.model_validate_json(path.read_text(encoding="utf-8"))
+            except Exception:
+                table.add_row(path.stem, "—", "INVALID", "—")
+                continue
+            table.add_row(run.run_id, run.task_ref, run.stage, str(run.correction_cycles))
+        console.print(table)
+    _handle_error(action)
+
+
+if __name__ == "__main__":
+    app()
