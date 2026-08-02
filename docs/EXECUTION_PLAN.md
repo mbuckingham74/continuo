@@ -1862,7 +1862,7 @@ renaming control identities.
     migrations`) was pushed directly to `origin/main` with all 123 tests passing.
 - [~] Replace display labels in control flow with separate stable role, provider
   adapter, route, and model/display identities.
-  - Planning evidence (2026-08-02): the approval-pending Gate 2.3 contract and
+  - Planning evidence (2026-08-02): the Gate 2.3 contract and
     adversarial matrix below were derived from authoritative C-5, the completed
     Gate 2.2 version-7 migration boundary, and every current label-dependent
     history, normalization, recovery, writer-linkage, policy-source, reporting,
@@ -1870,9 +1870,22 @@ renaming control identities.
     with `origin/main` at
     `722c1eafa1a91a02c066d0e74c90957633c139b0`. This planning pass changes only
     this tracker. No runtime model, migration, provider, fixture, test, private
-    run, target checkout, Git operation, or later Gate 2 item is authorized
-    until the repository owner approves the identities, schema-8 migration,
-    compatibility treatment, recovery linkage, and exclusions below.
+    run, target checkout, Git operation, or later Gate 2 item changed.
+  - Contract approval (2026-08-02): the repository owner approved the complete
+    identity vocabulary, schema-8 persistence/migration boundary, backward-
+    compatibility treatment, recovery and retry behavior, CLI behavior, later-
+    gate exclusions, and 41-row adversarial matrix, and explicitly authorized
+    commit, direct push to `origin/main`, and this tracker update. Gate 2.3
+    implementation remains a separate action and has not begun.
+  - Validation evidence (2026-08-02): all eight non-planning local Markdown
+    links/anchors and 41 unique ordered Gate 2.3 matrix rows validate;
+    `git diff --check` passes. The planning publication changed only this
+    tracker and used no private run, Jobs path, live provider, target checkout,
+    test fixture, runtime source, commit/push gate, or later Gate 2 work. The
+    123-test deterministic suite was not rerun for this documentation-only diff.
+  - Publication evidence (2026-08-02): contract commit
+    `77a6b1a4450f082f38b38b65dc77cfa9f2e247d4` (`Define Gate 2.3 identity
+    contract`) was pushed directly to `origin/main`.
 - [ ] Persist immutable parsed review records linked to raw attempts; make
   unreadable legacy history visible and non-silent.
 - [ ] Persist the resolved correction and escalation policy with each run.
@@ -2394,7 +2407,7 @@ private records or live providers; compatibility and documentation checks plus
 `git diff --check` pass; the complete implementation diff is reviewed; and no
 later Gate 2 item begins.
 
-### Gate 2.3 / C-5 stable provider-identity contract (approval pending)
+### Gate 2.3 / C-5 stable provider-identity contract (approved 2026-08-02)
 
 **Status and boundary.** This note specifies only the first unchecked Gate 2
 item after the published Gate 2.2 migration work. It replaces human-facing
@@ -2402,7 +2415,9 @@ provider/model labels as control identifiers with separate stable orchestration
 role, provider-adapter, configured-route, provider-model, and display
 identities. It also gives each persisted physical attempt a stable operation ID
 so the same role can perform more than one operation without falling back to a
-presentation string. The repository owner has not yet approved implementation.
+presentation string. The repository owner approved this contract and its
+adversarial matrix for publication on 2026-08-02. Runtime implementation has
+not begun and remains a separate action.
 
 This item is a persisted-contract bridge, not the generic provider-adapter or
 configuration implementation. Current commands, models, capabilities,
