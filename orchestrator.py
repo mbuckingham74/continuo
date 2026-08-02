@@ -907,19 +907,29 @@ def approve_policy_command(
         console.print("\n[cyan]Policy text to approve[/cyan]")
         console.print(approved)
 
-        if not typer.confirm("Approve this policy decision?", default=False):
+        if not typer.confirm(
+            "Approve this policy decision and resume orchestration?",
+            default=False,
+        ):
             console.print("Policy decision not approved; run remains blocked.")
             return
 
         controller = Controller(
             configured_repo(repo) if repo else Path(saved.repo.repo)
         )
+
+        # Persist the human decision before any provider work resumes.
         result = controller.approve_policy(run_id, approved)
         console.print(
             f"Recorded {result.policy_decisions[-1].decision_id}. "
-            f"Run {result.run_id}: {result.stage}"
+            "Resuming orchestration."
         )
-        console.print("Resume the run to continue with the approved policy.")
+        console.print(
+            "Policy approval does not approve any future commit, push, or merge."
+        )
+
+        result = controller.resume(run_id)
+        console.print(f"Run {result.run_id}: {result.stage}")
 
     _handle_error(action)
 
