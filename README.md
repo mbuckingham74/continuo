@@ -284,7 +284,7 @@ The generalization path centers on preserving the existing safety invariants whi
 - durable persistence, locking, redaction, and schema migrations; and
 - reporting across runs, projects, providers, and model generations.
 
-See [the full roadmap](docs/ORCHESTRATION_ENGINE.md#22-future-generalization-architecture) for the proposed abstractions, phases, and invariants to preserve.
+See the [validated stabilization and enhancement roadmap](docs/ENGINE_ROADMAP.md) for triaged priorities and corrected sequencing. The [full architecture roadmap](docs/ORCHESTRATION_ENGINE.md#22-future-generalization-architecture) describes the broader proposed abstractions and invariants.
 
 ## Guiding invariants
 
