@@ -282,6 +282,79 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(resumed.stage, "commit_declined")
         self.assertEqual(resumed.correction_cycles, 2)
 
+    def test_policy_approval_is_audited_and_propagated(self) -> None:
+        luna_prompts = []
+
+        run = self.controller(
+            self.passing_sonnet,
+            approval=lambda prompt: False,
+        ).new_run("009")
+
+        run.stage = "blocked_policy_ambiguity"
+        run.implementation_review = ReviewResult(
+            status="FAIL",
+            category="IMPLEMENTATION_DEFECT",
+            finding_key="remote-scope-ownership",
+            summary="remote scope ownership remains unresolved",
+        )
+        run.sol_guidance = "Decision 3 versus Decision 4 ownership is ambiguous."
+        run.terra_resolution = (
+            "Analysis.\n\n"
+            "Proposed approval text:\n\n"
+            "> Remote-role scope is positive evidence for remote reality.\n"
+        )
+        run.last_error = "policy ambiguity requires human approval"
+        orchestrator.persist(run, self.runs)
+
+        def luna(prompt, repo):
+            luna_prompts.append(prompt)
+            (repo / "policy-fix.py").write_text("# bounded change\n")
+            return ProviderExecution(["codex"], 0, "implemented", "")
+
+        controller = self.controller(
+            self.passing_sonnet,
+            luna=luna,
+            approval=lambda prompt: False,
+        )
+
+        approved = controller.approve_policy(
+            run.run_id,
+            "Remote-role scope is positive evidence for remote reality.",
+        )
+
+        self.assertEqual(approved.stage, "correction_pending")
+        self.assertEqual(approved.correction_cycles, 1)
+        self.assertEqual(len(approved.policy_decisions), 1)
+
+        decision = approved.policy_decisions[0]
+        self.assertEqual(decision.decision_id, "policy-01")
+        self.assertEqual(decision.approved_by, "human")
+        self.assertEqual(decision.source_provider, "Terra High")
+        self.assertEqual(decision.trigger_finding_key, "remote-scope-ownership")
+        self.assertIn("Decision 3 versus Decision 4", decision.trigger_summary)
+        self.assertIn("Proposed approval text", decision.recommendation)
+
+        resumed = controller.resume(run.run_id)
+
+        self.assertEqual(resumed.stage, "commit_declined")
+        self.assertEqual(len(luna_prompts), 1)
+        self.assertIn(
+            "Human-approved policy decisions (authoritative for this run)",
+            luna_prompts[0],
+        )
+        self.assertIn(
+            "Remote-role scope is positive evidence for remote reality.",
+            luna_prompts[0],
+        )
+
+        extracted = orchestrator._terra_proposed_approval_text(
+            run.terra_resolution
+        )
+        self.assertEqual(
+            extracted,
+            "Remote-role scope is positive evidence for remote reality.",
+        )
+
     def test_commit_prompt_defaults_to_no(self) -> None:
         prompts = []
 

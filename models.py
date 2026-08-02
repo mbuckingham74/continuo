@@ -66,12 +66,27 @@ class GitRecord(BaseModel):
     stderr: str = ""
 
 
+class PolicyDecision(BaseModel):
+    """Immutable human-approved policy clarification."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    decision_id: str
+    approved_at: str
+    approved_by: Literal["human"] = "human"
+    source_provider: str = "Terra High"
+    trigger_finding_key: str | None = None
+    trigger_summary: str
+    recommendation: str
+    approved_text: str
+
+
 class WorkflowRun(BaseModel):
     """Everything needed to audit and safely resume one run."""
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 3
+    schema_version: int = 4
     run_id: str
     created_at: str
     task_ref: str
@@ -85,6 +100,7 @@ class WorkflowRun(BaseModel):
     implementation_review: ReviewResult | None = None
     terra_resolution: str | None = None
     sol_guidance: str | None = None
+    policy_decisions: list[PolicyDecision] = Field(default_factory=list)
     changed_files: list[str] = Field(default_factory=list)
     working_tree_fingerprint: str | None = None
     verification: dict[str, object] = Field(default_factory=dict)

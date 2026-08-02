@@ -15,7 +15,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from models import GitRecord, ProviderRecord, RepoState, ReviewResult, WorkflowRun
+from models import GitRecord, PolicyDecision, ProviderRecord, RepoState, ReviewResult, WorkflowRun
 from providers import (
     DEFAULT_REPO,
     ProviderExecution,
@@ -171,9 +171,21 @@ def _record_git(run: WorkflowRun, operation: str, result: subprocess.CompletedPr
 
 
 def _task_prompt(run: WorkflowRun) -> str:
+    approved = ""
+    if run.policy_decisions:
+        decisions = "\n".join(
+            f"- {decision.decision_id}: {decision.approved_text}"
+            for decision in run.policy_decisions
+        )
+        approved = (
+            "\n\nHuman-approved policy decisions (authoritative for this run):\n"
+            + decisions
+        )
+
     return (
-        f"Task specification ({run.task_file}):\n\n{run.specification}\n\n"
-        "Implement only this task in the jobs repository. Preserve useful existing code. "
+        f"Task specification ({run.task_file}):\n\n{run.specification}"
+        + approved
+        + "\n\nImplement only this task in the jobs repository. Preserve useful existing code. "
         "Use deterministic Python for workflow/control decisions; do not invent policy."
     )
 
@@ -341,6 +353,30 @@ def _parse_sol_response(execution: ProviderExecution) -> tuple[str, str]:
     raise ValueError("Sol returned an invalid escalation result")
 
 
+def _terra_proposed_approval_text(resolution: str) -> str | None:
+    marker = "Proposed approval text:"
+    if marker not in resolution:
+        return None
+
+    tail = resolution.split(marker, 1)[1].strip()
+    quoted: list[str] = []
+    collecting = False
+
+    for raw in tail.splitlines():
+        line = raw.strip()
+        if line.startswith(">"):
+            collecting = True
+            body = line[1:].strip()
+            if body:
+                quoted.append(body)
+            continue
+        if collecting and line:
+            break
+
+    text = " ".join(quoted).strip()
+    return text or None
+
+
 class Controller:
     def __init__(
         self,
@@ -362,6 +398,62 @@ class Controller:
 
     def _save(self, run: WorkflowRun) -> None:
         persist(run, self.runs_dir)
+
+    def approve_policy(self, run_id: str, approved_text: str) -> WorkflowRun:
+        run = load_run(run_id, self.runs_dir)
+        self._resume_guard(run)
+
+        if run.stage != "blocked_policy_ambiguity":
+            raise ControllerError("policy approval requires blocked_policy_ambiguity stage")
+
+        approved_text = approved_text.strip()
+        if not approved_text:
+            raise ControllerError("approved policy text cannot be empty")
+
+        trigger_summary = (
+            run.sol_guidance
+            or (run.implementation_review.summary if run.implementation_review else None)
+            or (run.spec_review.summary if run.spec_review else None)
+            or run.last_error
+            or "policy ambiguity"
+        )
+        trigger_key = (
+            _finding_key(run.implementation_review)
+            if run.implementation_review is not None
+            else None
+        )
+
+        run.policy_decisions.append(
+            PolicyDecision(
+                decision_id=f"policy-{len(run.policy_decisions) + 1:02d}",
+                approved_at=datetime.now(timezone.utc).isoformat(),
+                trigger_finding_key=trigger_key,
+                trigger_summary=trigger_summary,
+                recommendation=run.terra_resolution or "",
+                approved_text=approved_text,
+            )
+        )
+
+        run.sol_guidance = None
+        run.last_error = None
+
+        # Specification ambiguity: re-review the specification with the
+        # approved decision now included in the authoritative task prompt.
+        if run.implementation_review is None:
+            run.stage = "created"
+        else:
+            if run.correction_cycles >= MAX_TOTAL_CORRECTIONS:
+                run.stage = "blocked_correction_budget"
+                run.last_error = (
+                    f"implementation still failing after "
+                    f"{MAX_TOTAL_CORRECTIONS} total corrections"
+                )
+            else:
+                run.correction_cycles += 1
+                run.stage = "correction_pending"
+
+        self._save(run)
+        return run
 
     def _block(self, run: WorkflowRun, stage: str, message: str) -> WorkflowRun:
         run.stage = stage
@@ -787,6 +879,51 @@ def resume(
     _handle_error(action)
 
 
+@app.command("approve-policy")
+def approve_policy_command(
+    run_id: str = typer.Argument(..., help="Saved run awaiting human policy approval."),
+    decision: str | None = typer.Option(
+        None,
+        "--decision",
+        help="Exact approved policy text. If omitted, use Terra's quoted proposal.",
+    ),
+    repo: Path | None = typer.Option(None, "--repo", help="Override the jobs repository path."),
+) -> None:
+    """Record a human-approved Terra clarification without invoking providers."""
+
+    def action() -> None:
+        saved = load_run(run_id)
+        if saved.stage != "blocked_policy_ambiguity":
+            raise ControllerError("run is not awaiting policy approval")
+
+        approved = decision or _terra_proposed_approval_text(saved.terra_resolution or "")
+        if not approved:
+            raise ControllerError(
+                "could not extract Terra's proposed approval text; use --decision"
+            )
+
+        console.print("\n[cyan]Terra recommendation[/cyan]")
+        console.print(saved.terra_resolution or "(none)")
+        console.print("\n[cyan]Policy text to approve[/cyan]")
+        console.print(approved)
+
+        if not typer.confirm("Approve this policy decision?", default=False):
+            console.print("Policy decision not approved; run remains blocked.")
+            return
+
+        controller = Controller(
+            configured_repo(repo) if repo else Path(saved.repo.repo)
+        )
+        result = controller.approve_policy(run_id, approved)
+        console.print(
+            f"Recorded {result.policy_decisions[-1].decision_id}. "
+            f"Run {result.run_id}: {result.stage}"
+        )
+        console.print("Resume the run to continue with the approved policy.")
+
+    _handle_error(action)
+
+
 @app.command()
 def status(
     run_id: str | None = typer.Argument(None, help="Run id; omit to list recent runs."),
@@ -798,14 +935,20 @@ def status(
             console.print(load_run(run_id).model_dump_json(indent=2))
             return
         paths = sorted(RUNS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
-        table = Table("Run", "Task", "Stage", "Corrections")
+        table = Table("Run", "Task", "Stage", "Corrections", "Policies")
         for path in paths:
             try:
                 run = WorkflowRun.model_validate_json(path.read_text(encoding="utf-8"))
             except Exception:
-                table.add_row(path.stem, "—", "INVALID", "—")
+                table.add_row(path.stem, "—", "INVALID", "—", "—")
                 continue
-            table.add_row(run.run_id, run.task_ref, run.stage, str(run.correction_cycles))
+            table.add_row(
+                run.run_id,
+                run.task_ref,
+                run.stage,
+                str(run.correction_cycles),
+                str(len(run.policy_decisions)),
+            )
         console.print(table)
     _handle_error(action)
 
