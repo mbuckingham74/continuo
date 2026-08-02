@@ -467,7 +467,7 @@ baseline for extraction. No live Jobs pilot occurs in this gate.
   - Publication evidence (2026-08-02): implementation commit
     `ec7fc5828c5e6877a2b59f2f191ff05fd1396021` (`Enforce target run ownership`)
     was pushed directly to `origin/main` with all 84 tests passing.
-- [~] **M0.6 / Q-6:** make run storage private by default and define explicit
+- [x] **M0.6 / Q-6:** make run storage private by default and define explicit
   handling for legacy files, redaction, retention, and export.
   - Planning evidence (2026-08-02): the draft bounded execution note and
     adversarial matrix below were derived from authoritative Q-6, the current
@@ -527,6 +527,13 @@ baseline for extraction. No live Jobs pilot occurs in this gate.
     `git diff --check` passes. No live provider, network service, external target,
     Jobs access, provider/model/policy change, commit, push, merge, export,
     cleanup, schema migration, or later-gate implementation occurred.
+  - Review decision (2026-08-02): the repository owner approved the complete
+    four-file implementation diff and explicitly authorized commit, direct push
+    to `origin/main`, and this tracker update. M0.6 is complete; Gate 2 remains
+    a separate future milestone.
+  - Publication evidence (2026-08-02): implementation commit
+    `04a34ae90fd50b4b2da3d4400c6735be6bd0e11b` (`Make run storage private`)
+    was pushed directly to `origin/main` with all 96 tests passing.
 
 M0.2 through M0.4 must share one designed provider-attempt vocabulary, but each
 implementation and diff remains independently reviewable.
