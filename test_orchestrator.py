@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import orchestrator
+import providers
 from models import RepoState, ReviewResult
 from providers import ProviderExecution, build_luna_command, build_sol_command, build_sonnet_command
 
@@ -403,6 +404,187 @@ class ControllerTests(unittest.TestCase):
             run.provider_runs[0].duration_seconds,
             12.5,
         )
+
+
+    def test_quota_stop_is_global_and_resume_retries_only_interrupted_stage(self) -> None:
+        sonnet_calls = 0
+        luna_calls = 0
+
+        def sonnet(prompt, repo):
+            nonlocal sonnet_calls
+            sonnet_calls += 1
+            if sonnet_calls == 1:
+                return review_execution("PASS", "PASS")
+            if sonnet_calls == 2:
+                return ProviderExecution(
+                    ["claude"],
+                    1,
+                    "",
+                    "You've hit your usage limit; resets later.",
+                )
+            return review_execution("PASS", "PASS")
+
+        def luna(prompt, repo):
+            nonlocal luna_calls
+            luna_calls += 1
+            (repo / "implementation.py").write_text(
+                "# implementation\n"
+            )
+            return ProviderExecution(
+                ["codex"],
+                0,
+                "implemented",
+                "",
+            )
+
+        controller = self.controller(
+            sonnet,
+            luna=luna,
+            approval=lambda prompt: False,
+        )
+        run = controller.new_run("009")
+
+        self.assertEqual(run.stage, "blocked_provider_quota")
+        self.assertEqual(
+            run.provider_resume_stage,
+            "reviewing",
+        )
+        self.assertEqual(sonnet_calls, 2)
+        self.assertEqual(luna_calls, 1)
+        self.assertEqual(
+            run.provider_runs[-1].failure_kind,
+            "quota",
+        )
+        self.assertFalse(
+            run.provider_runs[-1].retry_scheduled
+        )
+
+        resumed = controller.resume(run.run_id)
+
+        self.assertEqual(resumed.stage, "commit_declined")
+        self.assertEqual(sonnet_calls, 3)
+        self.assertEqual(luna_calls, 1)
+        self.assertIsNone(resumed.provider_resume_stage)
+        self.assertIsNone(resumed.provider_resume_prompt)
+
+
+    def test_provider_unavailability_retries_only_same_provider(self) -> None:
+        results = iter(
+            [
+                subprocess.CompletedProcess(
+                    ["claude"],
+                    503,
+                    "",
+                    "503 Service Unavailable",
+                ),
+                subprocess.CompletedProcess(
+                    ["claude"],
+                    502,
+                    "",
+                    "502 Bad Gateway",
+                ),
+                subprocess.CompletedProcess(
+                    ["claude"],
+                    0,
+                    "ok",
+                    "",
+                ),
+            ]
+        )
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+            return next(results)
+
+        execution = providers._run(
+            ["claude"],
+            self.repo,
+            runner=runner,
+            sleeper=lambda seconds: None,
+        )
+
+        self.assertEqual(execution.returncode, 0)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(execution.attempts), 3)
+        self.assertEqual(
+            [
+                attempt.failure_kind
+                for attempt in execution.attempts
+            ],
+            ["unavailable", "unavailable", None],
+        )
+        self.assertEqual(
+            [
+                attempt.retry_scheduled
+                for attempt in execution.attempts
+            ],
+            [True, True, False],
+        )
+
+
+    def test_provider_failure_classification_is_deterministic(self) -> None:
+        cases = (
+            ("You've hit your usage limit", "quota"),
+            ("402 Payment Required", "billing"),
+            ("401 Unauthorized", "auth"),
+            ("429 Too Many Requests", "rate_limit"),
+            ("503 Service Unavailable", "unavailable"),
+            ("unknown model requested", "configuration"),
+        )
+
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(
+                    providers.classify_provider_failure(
+                        1,
+                        "",
+                        message,
+                    ),
+                    expected,
+                )
+
+
+    def test_malformed_sonnet_output_gets_one_same_provider_retry(self) -> None:
+        sonnet_calls = 0
+        luna_calls = 0
+
+        def sonnet(prompt, repo):
+            nonlocal sonnet_calls
+            sonnet_calls += 1
+            if sonnet_calls == 1:
+                return review_execution("PASS", "PASS")
+            if sonnet_calls == 2:
+                return ProviderExecution(
+                    ["claude"],
+                    0,
+                    "not-json",
+                    "",
+                )
+            return review_execution("PASS", "PASS")
+
+        def luna(prompt, repo):
+            nonlocal luna_calls
+            luna_calls += 1
+            (repo / "implementation.py").write_text(
+                "# implementation\n"
+            )
+            return ProviderExecution(
+                ["codex"],
+                0,
+                "implemented",
+                "",
+            )
+
+        run = self.controller(
+            sonnet,
+            luna=luna,
+            approval=lambda prompt: False,
+        ).new_run("009")
+
+        self.assertEqual(run.stage, "commit_declined")
+        self.assertEqual(sonnet_calls, 3)
+        self.assertEqual(luna_calls, 1)
 
 
     def test_commit_prompt_defaults_to_no(self) -> None:

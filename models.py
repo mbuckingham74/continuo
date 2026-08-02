@@ -49,6 +49,17 @@ class RepoState(BaseModel):
     origin: str
 
 
+ProviderFailureKind = Literal[
+    "quota",
+    "billing",
+    "auth",
+    "rate_limit",
+    "unavailable",
+    "configuration",
+    "provider_error",
+]
+
+
 class ProviderRecord(BaseModel):
     provider: str
     purpose: str
@@ -57,6 +68,8 @@ class ProviderRecord(BaseModel):
     stdout: str = ""
     stderr: str = ""
     duration_seconds: float | None = Field(default=None, ge=0)
+    failure_kind: ProviderFailureKind | None = None
+    retry_scheduled: bool = False
 
 
 class GitRecord(BaseModel):
@@ -87,7 +100,7 @@ class WorkflowRun(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 5
+    schema_version: int = 6
     run_id: str
     created_at: str
     updated_at: str | None = None
@@ -103,6 +116,8 @@ class WorkflowRun(BaseModel):
     terra_resolution: str | None = None
     sol_guidance: str | None = None
     policy_decisions: list[PolicyDecision] = Field(default_factory=list)
+    provider_resume_stage: str | None = None
+    provider_resume_prompt: str | None = None
     changed_files: list[str] = Field(default_factory=list)
     working_tree_fingerprint: str | None = None
     verification: dict[str, object] = Field(default_factory=dict)

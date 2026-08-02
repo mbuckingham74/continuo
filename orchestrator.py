@@ -24,6 +24,7 @@ from providers import (
     execute_sonnet_review,
     execute_sol_escalation,
     execute_terra_resolution,
+    classify_provider_failure,
     parse_sonnet_review,
 )
 
@@ -146,7 +147,29 @@ def load_run(run_id: str, runs_dir: Path = RUNS) -> WorkflowRun:
         raise ControllerError(f"run state is invalid: {path}: {exc}") from exc
 
 
-def _record_provider(run: WorkflowRun, purpose: str, provider: str, execution: ProviderExecution) -> None:
+def _record_provider(
+    run: WorkflowRun,
+    purpose: str,
+    provider: str,
+    execution: ProviderExecution,
+) -> None:
+    if execution.attempts:
+        for attempt in execution.attempts:
+            run.provider_runs.append(
+                ProviderRecord(
+                    provider=provider,
+                    purpose=purpose,
+                    command=attempt.command,
+                    returncode=attempt.returncode,
+                    stdout=attempt.stdout,
+                    stderr=attempt.stderr,
+                    duration_seconds=attempt.duration_seconds,
+                    failure_kind=attempt.failure_kind,
+                    retry_scheduled=attempt.retry_scheduled,
+                )
+            )
+        return
+
     run.provider_runs.append(
         ProviderRecord(
             provider=provider,
@@ -156,6 +179,14 @@ def _record_provider(run: WorkflowRun, purpose: str, provider: str, execution: P
             stdout=execution.stdout,
             stderr=execution.stderr,
             duration_seconds=execution.duration_seconds,
+            failure_kind=(
+                execution.failure_kind
+                or classify_provider_failure(
+                    execution.returncode,
+                    execution.stdout,
+                    execution.stderr,
+                )
+            ),
         )
     )
 
@@ -208,12 +239,18 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
     provider_counts = Counter(record.provider for record in run.provider_runs)
     provider_seconds: Counter[str] = Counter()
     untimed_counts: Counter[str] = Counter()
+    failure_counts: Counter[str] = Counter()
+    retry_attempts = 0
 
     for record in run.provider_runs:
         if record.duration_seconds is None:
             untimed_counts[record.provider] += 1
         else:
             provider_seconds[record.provider] += record.duration_seconds
+        if record.failure_kind:
+            failure_counts[record.failure_kind] += 1
+        if record.retry_scheduled:
+            retry_attempts += 1
 
     reviews = _report_review_history(run)
     defect_keys = {
@@ -250,6 +287,8 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
         "untimed_counts": dict(untimed_counts),
         "provider_seconds_total": sum(provider_seconds.values()),
         "provider_calls_total": len(run.provider_runs),
+        "provider_failure_counts": dict(failure_counts),
+        "provider_retry_attempts": retry_attempts,
         "wall_seconds": wall_seconds,
         "corrections": run.correction_cycles,
         "distinct_defects": len(defect_keys),
@@ -304,6 +343,16 @@ def _print_run_report(run: WorkflowRun) -> None:
     provider_time = _format_duration(total_timed) if total_timed else "no recorded timing"
     legacy_suffix = f" ({total_untimed} untimed legacy call(s))" if total_untimed else ""
     console.print(f"Provider time: {provider_time}{legacy_suffix}")
+
+    failures = report["provider_failure_counts"]
+    console.print(
+        f"Infrastructure/provider failures: {sum(failures.values())}"
+    )
+    for kind, count in sorted(failures.items()):
+        console.print(f"  {kind}: {count}")
+    console.print(
+        f"Same-provider retries: {report['provider_retry_attempts']}"
+    )
 
     console.print(f"Corrections: {report['corrections']}")
     console.print(f"Distinct defects: {report['distinct_defects']}")
@@ -535,6 +584,18 @@ def _terra_proposed_approval_text(resolution: str) -> str | None:
     return text or None
 
 
+_PROVIDER_RESUMABLE_BLOCKS = {
+    "blocked_provider_quota",
+    "blocked_provider_billing",
+    "blocked_provider_auth",
+    "blocked_provider_rate_limit",
+    "blocked_provider_unavailable",
+    "blocked_provider_configuration",
+    "blocked_provider_failure",
+    "blocked_provider_output",
+}
+
+
 class Controller:
     def __init__(
         self,
@@ -555,7 +616,7 @@ class Controller:
         self.approval = approval or (lambda prompt: typer.confirm(prompt, default=False))
 
     def _save(self, run: WorkflowRun) -> None:
-        run.schema_version = 5
+        run.schema_version = 6
         run.updated_at = datetime.now(timezone.utc).isoformat()
         persist(run, self.runs_dir)
 
@@ -623,39 +684,304 @@ class Controller:
         _print_run_report(run)
         return run
 
+    def _arm_provider(self, run: WorkflowRun, stage: str, prompt: str) -> None:
+        run.provider_resume_stage = stage
+        run.provider_resume_prompt = prompt
+
+    def _clear_provider(self, run: WorkflowRun) -> None:
+        run.provider_resume_stage = None
+        run.provider_resume_prompt = None
+
+    def _block_provider(
+        self,
+        run: WorkflowRun,
+        provider: str,
+        purpose: str,
+        execution: ProviderExecution,
+    ) -> WorkflowRun:
+        kind = (
+            execution.failure_kind
+            or classify_provider_failure(
+                execution.returncode,
+                execution.stdout,
+                execution.stderr,
+            )
+            or "provider_error"
+        )
+
+        stage = {
+            "quota": "blocked_provider_quota",
+            "billing": "blocked_provider_billing",
+            "auth": "blocked_provider_auth",
+            "rate_limit": "blocked_provider_rate_limit",
+            "unavailable": "blocked_provider_unavailable",
+            "configuration": "blocked_provider_configuration",
+            "provider_error": "blocked_provider_failure",
+        }[kind]
+
+        description = {
+            "quota": "quota or usage cap exhausted",
+            "billing": "billing failure",
+            "auth": "authentication failure",
+            "rate_limit": "rate limit reached",
+            "unavailable": "provider unavailable after bounded retries",
+            "configuration": "provider CLI/model configuration failure",
+            "provider_error": "unclassified provider failure",
+        }[kind]
+
+        return self._block(
+            run,
+            stage,
+            f"{provider}: {description} during {purpose}; "
+            "no alternate provider was invoked",
+        )
+
+    def _block_provider_output(
+        self,
+        run: WorkflowRun,
+        provider: str,
+        purpose: str,
+        detail: str,
+    ) -> WorkflowRun:
+        return self._block(
+            run,
+            "blocked_provider_output",
+            f"{provider}: invalid structured output during {purpose} "
+            f"after one same-provider retry: {detail}",
+        )
+
+    def _retry_structured_once(
+        self,
+        run: WorkflowRun,
+        provider_name: str,
+        purpose: str,
+        provider: Callable[[str, Path], ProviderExecution],
+        parser: Callable[[ProviderExecution], object],
+    ) -> object | None:
+        prompt = run.provider_resume_prompt
+        if not prompt:
+            self._block(
+                run,
+                "blocked_interrupted_provider",
+                "cannot safely retry malformed provider output without saved prompt",
+            )
+            return None
+
+        console.print(
+            f"[yellow]Invalid {provider_name} structured output; "
+            "retrying the same provider once.[/yellow]"
+        )
+        execution = provider(prompt, self.repo)
+        _record_provider(run, purpose, provider_name, execution)
+        self._save(run)
+
+        if execution.returncode != 0:
+            self._block_provider(
+                run,
+                provider_name,
+                purpose,
+                execution,
+            )
+            return None
+
+        try:
+            return parser(execution)
+        except Exception as exc:
+            self._block_provider_output(
+                run,
+                provider_name,
+                purpose,
+                str(exc),
+            )
+            return None
+
+    def _resume_blocked_provider(self, run: WorkflowRun) -> WorkflowRun:
+        stage = run.provider_resume_stage
+        prompt = run.provider_resume_prompt
+
+        if not stage or not prompt:
+            return self._block(
+                run,
+                "blocked_interrupted_provider",
+                "provider failure lacks enough saved context for safe resumption",
+            )
+
+        provider_map = {
+            "terra_resolving": (
+                "policy clarification",
+                "Terra High",
+                self.terra,
+            ),
+            "sol_escalating": (
+                "escalation guidance",
+                "Sol High",
+                self.sol,
+            ),
+            "spec_reviewing": (
+                "specification",
+                "Sonnet 5 High",
+                self.sonnet,
+            ),
+            "reviewing": (
+                "implementation",
+                "Sonnet 5 High",
+                self.sonnet,
+            ),
+            "implementing": (
+                "implementation",
+                "Luna High",
+                self.luna,
+            ),
+            "correcting": (
+                "correction",
+                "Luna High",
+                self.luna,
+            ),
+        }
+
+        if stage not in provider_map:
+            return self._block(
+                run,
+                "blocked_interrupted_provider",
+                f"unsupported provider resume stage: {stage}",
+            )
+
+        purpose, provider_name, provider = provider_map[stage]
+        run.stage = stage
+        run.last_error = None
+        self._save(run)
+
+        console.print(
+            f"[cyan]Stage:[/cyan] Resuming {stage} — {provider_name}"
+        )
+        execution = provider(prompt, self.repo)
+        _record_provider(run, purpose, provider_name, execution)
+        self._save(run)
+
+        if execution.returncode != 0:
+            return self._block_provider(
+                run,
+                provider_name,
+                purpose,
+                execution,
+            )
+
+        result = self._recover_provider_stage(run)
+
+        # Do not erase context for a NEW provider failure reached while
+        # continuing the workflow.
+        if (
+            not result.stage.startswith("blocked")
+            and result.provider_resume_stage == stage
+            and result.provider_resume_prompt == prompt
+        ):
+            self._clear_provider(result)
+            self._save(result)
+
+        return result
+
     def _policy_stop(self, run: WorkflowRun, reason: str) -> WorkflowRun:
         run.stage = "terra_resolving"
+        prompt = _terra_prompt(run, reason)
+        self._arm_provider(run, run.stage, prompt)
         self._save(run)
+
         console.print("[cyan]Stage:[/cyan] Policy clarification — Terra High")
-        execution = self.terra(_terra_prompt(run, reason), self.repo)
-        _record_provider(run, "policy clarification", "Terra High", execution)
+        execution = self.terra(prompt, self.repo)
+        _record_provider(
+            run,
+            "policy clarification",
+            "Terra High",
+            execution,
+        )
         self._save(run)
+
+        if execution.returncode != 0:
+            return self._block_provider(
+                run,
+                "Terra High",
+                "policy clarification",
+                execution,
+            )
+
+        self._clear_provider(run)
         run.terra_resolution = execution.stdout or execution.stderr
-        return self._block(run, "blocked_policy_ambiguity", "policy ambiguity requires human approval")
+        return self._block(
+            run,
+            "blocked_policy_ambiguity",
+            "policy ambiguity requires human approval",
+        )
 
     def _review(self, run: WorkflowRun, purpose: str) -> ReviewResult | None:
-        run.stage = "spec_reviewing" if purpose == "specification" else "reviewing"
+        run.stage = (
+            "spec_reviewing"
+            if purpose == "specification"
+            else "reviewing"
+        )
+        label = (
+            "Specification review"
+            if purpose == "specification"
+            else "Implementation review"
+        )
+        prompt = (
+            _spec_review_prompt(run)
+            if purpose == "specification"
+            else _implementation_review_prompt(
+                run,
+                _implementation_diff(self.repo),
+            )
+        )
+        self._arm_provider(run, run.stage, prompt)
         self._save(run)
-        label = "Specification review" if purpose == "specification" else "Implementation review"
-        console.print(f"[cyan]Stage:[/cyan] {label} — Sonnet 5 High")
-        prompt = _spec_review_prompt(run) if purpose == "specification" else _implementation_review_prompt(run, _implementation_diff(self.repo))
+
+        console.print(
+            f"[cyan]Stage:[/cyan] {label} — Sonnet 5 High"
+        )
         execution = self.sonnet(prompt, self.repo)
-        _record_provider(run, purpose, "Sonnet 5 High", execution)
+        _record_provider(
+            run,
+            purpose,
+            "Sonnet 5 High",
+            execution,
+        )
         self._save(run)
+
         if execution.returncode != 0:
-            self._block(run, "blocked_provider_failure", f"Sonnet failed during {purpose} review")
+            self._block_provider(
+                run,
+                "Sonnet 5 High",
+                purpose,
+                execution,
+            )
             return None
+
         try:
             result = parse_sonnet_review(execution)
-        except Exception as exc:
-            self._block(run, "blocked_provider_failure", f"invalid Sonnet result: {exc}")
-            return None
+        except Exception:
+            retried = self._retry_structured_once(
+                run,
+                "Sonnet 5 High",
+                purpose,
+                self.sonnet,
+                parse_sonnet_review,
+            )
+            if retried is None:
+                return None
+            result = retried
+
+        self._clear_provider(run)
+
         if purpose == "specification":
             run.spec_review = result
-            run.stage = "spec_review_passed" if result.category == "PASS" else "spec_review_failed"
+            run.stage = (
+                "spec_review_passed"
+                if result.category == "PASS"
+                else "spec_review_failed"
+            )
         else:
             run.implementation_review = result
             run.stage = "implementation_reviewed"
+
         self._save(run)
         return result
 
@@ -688,29 +1014,59 @@ class Controller:
 
     def _implement(self, run: WorkflowRun, correction: bool = False) -> bool:
         run.stage = "correcting" if correction else "implementing"
-        self._save(run)
         label = "Correction" if correction else "Implementation"
-        console.print(f"[cyan]Stage:[/cyan] {label} — Luna High")
+
         prompt = _task_prompt(run)
         if correction:
             prompt += (
-                "\n\nCorrect the implementation for this review finding. Make the smallest bounded "
-                "change that addresses it; do not change policy or perform Git operations.\n"
-                + (run.implementation_review.summary if run.implementation_review else "")
+                "\n\nCorrect the implementation for this review finding. "
+                "Make the smallest bounded change that addresses it; do not "
+                "change policy or perform Git operations.\n"
+                + (
+                    run.implementation_review.summary
+                    if run.implementation_review
+                    else ""
+                )
             )
             if run.sol_guidance:
                 prompt += (
-                    "\n\nSol High escalation guidance for this bounded correction:\n"
+                    "\n\nSol High escalation guidance for this bounded "
+                    "correction:\n"
                     + run.sol_guidance
                 )
+
+        self._arm_provider(run, run.stage, prompt)
+        self._save(run)
+
+        console.print(
+            f"[cyan]Stage:[/cyan] {label} — Luna High"
+        )
         execution = self.luna(prompt, self.repo)
-        _record_provider(run, "correction" if correction else "implementation", "Luna High", execution)
+        purpose = "correction" if correction else "implementation"
+        _record_provider(
+            run,
+            purpose,
+            "Luna High",
+            execution,
+        )
         self._save(run)
-        run.stage = "correction_completed" if correction else "implementation_completed"
-        self._save(run)
+
         if execution.returncode != 0:
-            self._block(run, "blocked_provider_failure", "Luna failed during implementation")
+            self._block_provider(
+                run,
+                "Luna High",
+                purpose,
+                execution,
+            )
             return False
+
+        self._clear_provider(run)
+        run.stage = (
+            "correction_completed"
+            if correction
+            else "implementation_completed"
+        )
+        self._save(run)
         return self._verify(run)
 
     def _escalate_to_sol(
@@ -720,29 +1076,60 @@ class Controller:
         escalation_round: int,
     ) -> bool:
         run.stage = "sol_escalating"
-        self._save(run)
-        console.print("[cyan]Stage:[/cyan] Escalation diagnosis — Sol High")
-
-        execution = self.sol(
-            _sol_prompt(run, self.repo, finding_key, escalation_round),
+        prompt = _sol_prompt(
+            run,
             self.repo,
+            finding_key,
+            escalation_round,
         )
-        _record_provider(run, "escalation guidance", "Sol High", execution)
+        self._arm_provider(run, run.stage, prompt)
         self._save(run)
 
-        try:
-            kind, guidance = _parse_sol_response(execution)
-        except Exception as exc:
-            self._block(run, "blocked_provider_failure", f"invalid Sol result: {exc}")
+        console.print(
+            "[cyan]Stage:[/cyan] Escalation diagnosis — Sol High"
+        )
+        execution = self.sol(prompt, self.repo)
+        _record_provider(
+            run,
+            "escalation guidance",
+            "Sol High",
+            execution,
+        )
+        self._save(run)
+
+        if execution.returncode != 0:
+            self._block_provider(
+                run,
+                "Sol High",
+                "escalation guidance",
+                execution,
+            )
             return False
 
+        try:
+            parsed = _parse_sol_response(execution)
+        except Exception:
+            retried = self._retry_structured_once(
+                run,
+                "Sol High",
+                "escalation guidance",
+                self.sol,
+                _parse_sol_response,
+            )
+            if retried is None:
+                return False
+            parsed = retried
+
+        kind, guidance = parsed
+        self._clear_provider(run)
         run.sol_guidance = guidance
         self._save(run)
 
         if kind == "POLICY_AMBIGUITY":
             self._policy_stop(
                 run,
-                "Sol High escalation identified policy ambiguity: " + guidance,
+                "Sol High escalation identified policy ambiguity: "
+                + guidance,
             )
             return False
 
@@ -912,6 +1299,14 @@ class Controller:
     def resume(self, run_id: str) -> WorkflowRun:
         run = load_run(run_id, self.runs_dir)
         self._resume_guard(run)
+
+        if (
+            run.stage in _PROVIDER_RESUMABLE_BLOCKS
+            and run.provider_resume_stage
+            and run.provider_resume_prompt
+        ):
+            return self._resume_blocked_provider(run)
+
         if (
             run.stage in {"blocked_after_correction", "blocked_after_escalation"}
             and run.correction_cycles < MAX_TOTAL_CORRECTIONS
@@ -949,7 +1344,21 @@ class Controller:
                 "blocked_interrupted_provider",
                 "provider stage was interrupted before matching output was recorded",
             )
-        execution = ProviderExecution(record.command, record.returncode, record.stdout, record.stderr)
+        execution = ProviderExecution(
+            command=record.command,
+            returncode=record.returncode,
+            stdout=record.stdout,
+            stderr=record.stderr,
+            duration_seconds=record.duration_seconds,
+            failure_kind=record.failure_kind,
+        )
+        if execution.returncode != 0:
+            return self._block_provider(
+                run,
+                record.provider,
+                record.purpose,
+                execution,
+            )
         if run.stage == "terra_resolving":
             run.terra_resolution = execution.stdout or execution.stderr
             return self._block(run, "blocked_policy_ambiguity", "policy ambiguity requires human approval")
@@ -957,7 +1366,12 @@ class Controller:
             try:
                 kind, guidance = _parse_sol_response(execution)
             except Exception as exc:
-                return self._block(run, "blocked_provider_failure", f"invalid Sol result: {exc}")
+                return self._block_provider_output(
+                    run,
+                    "Sol High",
+                    "escalation guidance",
+                    str(exc),
+                )
             run.sol_guidance = guidance
             self._save(run)
             if kind == "POLICY_AMBIGUITY":
@@ -972,7 +1386,12 @@ class Controller:
             try:
                 result = parse_sonnet_review(execution)
             except Exception as exc:
-                return self._block(run, "blocked_provider_failure", f"invalid Sonnet result: {exc}")
+                return self._block_provider_output(
+                    run,
+                    "Sonnet 5 High",
+                    "specification",
+                    str(exc),
+                )
             run.spec_review = result
             run.stage = "spec_review_passed" if result.category == "PASS" else "spec_review_failed"
             self._save(run)
@@ -985,7 +1404,12 @@ class Controller:
             try:
                 result = parse_sonnet_review(execution)
             except Exception as exc:
-                return self._block(run, "blocked_provider_failure", f"invalid Sonnet result: {exc}")
+                return self._block_provider_output(
+                    run,
+                    "Sonnet 5 High",
+                    "implementation",
+                    str(exc),
+                )
             run.implementation_review = result
             run.stage = "implementation_reviewed"
             self._save(run)
