@@ -1,0 +1,235 @@
+{
+  "inventory_version": 1,
+  "baseline_commit": "e0f1ad9b99a127be8885f1bc2fada24aba0dc0ad",
+  "provenance": "Synthetic records derived only from committed historical model contracts. No record content came from runs/, Jobs, a provider capture, or another project.",
+  "declared_schemas": [
+    {
+      "class_id": "V1",
+      "schema_version": 1,
+      "source_commit": "aa2120cb12cbad134cefccaed04a7f5a4de1dc47",
+      "fixture": "schema_v1.json",
+      "sha256": "ccc369436485b159b09bf0e0b8fe34dbd3b48ddfd29a731b0eb637390b65bcdc",
+      "treatment": "migrate",
+      "disposition": "resume_eligibility_deferred",
+      "transition_to_next": "Add Sol guidance while preserving correction count and missing escalation evidence.",
+      "derived_cases": [
+        "minimal-by-removing-defaulted-fields",
+        "created-stage",
+        "approval-stage",
+        "correction-stage",
+        "blocked-stage"
+      ]
+    },
+    {
+      "class_id": "V2",
+      "schema_version": 2,
+      "source_commit": "b7b90deffe460c3d91cd9c57062ea627346e86e6",
+      "fixture": "schema_v2.json",
+      "sha256": "aa766b15532a836ca6f0ae1db928484315d32e3a12395320b5821ed9032c1e4c",
+      "treatment": "migrate",
+      "disposition": "resume_eligibility_deferred",
+      "transition_to_next": "Add optional finding identity without inferring escalation events.",
+      "derived_cases": [
+        "sol-guidance-present",
+        "sol-guidance-absent"
+      ]
+    },
+    {
+      "class_id": "V3",
+      "schema_version": 3,
+      "source_commit": "20d011a355c6f637529c25897d5e9631211a809e",
+      "fixture": "schema_v3.json",
+      "sha256": "4867a06a6d021e26dc4e8bac9bcd895e6bd6fb2b5c84d025b3cddb35886942d8",
+      "treatment": "migrate",
+      "disposition": "resume_eligibility_deferred",
+      "transition_to_next": "Add an empty policy-decision list while preserving absent finding keys.",
+      "derived_cases": [
+        "pass-without-finding-key",
+        "failure-with-finding-key",
+        "failure-without-finding-key"
+      ]
+    },
+    {
+      "class_id": "V4",
+      "schema_version": 4,
+      "source_commit": "2aeb003ee623fb3ee4425523d987ae1a73f1fc14",
+      "fixture": "schema_v4.json",
+      "sha256": "6460a57888f67b8bf5430788d78973e6bcabcb6742cf99f1258ca2e430d07070",
+      "treatment": "migrate",
+      "disposition": "resume_eligibility_deferred",
+      "transition_to_next": "Add optional update and provider-duration timestamps without synthesizing time.",
+      "derived_cases": [
+        "zero-policy-decisions",
+        "one-policy-decision",
+        "multiple-policy-decisions"
+      ]
+    },
+    {
+      "class_id": "V5",
+      "schema_version": 5,
+      "source_commit": "37411184c6fedd12511a72f0b82a52003d793b50",
+      "fixture": "schema_v5.json",
+      "sha256": "2913589bd275f3e385fcd1e84cb77180cd64b1eeeafceeb72503b0220466f602",
+      "treatment": "migrate",
+      "disposition": "resume_eligibility_deferred",
+      "transition_to_next": "Add provider failure/retry and resume fields without classifying historical model prose.",
+      "derived_cases": [
+        "timestamps-present",
+        "timestamps-absent",
+        "provider-duration-present",
+        "provider-duration-absent"
+      ]
+    },
+    {
+      "class_id": "V6-base",
+      "schema_version": 6,
+      "source_commit": "f7ac5ecd697d7b9df0f97fffaafc1de2cc8fc169",
+      "fixture": "schema_v6_base.json",
+      "sha256": "a9310af78910b5cdbd369ab93b046cede915ec7b004eefc99282d7ddbe6d76e3",
+      "treatment": "migrate",
+      "disposition": "resume_eligibility_deferred",
+      "transition_to_next": null,
+      "derived_cases": [
+        "saved-failure-kind",
+        "saved-provider-resume-prompt"
+      ]
+    }
+  ],
+  "schema_6_generations": [
+    {
+      "class_id": "V6-supervisor",
+      "source_commit": "fdcfa930e5570e9b667d0005a01c21a3551c5bbf",
+      "derivation": "Replace the V6-base saved failure kind with timeout or interrupted.",
+      "treatment": "compatible_when_valid",
+      "disposition": "resume_blocked"
+    },
+    {
+      "class_id": "V6-provenance",
+      "source_commit": "4a3262eda14e41c60a21b7b3d3d152dffe48a286",
+      "derivation": "Add optional failure_source and failure_code to a V6-base provider record, or preserve their absence as null evidence.",
+      "treatment": "compatible_when_valid",
+      "disposition": "resume_eligibility_deferred"
+    },
+    {
+      "class_id": "V6-writer",
+      "source_commit": "b7ca3cab3d0fef780c773ffd67903af3bd568270",
+      "derivation": "Add capability, writer fingerprints, active-writer state, and immutable recovery decisions; derive incoherent linkage by changing or removing the provider index or evidence.",
+      "treatment": "compatible_or_archive",
+      "disposition": "resume_blocked_when_incoherent"
+    },
+    {
+      "class_id": "V6-owner",
+      "source_commit": "ec7fc5828c5e6877a2b59f2f191ff05fd1396021",
+      "derivation": "Add coherent target ownership, preserve absent ownership as legacy, or derive contradictory release fields.",
+      "treatment": "compatible_or_archive",
+      "disposition": "inspection_only_when_incoherent"
+    },
+    {
+      "class_id": "V6-current",
+      "source_commit": "04a34ae90fd50b4b2da3d4400c6735be6bd0e11b",
+      "derivation": "Use schema_v6_current.json; M0.6 changed storage guarantees without changing record content.",
+      "fixture": "schema_v6_current.json",
+      "sha256": "c557de3dee7635554e3f6a621720a0a1f9507f6264a5e39e80c60f18b986fcf1",
+      "treatment": "compatible_when_valid",
+      "disposition": "resume_eligibility_deferred"
+    }
+  ],
+  "invalid_classes": [
+    {
+      "class_id": "known-version-invalid",
+      "derivations": [
+        "missing-required-field",
+        "unknown-top-level-field",
+        "unknown-nested-field",
+        "invalid-enum",
+        "invalid-type",
+        "invalid-bound",
+        "writer-link-out-of-range",
+        "writer-link-mismatch",
+        "contradictory-stage-evidence",
+        "contradictory-ownership-release"
+      ],
+      "treatment": "archive_or_unsupported",
+      "disposition": "inspection_only"
+    },
+    {
+      "class_id": "unversioned-or-invalid-version",
+      "derivations": [
+        "missing-version",
+        "null-version",
+        "boolean-version",
+        "string-version",
+        "fractional-version",
+        "zero-version",
+        "negative-version"
+      ],
+      "treatment": "unsupported",
+      "disposition": "inspection_only"
+    },
+    {
+      "class_id": "future-or-unknown-version",
+      "derivations": [
+        "unknown-past-integer",
+        "current-plus-one"
+      ],
+      "treatment": "unsupported",
+      "disposition": "inspection_only"
+    },
+    {
+      "class_id": "invalid-json-envelope",
+      "derivations": [
+        "malformed-json",
+        "truncated-json",
+        "duplicate-key",
+        "array-top-level",
+        "scalar-top-level",
+        "invalid-utf8",
+        "nan-token",
+        "infinity-token"
+      ],
+      "treatment": "unsupported",
+      "disposition": "inspection_only"
+    }
+  ],
+  "matrix_rows": [
+    "H1",
+    "H2",
+    "H3",
+    "V1",
+    "V2",
+    "V3",
+    "V4",
+    "V5",
+    "V6A",
+    "V6B",
+    "V6C",
+    "V6D",
+    "V6E",
+    "V6F",
+    "I1",
+    "I2",
+    "I3",
+    "I4",
+    "U1",
+    "U2",
+    "U3",
+    "P1",
+    "P2",
+    "A1",
+    "B1",
+    "B2",
+    "B3"
+  ],
+  "scope_boundaries": {
+    "runtime_changes": false,
+    "private_run_access": false,
+    "jobs_access": false,
+    "provider_access": false,
+    "git_subprocess_in_fixture_tests": false,
+    "compatibility_identifiers_unchanged": [
+      "jobs-orchestrator",
+      "JOBS_REPO",
+      "src/jobs_orchestrator"
+    ]
+  }
+}

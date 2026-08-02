@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "run_id": "fixture-v1",
+  "created_at": "2026-08-01T00:00:00+00:00",
+  "task_ref": "fixture-001",
+  "task_file": "tasks/fixture-001.md",
+  "task_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "specification": "Synthetic schema 1 fixture specification.",
+  "repo": {
+    "repo": "/fixture/repo",
+    "branch": "fixture-main",
+    "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "clean": false,
+    "origin": "https://example.invalid/fixture.git"
+  },
+  "stage": "blocked_after_correction",
+  "correction_cycles": 1,
+  "spec_review": {
+    "status": "PASS",
+    "category": "PASS",
+    "summary": "Synthetic specification pass."
+  },
+  "implementation_review": {
+    "status": "FAIL",
+    "category": "IMPLEMENTATION_DEFECT",
+    "summary": "Synthetic legacy defect."
+  },
+  "terra_resolution": null,
+  "changed_files": [
+    "implementation.py"
+  ],
+  "working_tree_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "verification": {
+    "passed": true
+  },
+  "provider_runs": [
+    {
+      "provider": "Sonnet 5 High",
+      "purpose": "implementation",
+      "command": [
+        "fixture-provider",
+        "review"
+      ],
+      "returncode": 0,
+      "stdout": "Synthetic schema 1 provider output.",
+      "stderr": ""
+    }
+  ],
+  "git_operations": [],
+  "commit_hash": null,
+  "commit_message": null,
+  "last_error": "Synthetic correction block."
+}

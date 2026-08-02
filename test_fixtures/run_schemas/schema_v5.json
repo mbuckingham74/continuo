@@ -1,0 +1,71 @@
+{
+  "schema_version": 5,
+  "run_id": "fixture-v5",
+  "created_at": "2026-08-01T00:05:00+00:00",
+  "updated_at": "2026-08-01T00:06:00+00:00",
+  "task_ref": "fixture-005",
+  "task_file": "tasks/fixture-005.md",
+  "task_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "specification": "Synthetic schema 5 fixture specification.",
+  "repo": {
+    "repo": "/fixture/repo",
+    "branch": "fixture-main",
+    "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "clean": false,
+    "origin": "https://example.invalid/fixture.git"
+  },
+  "stage": "awaiting_commit_approval",
+  "correction_cycles": 3,
+  "spec_review": {
+    "status": "PASS",
+    "category": "PASS",
+    "finding_key": null,
+    "summary": "Synthetic specification pass."
+  },
+  "implementation_review": {
+    "status": "PASS",
+    "category": "PASS",
+    "finding_key": null,
+    "summary": "Synthetic implementation pass."
+  },
+  "terra_resolution": null,
+  "sol_guidance": null,
+  "policy_decisions": [],
+  "changed_files": [
+    "implementation.py"
+  ],
+  "working_tree_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "verification": {
+    "passed": true
+  },
+  "provider_runs": [
+    {
+      "provider": "Sonnet 5 High",
+      "purpose": "implementation",
+      "command": [
+        "fixture-provider",
+        "review"
+      ],
+      "returncode": 0,
+      "stdout": "Synthetic schema 5 provider output.",
+      "stderr": "",
+      "duration_seconds": 1.25
+    },
+    {
+      "provider": "Luna High",
+      "purpose": "implementation",
+      "command": [
+        "fixture-provider",
+        "write"
+      ],
+      "returncode": 0,
+      "stdout": "Synthetic schema 5 writer output.",
+      "stderr": "",
+      "duration_seconds": null
+    }
+  ],
+  "git_operations": [],
+  "commit_hash": null,
+  "commit_message": null,
+  "last_error": null
+}

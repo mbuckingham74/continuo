@@ -1,0 +1,56 @@
+{
+  "schema_version": 3,
+  "run_id": "fixture-v3",
+  "created_at": "2026-08-01T00:02:00+00:00",
+  "task_ref": "fixture-003",
+  "task_file": "tasks/fixture-003.md",
+  "task_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "specification": "Synthetic schema 3 fixture specification.",
+  "repo": {
+    "repo": "/fixture/repo",
+    "branch": "fixture-main",
+    "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "clean": false,
+    "origin": "https://example.invalid/fixture.git"
+  },
+  "stage": "blocked_repeated_finding",
+  "correction_cycles": 3,
+  "spec_review": {
+    "status": "PASS",
+    "category": "PASS",
+    "finding_key": null,
+    "summary": "Synthetic specification pass."
+  },
+  "implementation_review": {
+    "status": "FAIL",
+    "category": "IMPLEMENTATION_DEFECT",
+    "finding_key": "synthetic-persistent-defect",
+    "summary": "Synthetic repeated defect."
+  },
+  "terra_resolution": null,
+  "sol_guidance": "Synthetic read-only escalation guidance.",
+  "changed_files": [
+    "implementation.py"
+  ],
+  "working_tree_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "verification": {
+    "passed": true
+  },
+  "provider_runs": [
+    {
+      "provider": "Sonnet 5 High",
+      "purpose": "implementation",
+      "command": [
+        "fixture-provider",
+        "review"
+      ],
+      "returncode": 0,
+      "stdout": "Synthetic schema 3 provider output.",
+      "stderr": ""
+    }
+  ],
+  "git_operations": [],
+  "commit_hash": null,
+  "commit_message": null,
+  "last_error": "Synthetic repeated-finding block."
+}

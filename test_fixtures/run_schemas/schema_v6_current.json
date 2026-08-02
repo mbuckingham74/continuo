@@ -1,0 +1,137 @@
+{
+  "schema_version": 6,
+  "run_id": "fixture-v6-current",
+  "created_at": "2026-08-02T00:00:00+00:00",
+  "updated_at": "2026-08-02T00:01:00+00:00",
+  "task_ref": "fixture-006-current",
+  "task_file": "tasks/fixture-006-current.md",
+  "task_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "specification": "Synthetic current schema 6 fixture specification.",
+  "repo": {
+    "repo": "/fixture/repo",
+    "branch": "fixture-main",
+    "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "clean": false,
+    "origin": "https://example.invalid/fixture.git"
+  },
+  "stage": "blocked_writer_partial_changes",
+  "correction_cycles": 1,
+  "spec_review": {
+    "status": "PASS",
+    "category": "PASS",
+    "finding_key": null,
+    "summary": "Synthetic specification pass."
+  },
+  "implementation_review": {
+    "status": "FAIL",
+    "category": "IMPLEMENTATION_DEFECT",
+    "finding_key": "synthetic-current-defect",
+    "summary": "Synthetic current defect."
+  },
+  "terra_resolution": "Synthetic policy recommendation.",
+  "sol_guidance": "Synthetic escalation guidance.",
+  "policy_decisions": [
+    {
+      "decision_id": "fixture-policy-current",
+      "approved_at": "2026-08-02T00:00:30+00:00",
+      "approved_by": "human",
+      "source_provider": "Terra High",
+      "trigger_finding_key": "POLICY",
+      "trigger_summary": "Synthetic policy ambiguity.",
+      "recommendation": "Synthetic policy recommendation.",
+      "approved_text": "Synthetic approved policy text."
+    }
+  ],
+  "provider_resume_stage": null,
+  "provider_resume_prompt": null,
+  "target_ownership": {
+    "target_key": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "canonical_repo": "/fixture/repo",
+    "device": 100,
+    "inode": 200,
+    "acquired_at": "2026-08-02T00:00:10+00:00",
+    "released_at": null,
+    "release_reason": null,
+    "release_note": null
+  },
+  "active_writer_attempt": {
+    "attempt_id": "fixture-writer-current",
+    "stage": "implementing",
+    "purpose": "implementation",
+    "pre_fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "pre_changed_files": [],
+    "post_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "post_changed_files": [
+      "implementation.py"
+    ],
+    "inspection_error": null,
+    "provider_record_index": 1
+  },
+  "writer_recovery_decisions": [
+    {
+      "decision_id": "fixture-recovery-current",
+      "decided_at": "2026-08-02T00:00:20+00:00",
+      "action": "retry_restored",
+      "note": "Synthetic exact-restoration decision.",
+      "writer_attempt_id": "fixture-writer-previous",
+      "stage": "implementing",
+      "purpose": "implementation",
+      "pre_fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "saved_post_fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "observed_fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "observed_changed_files": []
+    }
+  ],
+  "changed_files": [
+    "implementation.py"
+  ],
+  "working_tree_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "verification": {
+    "passed": false,
+    "reason": "Synthetic writer failure."
+  },
+  "provider_runs": [
+    {
+      "provider": "Sonnet 5 High",
+      "purpose": "specification",
+      "command": [
+        "fixture-provider",
+        "review"
+      ],
+      "returncode": 0,
+      "stdout": "Synthetic current review output.",
+      "stderr": "",
+      "duration_seconds": 1.0,
+      "failure_kind": null,
+      "failure_source": null,
+      "failure_code": null,
+      "capability": "read_only",
+      "repository_fingerprint_before": null,
+      "repository_fingerprint_after": null,
+      "retry_scheduled": false
+    },
+    {
+      "provider": "Luna High",
+      "purpose": "implementation",
+      "command": [
+        "fixture-provider",
+        "write"
+      ],
+      "returncode": 1,
+      "stdout": "Synthetic current writer output.",
+      "stderr": "fixture provider failure diagnostic",
+      "duration_seconds": 2.0,
+      "failure_kind": "provider_error",
+      "failure_source": "returncode",
+      "failure_code": null,
+      "capability": "workspace_write",
+      "repository_fingerprint_before": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "repository_fingerprint_after": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "retry_scheduled": false
+    }
+  ],
+  "git_operations": [],
+  "commit_hash": null,
+  "commit_message": null,
+  "last_error": "Synthetic partial-writer block."
+}

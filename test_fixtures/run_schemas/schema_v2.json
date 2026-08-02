@@ -1,0 +1,54 @@
+{
+  "schema_version": 2,
+  "run_id": "fixture-v2",
+  "created_at": "2026-08-01T00:01:00+00:00",
+  "task_ref": "fixture-002",
+  "task_file": "tasks/fixture-002.md",
+  "task_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "specification": "Synthetic schema 2 fixture specification.",
+  "repo": {
+    "repo": "/fixture/repo",
+    "branch": "fixture-main",
+    "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "clean": false,
+    "origin": "https://example.invalid/fixture.git"
+  },
+  "stage": "blocked_after_escalation",
+  "correction_cycles": 2,
+  "spec_review": {
+    "status": "PASS",
+    "category": "PASS",
+    "summary": "Synthetic specification pass."
+  },
+  "implementation_review": {
+    "status": "FAIL",
+    "category": "IMPLEMENTATION_DEFECT",
+    "summary": "Synthetic escalated defect."
+  },
+  "terra_resolution": null,
+  "sol_guidance": "Synthetic read-only escalation guidance.",
+  "changed_files": [
+    "implementation.py"
+  ],
+  "working_tree_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "verification": {
+    "passed": true
+  },
+  "provider_runs": [
+    {
+      "provider": "Sol High",
+      "purpose": "escalation guidance",
+      "command": [
+        "fixture-provider",
+        "advise"
+      ],
+      "returncode": 0,
+      "stdout": "Synthetic schema 2 provider output.",
+      "stderr": ""
+    }
+  ],
+  "git_operations": [],
+  "commit_hash": null,
+  "commit_message": null,
+  "last_error": "Synthetic escalation block."
+}

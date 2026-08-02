@@ -1,0 +1,49 @@
+{
+  "schema_version": 6,
+  "run_id": "fixture-v6-base",
+  "created_at": "2026-08-01T00:07:00+00:00",
+  "updated_at": "2026-08-01T00:08:00+00:00",
+  "task_ref": "fixture-006",
+  "task_file": "tasks/fixture-006.md",
+  "task_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "specification": "Synthetic base schema 6 fixture specification.",
+  "repo": {
+    "repo": "/fixture/repo",
+    "branch": "fixture-main",
+    "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "clean": true,
+    "origin": "https://example.invalid/fixture.git"
+  },
+  "stage": "blocked_provider_quota",
+  "correction_cycles": 0,
+  "spec_review": null,
+  "implementation_review": null,
+  "terra_resolution": null,
+  "sol_guidance": null,
+  "policy_decisions": [],
+  "provider_resume_stage": "spec_reviewing",
+  "provider_resume_prompt": "Synthetic saved read-only review prompt.",
+  "changed_files": [],
+  "working_tree_fingerprint": null,
+  "verification": {},
+  "provider_runs": [
+    {
+      "provider": "Sonnet 5 High",
+      "purpose": "specification",
+      "command": [
+        "fixture-provider",
+        "review"
+      ],
+      "returncode": 1,
+      "stdout": "Synthetic schema 6 model output.",
+      "stderr": "fixture provider quota diagnostic",
+      "duration_seconds": 2.5,
+      "failure_kind": "quota",
+      "retry_scheduled": false
+    }
+  ],
+  "git_operations": [],
+  "commit_hash": null,
+  "commit_message": null,
+  "last_error": "Synthetic provider quota block."
+}
