@@ -10,6 +10,8 @@
 
 This document organizes two external analyses against the current repository and records which recommendations are accepted, revised, deferred, rejected, or still need evidence. It is the decision layer between raw ideas and implementation tickets.
 
+Execution progress is tracked in [EXECUTION_PLAN.md](EXECUTION_PLAN.md). This roadmap remains authoritative; the tracker translates its priorities and dependencies into review gates and must be reconciled if the two documents diverge.
+
 Preserved source material:
 
 - [Critical-fixes intake](planning/2026-08-01-critical-fixes-intake.md)
@@ -595,6 +597,6 @@ These questions should become ADRs or time-boxed spikes, not implicit implementa
 
 ## 13. Next planning action
 
-Convert Milestone 0 into six bounded task specifications, starting with M0.1 and M0.2 but designing M0.2–M0.4 together around one provider-attempt lifecycle. Each task should receive an adversarial test plan before implementation begins.
+Review and approve [EXECUTION_PLAN.md](EXECUTION_PLAN.md), then convert Milestone 0 into six bounded task specifications, starting with M0.1 and M0.2 but designing M0.2–M0.4 together around one provider-attempt lifecycle. Each task should receive an adversarial test plan before implementation begins.
 
 After Milestone 0 is specified, decide whether the next planning session focuses on the persistence-contract ADR (Milestone 1) or the first generic configuration schema (Milestone 2). Do not begin UI or queue implementation first.

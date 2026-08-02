@@ -296,6 +296,8 @@ The generalization path centers on preserving the existing safety invariants whi
 
 See the [validated stabilization and enhancement roadmap](docs/ENGINE_ROADMAP.md) for triaged priorities and corrected sequencing. The [full architecture roadmap](docs/ORCHESTRATION_ENGINE.md#22-future-generalization-architecture) describes the broader proposed abstractions and invariants.
 
+Implementation progress and the gated transition from the Jobs compatibility profile to a reusable engine are tracked in the [Continuo execution plan](docs/EXECUTION_PLAN.md).
+
 ## Guiding invariants
 
 As the engine becomes reusable, these properties should remain non-negotiable:
