@@ -355,7 +355,7 @@ baseline for extraction. No live Jobs pilot occurs in this gate.
   - Publication evidence (2026-08-02): commit
     `4a3262eda14e41c60a21b7b3d3d152dffe48a286` (`Normalize provider failure
     evidence`) was pushed directly to `origin/main` with all 59 tests passing.
-- [~] **M0.4 / A-1:** make the provider-attempt lifecycle capability-aware; allow
+- [x] **M0.4 / A-1:** make the provider-attempt lifecycle capability-aware; allow
   bounded read-only retry while blocking uncertain write-capable recovery when
   partial changes exist.
   - Planning evidence (2026-08-02): the draft bounded execution note and
@@ -398,9 +398,16 @@ baseline for extraction. No live Jobs pilot occurs in this gate.
     `JOBS_REPO` and `src/jobs_orchestrator` remain intact. All ten authoritative
     local Markdown links/anchors and all 39 ordered M0.4 matrix rows validate;
     Python compilation, documentation checks, and `git diff --check` pass. No
-    live provider or external target was invoked and no commit or push was made.
-    The complete implementation diff remains uncommitted pending repository-owner
-    review, so M0.4 stays in progress.
+    live provider or external target was invoked during implementation or
+    validation.
+  - Review decision (2026-08-02): the repository owner approved the complete
+    seven-file implementation diff and explicitly authorized commit, direct push
+    to `origin/main`, and this tracker update. M0.4 is complete; M0.5 remains a
+    separate bounded item.
+  - Publication evidence (2026-08-02): implementation commit
+    `b7ca3cab3d0fef780c773ffd67903af3bd568270` (`Make writer recovery
+    capability-aware`) was pushed directly to `origin/main` with all 75 tests
+    passing.
 - [ ] **M0.5 / Q-2:** enforce one active run per canonical target and test clean
   release, crash recovery, stale ownership, and approval-pending ownership.
 - [ ] **M0.6 / Q-6:** make run storage private by default and define explicit
