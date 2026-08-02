@@ -53,6 +53,7 @@ class ProviderExecution:
     returncode: int
     stdout: str = ""
     stderr: str = ""
+    duration_seconds: float | None = None
 
 
 def build_sonnet_command(prompt: str) -> list[str]:
@@ -198,6 +199,7 @@ def _run(command: list[str], repo: Path, runner: Callable[..., subprocess.Comple
         returncode=result.returncode,
         stdout=result.stdout,
         stderr=result.stderr,
+        duration_seconds=elapsed,
     )
 
 

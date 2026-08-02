@@ -56,6 +56,7 @@ class ProviderRecord(BaseModel):
     returncode: int
     stdout: str = ""
     stderr: str = ""
+    duration_seconds: float | None = Field(default=None, ge=0)
 
 
 class GitRecord(BaseModel):
@@ -86,9 +87,10 @@ class WorkflowRun(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 4
+    schema_version: int = 5
     run_id: str
     created_at: str
+    updated_at: str | None = None
     task_ref: str
     task_file: str
     task_sha256: str

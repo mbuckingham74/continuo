@@ -355,6 +355,56 @@ class ControllerTests(unittest.TestCase):
             "Remote-role scope is positive evidence for remote reality.",
         )
 
+    def test_provider_timing_and_run_report_are_derived_safely(self) -> None:
+        run = self.controller(
+            self.passing_sonnet,
+            approval=lambda prompt: False,
+        ).new_run("009")
+
+        run.provider_runs = []
+        run.created_at = "2026-08-01T12:00:00+00:00"
+        run.updated_at = "2026-08-01T12:01:30+00:00"
+
+        orchestrator._record_provider(
+            run,
+            "implementation",
+            "Luna High",
+            ProviderExecution(
+                command=["codex"],
+                returncode=0,
+                stdout="implemented",
+                stderr="",
+                duration_seconds=12.5,
+            ),
+        )
+        orchestrator._record_provider(
+            run,
+            "implementation",
+            "Sonnet 5 High",
+            ProviderExecution(
+                command=["claude"],
+                returncode=0,
+                stdout="legacy review output",
+                stderr="",
+            ),
+        )
+
+        report = orchestrator._run_report(run)
+
+        self.assertEqual(report["provider_calls_total"], 2)
+        self.assertEqual(report["provider_counts"]["Luna High"], 1)
+        self.assertEqual(report["provider_counts"]["Sonnet 5 High"], 1)
+        self.assertAlmostEqual(report["provider_seconds"]["Luna High"], 12.5)
+        self.assertEqual(report["untimed_counts"]["Sonnet 5 High"], 1)
+        self.assertEqual(report["verification_runs"], 1)
+        self.assertEqual(report["wall_seconds"], 90.0)
+
+        self.assertEqual(
+            run.provider_runs[0].duration_seconds,
+            12.5,
+        )
+
+
     def test_commit_prompt_defaults_to_no(self) -> None:
         prompts = []
 

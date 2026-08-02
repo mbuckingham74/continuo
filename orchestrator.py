@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -154,6 +155,7 @@ def _record_provider(run: WorkflowRun, purpose: str, provider: str, execution: P
             returncode=execution.returncode,
             stdout=execution.stdout,
             stderr=execution.stderr,
+            duration_seconds=execution.duration_seconds,
         )
     )
 
@@ -168,6 +170,162 @@ def _record_git(run: WorkflowRun, operation: str, result: subprocess.CompletedPr
             stderr=result.stderr,
         )
     )
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "unavailable"
+    total = max(0, int(round(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def _report_review_history(run: WorkflowRun) -> list[ReviewResult]:
+    history: list[ReviewResult] = []
+    for record in run.provider_runs:
+        if record.provider != "Sonnet 5 High" or record.purpose != "implementation":
+            continue
+        execution = ProviderExecution(
+            command=record.command,
+            returncode=record.returncode,
+            stdout=record.stdout,
+            stderr=record.stderr,
+            duration_seconds=record.duration_seconds,
+        )
+        try:
+            history.append(parse_sonnet_review(execution))
+        except Exception:
+            continue
+    return history
+
+
+def _run_report(run: WorkflowRun) -> dict[str, object]:
+    provider_counts = Counter(record.provider for record in run.provider_runs)
+    provider_seconds: Counter[str] = Counter()
+    untimed_counts: Counter[str] = Counter()
+
+    for record in run.provider_runs:
+        if record.duration_seconds is None:
+            untimed_counts[record.provider] += 1
+        else:
+            provider_seconds[record.provider] += record.duration_seconds
+
+    reviews = _report_review_history(run)
+    defect_keys = {
+        _finding_key(review)
+        for review in reviews
+        if review.category not in {"PASS", "POLICY_AMBIGUITY"}
+    }
+
+    verification_runs = sum(
+        1
+        for record in run.provider_runs
+        if record.provider == "Luna High"
+        and record.purpose in {"implementation", "correction"}
+        and record.returncode == 0
+    )
+
+    wall_seconds: float | None = None
+    if run.updated_at:
+        try:
+            created = datetime.fromisoformat(run.created_at)
+            updated = datetime.fromisoformat(run.updated_at)
+            wall_seconds = max(0.0, (updated - created).total_seconds())
+        except ValueError:
+            pass
+
+    pushed = any(
+        record.operation == "push" and record.returncode == 0
+        for record in run.git_operations
+    )
+
+    return {
+        "provider_counts": dict(provider_counts),
+        "provider_seconds": dict(provider_seconds),
+        "untimed_counts": dict(untimed_counts),
+        "provider_seconds_total": sum(provider_seconds.values()),
+        "provider_calls_total": len(run.provider_runs),
+        "wall_seconds": wall_seconds,
+        "corrections": run.correction_cycles,
+        "distinct_defects": len(defect_keys),
+        "sol_escalations": provider_counts.get("Sol High", 0),
+        "policy_decisions": len(run.policy_decisions),
+        "verification_runs": verification_runs,
+        "final_review": (
+            run.implementation_review.status
+            if run.implementation_review is not None
+            else None
+        ),
+        "committed": run.commit_hash is not None,
+        "commit_hash": run.commit_hash,
+        "pushed": pushed,
+    }
+
+
+def _print_run_report(run: WorkflowRun) -> None:
+    report = _run_report(run)
+
+    console.print(f"\n[bold]Run {run.run_id} — {run.stage}[/bold]")
+    console.print(
+        "Wall-clock span: "
+        + _format_duration(report["wall_seconds"])
+    )
+
+    total_calls = int(report["provider_calls_total"])
+    console.print(f"Provider calls: {total_calls}")
+
+    counts = report["provider_counts"]
+    seconds = report["provider_seconds"]
+    untimed = report["untimed_counts"]
+    preferred = ("Luna High", "Sonnet 5 High", "Sol High", "Terra High")
+    providers = list(preferred)
+    providers.extend(
+        provider for provider in counts
+        if provider not in providers
+    )
+
+    for provider in providers:
+        count = counts.get(provider, 0)
+        if not count:
+            continue
+        timed = seconds.get(provider, 0.0)
+        legacy = untimed.get(provider, 0)
+        timing = _format_duration(timed) if timed else "no recorded timing"
+        suffix = f"; {legacy} untimed legacy" if legacy else ""
+        console.print(f"  {provider}: {count} call(s), {timing}{suffix}")
+
+    total_timed = float(report["provider_seconds_total"])
+    total_untimed = sum(untimed.values())
+    provider_time = _format_duration(total_timed) if total_timed else "no recorded timing"
+    legacy_suffix = f" ({total_untimed} untimed legacy call(s))" if total_untimed else ""
+    console.print(f"Provider time: {provider_time}{legacy_suffix}")
+
+    console.print(f"Corrections: {report['corrections']}")
+    console.print(f"Distinct defects: {report['distinct_defects']}")
+    console.print(f"Sol escalations: {report['sol_escalations']}")
+    console.print(f"Verification runs: {report['verification_runs']}")
+
+    console.print(f"Policy decisions: {report['policy_decisions']}")
+    for decision in run.policy_decisions:
+        text = " ".join(decision.approved_text.split())
+        if len(text) > 110:
+            text = text[:107] + "..."
+        console.print(f"  {decision.decision_id}: {text}")
+
+    final_review = report["final_review"] or "not available"
+    console.print(f"Final review: {final_review}")
+
+    if report["committed"]:
+        console.print(f"Git commit: {report['commit_hash']}")
+    else:
+        console.print("Git commit: not made")
+
+    console.print(f"Git push: {'completed' if report['pushed'] else 'not completed'}")
 
 
 def _task_prompt(run: WorkflowRun) -> str:
@@ -397,6 +555,8 @@ class Controller:
         self.approval = approval or (lambda prompt: typer.confirm(prompt, default=False))
 
     def _save(self, run: WorkflowRun) -> None:
+        run.schema_version = 5
+        run.updated_at = datetime.now(timezone.utc).isoformat()
         persist(run, self.runs_dir)
 
     def approve_policy(self, run_id: str, approved_text: str) -> WorkflowRun:
@@ -460,6 +620,7 @@ class Controller:
         run.last_error = message
         self._save(run)
         console.print(f"[red]BLOCKED:[/red] {message}")
+        _print_run_report(run)
         return run
 
     def _policy_stop(self, run: WorkflowRun, reason: str) -> WorkflowRun:
@@ -637,6 +798,7 @@ class Controller:
     def _approval_gates(self, run: WorkflowRun) -> WorkflowRun:
         self._resume_guard(run)
         if run.stage in {"awaiting_commit_approval", "commit_declined"}:
+            _print_run_report(run)
             console.print("\n[cyan]Commit approval gate[/cyan]")
             console.print("Changed files: " + ", ".join(run.changed_files))
             if run.implementation_review:
@@ -675,6 +837,7 @@ class Controller:
             run.stage = "pushed_awaiting_merge"
             self._save(run)
             console.print("Pushed. Merge remains a separate manual/future gate.")
+            _print_run_report(run)
         return run
 
     def new_run(self, task_ref: str) -> WorkflowRun:
@@ -930,6 +1093,18 @@ def approve_policy_command(
 
         result = controller.resume(run_id)
         console.print(f"Run {result.run_id}: {result.stage}")
+
+    _handle_error(action)
+
+
+@app.command()
+def report(
+    run_id: str = typer.Argument(..., help="Saved run id."),
+) -> None:
+    """Show a concise orchestration audit and timing report."""
+
+    def action() -> None:
+        _print_run_report(load_run(run_id))
 
     _handle_error(action)
 
