@@ -251,6 +251,7 @@ class Controller:
     def _policy_stop(self, run: WorkflowRun, reason: str) -> WorkflowRun:
         run.stage = "terra_resolving"
         self._save(run)
+        console.print("[cyan]Stage:[/cyan] Policy clarification — Terra High")
         execution = self.terra(_terra_prompt(run, reason), self.repo)
         _record_provider(run, "policy clarification", "Terra High", execution)
         self._save(run)
@@ -260,6 +261,8 @@ class Controller:
     def _review(self, run: WorkflowRun, purpose: str) -> ReviewResult | None:
         run.stage = "spec_reviewing" if purpose == "specification" else "reviewing"
         self._save(run)
+        label = "Specification review" if purpose == "specification" else "Implementation review"
+        console.print(f"[cyan]Stage:[/cyan] {label} — Sonnet 5 High")
         prompt = _spec_review_prompt(run) if purpose == "specification" else _implementation_review_prompt(run, _implementation_diff(self.repo))
         execution = self.sonnet(prompt, self.repo)
         _record_provider(run, purpose, "Sonnet 5 High", execution)
@@ -284,6 +287,7 @@ class Controller:
     def _verify(self, run: WorkflowRun) -> bool:
         run.stage = "verifying"
         self._save(run)
+        console.print("[cyan]Stage:[/cyan] Deterministic verification")
         current = repo_state(self.repo)
         checks: dict[str, object] = {
             "branch_matches": current.branch == run.repo.branch,
@@ -310,6 +314,8 @@ class Controller:
     def _implement(self, run: WorkflowRun, correction: bool = False) -> bool:
         run.stage = "correcting" if correction else "implementing"
         self._save(run)
+        label = "Correction" if correction else "Implementation"
+        console.print(f"[cyan]Stage:[/cyan] {label} — Luna High")
         prompt = _task_prompt(run)
         if correction:
             prompt += (

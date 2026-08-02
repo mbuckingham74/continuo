@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -104,14 +106,75 @@ def build_luna_command(prompt: str) -> list[str]:
     ]
 
 
+def _provider_label(command: list[str]) -> str:
+    if "gpt-5.6-luna" in command:
+        return "Luna High"
+    if "gpt-5.6-terra" in command:
+        return "Terra High"
+    if command and Path(command[0]).name == "claude":
+        return "Sonnet 5 High"
+    return Path(command[0]).name if command else "provider"
+
+
 def _run(command: list[str], repo: Path, runner: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> ProviderExecution:
-    result = runner(
-        command,
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=False,
+    label = _provider_label(command)
+    started = time.monotonic()
+    interactive = sys.stderr.isatty()
+
+    print(f"▶ {label} started", file=sys.stderr, flush=True)
+
+    if runner is not subprocess.run:
+        result = runner(
+            command,
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    else:
+        process = subprocess.Popen(
+            command,
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        frames = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+        frame = 0
+        next_heartbeat = 5.0
+
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                elapsed = time.monotonic() - started
+                if elapsed >= next_heartbeat:
+                    print(
+                        f"… {label} still running ({elapsed:0.0f}s)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    next_heartbeat += 5.0
+
+        result = subprocess.CompletedProcess(
+            command,
+            process.returncode,
+            stdout,
+            stderr,
+        )
+
+    elapsed = time.monotonic() - started
+    if interactive:
+        print("\r\033[2K", end="", file=sys.stderr)
+
+    mark = "✓" if result.returncode == 0 else "✗"
+    print(
+        f"{mark} {label} finished in {elapsed:0.1f}s (exit {result.returncode})",
+        file=sys.stderr,
+        flush=True,
     )
+
     return ProviderExecution(
         command=command,
         returncode=result.returncode,
