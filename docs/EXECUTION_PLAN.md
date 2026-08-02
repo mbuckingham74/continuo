@@ -1857,6 +1857,9 @@ renaming control identities.
     nine-file implementation diff and explicitly authorized commit, direct push
     to `origin/main`, and this tracker update. Gate 2.2 is complete; the stable-
     identity item remains separate and unchecked.
+  - Publication evidence (2026-08-02): implementation commit
+    `bccde195db42f9497a489e8e51c262aa4e2f0d54` (`Add explicit run schema
+    migrations`) was pushed directly to `origin/main` with all 123 tests passing.
 - [ ] Replace display labels in control flow with separate stable role, provider
   adapter, route, and model/display identities.
 - [ ] Persist immutable parsed review records linked to raw attempts; make
