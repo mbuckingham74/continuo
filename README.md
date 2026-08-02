@@ -7,7 +7,7 @@ Continuo is an early-stage controller for coordinating specialized AI roles thro
 The engine is designed around a simple principle: **models do the probabilistic work; deterministic code controls the workflow**. Providers can implement, review, diagnose, and recommend, but they cannot decide their own authority, silently change roles, bypass correction limits, or publish repository changes.
 
 > [!IMPORTANT]
-> The current code is a working Jobs-specific reference implementation, not yet a project-agnostic framework. Repository conventions, provider commands, model names, and role labels are still hard-coded. The architecture deliberately documents these as implementation details to be replaced with role-based configuration and adapters.
+> The current code is a working Jobs-specific reference implementation, not yet a project-agnostic framework. Repository conventions, provider commands, and the stable role/route catalog are still hard-coded. The architecture deliberately documents these as implementation details to be replaced with configuration and adapters.
 
 For the complete behavioral reference and generalization roadmap, read [docs/ORCHESTRATION_ENGINE.md](docs/ORCHESTRATION_ENGINE.md).
 
@@ -31,6 +31,7 @@ This controller moves those decisions into inspectable Python. It provides:
 - stable finding identities and bounded correction loops;
 - hard stops for policy ambiguity and provider/account failures;
 - no automatic cross-provider fallback;
+- stable role, provider-adapter, route, model, display, and operation identities;
 - recoverable, persisted workflow stages;
 - working-tree fingerprints and resume guards;
 - separate human approval for policy, commit, and push;
@@ -48,7 +49,7 @@ tasks/<task-ref>-*.md
 
 For example, task `009` must resolve to exactly one file such as `tasks/009-example.md`. The controller persists the specification and its SHA-256, coordinates the run, and stores local run state under `runs/`.
 
-The controller and its safety behavior are implemented and covered by 123 unit tests. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
+The controller and its safety behavior are implemented and covered by 135 unit tests. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
 
 ## How it works
 
@@ -307,7 +308,7 @@ Using uv's supported `UV_NO_EDITABLE=1` mode avoids that platform failure. The
 compatibility package resolves the local checkout from installed direct-URL
 metadata, so `uv run jobs-orchestrator` remains the same command in that mode.
 
-The 123 tests exercise temporary repositories, committed synthetic historical
+The 135 tests exercise temporary repositories, committed synthetic historical
 run fixtures, recorded sanitized provider fixtures, fake
 providers, and real local child/grandchild processes. They cover preflight
 safety, task resolution, correction budgets, repeat-finding escalation, policy
@@ -318,8 +319,9 @@ process cleanup, timeout/interruption output, sandbox command construction,
 target identity, cross-controller mutex contention, durable ownership, clean
 release, stale/corrupt coordination recovery, reporting, Git approval defaults,
 strict schema dispatch, adjacent migrations, audit preservation, rollback and
-concurrency boundaries, and adversarial Git change parsing, fingerprinting,
-persistence, recovery, and staging behavior.
+concurrency boundaries, stable provider identities, display-name independence,
+and adversarial Git change parsing, fingerprinting, persistence, recovery, and
+staging behavior.
 
 Before committing changes, also check the diff:
 

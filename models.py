@@ -1,26 +1,90 @@
 """Persistent data models used by the orchestration controller."""
 
-from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-CURRENT_RUN_SCHEMA_VERSION = 7
+CURRENT_RUN_SCHEMA_VERSION = 8
 OLDEST_MIGRATABLE_RUN_SCHEMA_VERSION = 1
 
 
-@dataclass(frozen=True)
-class ModelRoute:
-    role: str
-    cli: str
-    model: str
+OrchestrationRole = Literal[
+    "implementation",
+    "adversarial_review",
+    "escalation_executive",
+    "policy_authority",
+]
+ProviderOperation = Literal[
+    "implementation_write",
+    "correction_write",
+    "specification_review",
+    "implementation_review",
+    "escalation_guidance",
+    "policy_clarification",
+]
+ProviderAdapterId = Literal["codex_cli", "claude_cli"]
 
 
-TERRA = ModelRoute("architecture/policy", "codex", "gpt-5.6-terra")
-SOL = ModelRoute("escalation-executive", "codex", "gpt-5.6-sol")
-LUNA = ModelRoute("implementation", "codex", "gpt-5.6-luna")
-SONNET = ModelRoute("adversarial-review", "claude", "sonnet")
+class ProviderRouteIdentity(BaseModel):
+    """Stable control identity plus presentation metadata for one route."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    role_id: OrchestrationRole
+    provider_adapter_id: ProviderAdapterId
+    route_id: str = Field(min_length=1, max_length=120)
+    model_id: str = Field(min_length=1, max_length=240)
+    display_name: str = Field(min_length=1, max_length=120)
+
+
+IMPLEMENTATION_ROUTE = ProviderRouteIdentity(
+    role_id="implementation",
+    provider_adapter_id="codex_cli",
+    route_id="builtin.implementation.v1",
+    model_id="gpt-5.6-luna",
+    display_name="Luna High",
+)
+ADVERSARIAL_REVIEW_ROUTE = ProviderRouteIdentity(
+    role_id="adversarial_review",
+    provider_adapter_id="claude_cli",
+    route_id="builtin.adversarial_review.v1",
+    model_id="sonnet",
+    display_name="Sonnet 5 High",
+)
+ESCALATION_EXECUTIVE_ROUTE = ProviderRouteIdentity(
+    role_id="escalation_executive",
+    provider_adapter_id="codex_cli",
+    route_id="builtin.escalation_executive.v1",
+    model_id="gpt-5.6-sol",
+    display_name="Sol High",
+)
+POLICY_AUTHORITY_ROUTE = ProviderRouteIdentity(
+    role_id="policy_authority",
+    provider_adapter_id="codex_cli",
+    route_id="builtin.policy_authority.v1",
+    model_id="gpt-5.6-terra",
+    display_name="Terra High",
+)
+
+ROUTE_IDENTITIES: dict[OrchestrationRole, ProviderRouteIdentity] = {
+    route.role_id: route
+    for route in (
+        IMPLEMENTATION_ROUTE,
+        ADVERSARIAL_REVIEW_ROUTE,
+        ESCALATION_EXECUTIVE_ROUTE,
+        POLICY_AUTHORITY_ROUTE,
+    )
+}
+
+OPERATION_ROLES: dict[ProviderOperation, OrchestrationRole] = {
+    "implementation_write": "implementation",
+    "correction_write": "implementation",
+    "specification_review": "adversarial_review",
+    "implementation_review": "adversarial_review",
+    "escalation_guidance": "escalation_executive",
+    "policy_clarification": "policy_authority",
+}
 
 
 ReviewStatus = Literal["PASS", "FAIL"]
@@ -84,7 +148,7 @@ RunMigrationDisposition = Literal[
     "resume_blocked",
     "inspection_only",
 ]
-RunStructuralClass = Literal[
+LegacyRunStructuralClass = Literal[
     "V1",
     "V2",
     "V3",
@@ -97,6 +161,20 @@ RunStructuralClass = Literal[
     "V6-owner",
     "V6-current",
 ]
+RunStructuralClass = Literal[
+    "V1",
+    "V2",
+    "V3",
+    "V4",
+    "V5",
+    "V6-base",
+    "V6-supervisor",
+    "V6-provenance",
+    "V6-writer",
+    "V6-owner",
+    "V6-current",
+    "V7",
+]
 
 
 class RunMigrationAudit(BaseModel):
@@ -106,8 +184,24 @@ class RunMigrationAudit(BaseModel):
 
     migration_id: str = Field(min_length=1, max_length=64)
     migrated_at: str
+    source_schema_version: int = Field(ge=1, lt=7)
+    target_schema_version: Literal[7] = 7
+    source_structural_class: LegacyRunStructuralClass
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    applied_steps: tuple[str, ...] = Field(min_length=1, strict=False)
+    reason_codes: tuple[str, ...] = Field(default_factory=tuple, strict=False)
+    disposition: RunMigrationDisposition
+
+
+class IdentityMigrationAudit(BaseModel):
+    """Immutable provenance for the explicit stable-identity migration."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    migration_id: str = Field(min_length=1, max_length=64)
+    migrated_at: str
     source_schema_version: int = Field(ge=1, lt=CURRENT_RUN_SCHEMA_VERSION)
-    target_schema_version: Literal[7] = CURRENT_RUN_SCHEMA_VERSION
+    target_schema_version: Literal[8] = CURRENT_RUN_SCHEMA_VERSION
     source_structural_class: RunStructuralClass
     source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     applied_steps: tuple[str, ...] = Field(min_length=1, strict=False)
@@ -186,8 +280,8 @@ class WriterRecoveryDecision(BaseModel):
 class ProviderRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    provider: str
-    purpose: str
+    identity: ProviderRouteIdentity
+    operation_id: ProviderOperation
     command: list[str]
     returncode: int
     stdout: str = ""
@@ -228,11 +322,24 @@ class PolicyDecision(BaseModel):
     decision_id: str
     approved_at: str
     approved_by: Literal["human"] = "human"
-    source_provider: str = "Terra High"
+    source_role_id: Literal["policy_authority"] = "policy_authority"
+    source_route_id: str = POLICY_AUTHORITY_ROUTE.route_id
+    source_provider_record_index: int | None = Field(default=None, ge=0)
+    source_link_reason: Literal["legacy_source_attempt_unlinked"] | None = None
     trigger_finding_key: str | None = None
     trigger_summary: str
     recommendation: str
     approved_text: str
+
+    @model_validator(mode="after")
+    def validate_source_link(self) -> "PolicyDecision":
+        if (self.source_provider_record_index is None) == (
+            self.source_link_reason is None
+        ):
+            raise ValueError(
+                "policy source requires either a record link or a legacy reason"
+            )
+        return self
 
 
 class WorkflowRun(BaseModel):
@@ -240,7 +347,7 @@ class WorkflowRun(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal[7] = CURRENT_RUN_SCHEMA_VERSION
+    schema_version: Literal[8] = CURRENT_RUN_SCHEMA_VERSION
     run_id: str
     created_at: str
     updated_at: str | None = None
@@ -258,7 +365,10 @@ class WorkflowRun(BaseModel):
     policy_decisions: list[PolicyDecision] = Field(default_factory=list)
     provider_resume_stage: str | None = None
     provider_resume_prompt: str | None = None
+    provider_resume_identity: ProviderRouteIdentity | None = None
+    provider_resume_operation_id: ProviderOperation | None = None
     migration_audit: RunMigrationAudit | None = None
+    identity_migration_audit: IdentityMigrationAudit | None = None
     target_ownership: TargetOwnership | None = None
     active_writer_attempt: WriterAttemptState | None = None
     writer_recovery_decisions: list[WriterRecoveryDecision] = Field(
@@ -273,7 +383,150 @@ class WorkflowRun(BaseModel):
     commit_message: str | None = None
     last_error: str | None = None
 
+    @model_validator(mode="after")
+    def validate_provider_identities(self) -> "WorkflowRun":
+        legacy_audit = self.migration_audit
+        identity_audit = self.identity_migration_audit
+        if legacy_audit is not None and identity_audit is None:
+            raise ValueError("schema-8 migration audit lacks identity audit")
+        if identity_audit is not None:
+            if not identity_audit.applied_steps or (
+                identity_audit.applied_steps[-1] != "7_to_8"
+            ):
+                raise ValueError("identity migration steps are incoherent")
+            if identity_audit.source_schema_version <= 6:
+                if legacy_audit is None:
+                    raise ValueError("identity migration lacks schema-7 audit")
+                if (
+                    legacy_audit.migration_id != identity_audit.migration_id
+                    or legacy_audit.migrated_at != identity_audit.migrated_at
+                    or legacy_audit.source_schema_version
+                    != identity_audit.source_schema_version
+                    or legacy_audit.source_structural_class
+                    != identity_audit.source_structural_class
+                    or legacy_audit.source_sha256
+                    != identity_audit.source_sha256
+                    or legacy_audit.applied_steps
+                    != identity_audit.applied_steps[:-1]
+                ):
+                    raise ValueError("migration audit lineage is incoherent")
+            if (
+                legacy_audit is not None
+                and legacy_audit.disposition != identity_audit.disposition
+            ):
+                raise ValueError("migration audit disposition is incoherent")
+
+        pending = (
+            self.provider_resume_stage,
+            self.provider_resume_prompt,
+            self.provider_resume_identity,
+            self.provider_resume_operation_id,
+        )
+        if any(item is not None for item in pending) and not all(
+            item is not None for item in pending
+        ):
+            raise ValueError("provider resume state must be complete")
+
+        migrated = (
+            self.migration_audit is not None
+            or self.identity_migration_audit is not None
+        )
+        for record in self.provider_runs:
+            expected_role = OPERATION_ROLES[record.operation_id]
+            if record.identity.role_id != expected_role:
+                raise ValueError("provider operation does not match role")
+            catalog = ROUTE_IDENTITIES[record.identity.role_id]
+            if (
+                record.identity.provider_adapter_id
+                != catalog.provider_adapter_id
+                or record.identity.route_id != catalog.route_id
+                or record.identity.model_id != catalog.model_id
+            ):
+                raise ValueError("provider route identity is not recognized")
+            expected_capability: ProviderCapability = (
+                "workspace_write"
+                if record.identity.role_id == "implementation"
+                else "read_only"
+            )
+            if record.capability is None:
+                if not migrated:
+                    raise ValueError("ordinary provider record lacks capability")
+            elif record.capability != expected_capability:
+                raise ValueError("provider capability does not match role")
+
+        if self.provider_resume_identity is not None:
+            operation = self.provider_resume_operation_id
+            if operation is None or (
+                self.provider_resume_identity.role_id != OPERATION_ROLES[operation]
+            ):
+                raise ValueError("provider resume operation does not match role")
+            catalog = ROUTE_IDENTITIES[self.provider_resume_identity.role_id]
+            if (
+                self.provider_resume_identity.provider_adapter_id
+                != catalog.provider_adapter_id
+                or self.provider_resume_identity.route_id != catalog.route_id
+                or self.provider_resume_identity.model_id != catalog.model_id
+            ):
+                raise ValueError("provider resume route is not recognized")
+            expected_pending = {
+                "implementing": "implementation_write",
+                "correcting": "correction_write",
+                "spec_reviewing": "specification_review",
+                "reviewing": "implementation_review",
+                "sol_escalating": "escalation_guidance",
+                "terra_resolving": "policy_clarification",
+            }.get(self.provider_resume_stage or "")
+            if expected_pending != operation:
+                raise ValueError("provider resume stage does not match operation")
+
+        active = self.active_writer_attempt
+        if active is not None and active.provider_record_index is not None:
+            if active.provider_record_index >= len(self.provider_runs):
+                raise ValueError("writer provider record index is out of range")
+            record = self.provider_runs[active.provider_record_index]
+            expected_operation: ProviderOperation = (
+                "correction_write"
+                if active.purpose == "correction"
+                else "implementation_write"
+            )
+            if (
+                record.identity.role_id != "implementation"
+                or record.identity.route_id != IMPLEMENTATION_ROUTE.route_id
+                or record.operation_id != expected_operation
+                or record.capability != "workspace_write"
+                or record.repository_fingerprint_before
+                != active.pre_fingerprint
+                or (
+                    active.post_fingerprint is not None
+                    and record.repository_fingerprint_after
+                    != active.post_fingerprint
+                )
+            ):
+                raise ValueError("writer provider record link is incoherent")
+
+        for decision in self.policy_decisions:
+            index = decision.source_provider_record_index
+            if index is None:
+                if not migrated:
+                    raise ValueError("ordinary policy decision lacks source link")
+                continue
+            if index >= len(self.provider_runs):
+                raise ValueError("policy source record index is out of range")
+            record = self.provider_runs[index]
+            if (
+                record.identity.role_id != "policy_authority"
+                or record.identity.route_id != decision.source_route_id
+                or record.operation_id != "policy_clarification"
+                or record.returncode != 0
+                or record.failure_kind is not None
+            ):
+                raise ValueError("policy source record link is incoherent")
+        return self
+
 
 if __name__ == "__main__":
-    for route in (TERRA, SOL, LUNA, SONNET):
-        print(f"{route.role}: {route.cli} -> {route.model}")
+    for role, route in ROUTE_IDENTITIES.items():
+        print(
+            f"{role}: {route.provider_adapter_id} -> {route.model_id} "
+            f"({route.route_id})"
+        )

@@ -20,6 +20,10 @@ from pathlib import Path
 from typing import Callable
 
 from models import (
+    ADVERSARIAL_REVIEW_ROUTE,
+    ESCALATION_EXECUTIVE_ROUTE,
+    IMPLEMENTATION_ROUTE,
+    POLICY_AUTHORITY_ROUTE,
     ProviderCapability,
     ProviderFailureKind,
     ProviderFailureSource,
@@ -117,7 +121,7 @@ def build_sonnet_command(prompt: str) -> list[str]:
         "claude",
         "-p",
         "--model",
-        "sonnet",
+        ADVERSARIAL_REVIEW_ROUTE.model_id,
         "--permission-mode",
         "plan",
         "--tools",
@@ -136,7 +140,7 @@ def build_terra_command(prompt: str) -> list[str]:
         "codex",
         "exec",
         "--model",
-        "gpt-5.6-terra",
+        POLICY_AUTHORITY_ROUTE.model_id,
         "--sandbox",
         "read-only",
         "--",
@@ -151,7 +155,7 @@ def build_sol_command(prompt: str) -> list[str]:
         "codex",
         "exec",
         "--model",
-        "gpt-5.6-sol",
+        ESCALATION_EXECUTIVE_ROUTE.model_id,
         "--sandbox",
         "read-only",
         "--",
@@ -165,7 +169,7 @@ def build_luna_command(prompt: str) -> list[str]:
         "codex",
         "exec",
         "--model",
-        "gpt-5.6-luna",
+        IMPLEMENTATION_ROUTE.model_id,
         "--sandbox",
         "workspace-write",
         "--config",
@@ -175,18 +179,6 @@ def build_luna_command(prompt: str) -> list[str]:
         "--",
         bounded_prompt,
     ]
-
-
-def _provider_label(command: list[str]) -> str:
-    if "gpt-5.6-luna" in command:
-        return "Luna High"
-    if "gpt-5.6-sol" in command:
-        return "Sol High"
-    if "gpt-5.6-terra" in command:
-        return "Terra High"
-    if command and Path(command[0]).name == "claude":
-        return "Sonnet 5 High"
-    return Path(command[0]).name if command else "provider"
 
 
 def classify_provider_failure(
@@ -720,6 +712,7 @@ def _run(
     repo: Path,
     *,
     capability: ProviderCapability,
+    display_name: str = "provider",
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     sleeper: Callable[[float], None] = time.sleep,
     deadline_seconds: float = READ_ONLY_PROVIDER_DEADLINE_SECONDS,
@@ -744,7 +737,7 @@ def _run(
         poll_interval_seconds,
         heartbeat_seconds,
     )
-    label = _provider_label(command)
+    label = display_name
     attempts: list[ProviderAttempt] = []
     retry_delays = (5.0, 15.0)
     max_attempts = 1 + len(retry_delays)
@@ -898,6 +891,7 @@ def execute_sonnet_review(prompt: str, repo: Path = DEFAULT_REPO) -> ProviderExe
         build_sonnet_command(prompt),
         repo,
         capability="read_only",
+        display_name=ADVERSARIAL_REVIEW_ROUTE.display_name,
         deadline_seconds=READ_ONLY_PROVIDER_DEADLINE_SECONDS,
         native_classifier=classify_claude_native_failure,
     )
@@ -938,6 +932,7 @@ def execute_terra_resolution(prompt: str, repo: Path = DEFAULT_REPO) -> Provider
         build_terra_command(prompt),
         repo,
         capability="read_only",
+        display_name=POLICY_AUTHORITY_ROUTE.display_name,
         deadline_seconds=READ_ONLY_PROVIDER_DEADLINE_SECONDS,
     )
 
@@ -947,6 +942,7 @@ def execute_sol_escalation(prompt: str, repo: Path = DEFAULT_REPO) -> ProviderEx
         build_sol_command(prompt),
         repo,
         capability="read_only",
+        display_name=ESCALATION_EXECUTIVE_ROUTE.display_name,
         deadline_seconds=READ_ONLY_PROVIDER_DEADLINE_SECONDS,
     )
 
@@ -956,5 +952,6 @@ def execute_luna_implementation(prompt: str, repo: Path = DEFAULT_REPO) -> Provi
         build_luna_command(prompt),
         repo,
         capability="workspace_write",
+        display_name=IMPLEMENTATION_ROUTE.display_name,
         deadline_seconds=WRITE_PROVIDER_DEADLINE_SECONDS,
     )

@@ -23,11 +23,19 @@ from rich.console import Console
 from rich.table import Table
 
 from models import (
+    ADVERSARIAL_REVIEW_ROUTE,
     CURRENT_RUN_SCHEMA_VERSION,
+    ESCALATION_EXECUTIVE_ROUTE,
     GitRecord,
+    IMPLEMENTATION_ROUTE,
+    OPERATION_ROLES,
+    POLICY_AUTHORITY_ROUTE,
     PolicyDecision,
     ProviderCapability,
+    ProviderOperation,
     ProviderRecord,
+    ProviderRouteIdentity,
+    ROUTE_IDENTITIES,
     RepoState,
     ReviewResult,
     TargetOwnership,
@@ -770,9 +778,9 @@ def migrate_run_record(
         if exc.field_path:
             detail = f"{detail}:{exc.field_path}"
         raise ControllerError(f"run migration {detail}") from exc
-    audit = result.run.migration_audit
+    audit = result.run.identity_migration_audit
     if audit is None:
-        raise ControllerError("run migration migration_audit_invalid")
+        raise ControllerError("run migration identity_migration_audit_invalid")
     console.print(
         f"Migrated run {run_id} to schema {CURRENT_RUN_SCHEMA_VERSION}; "
         f"disposition is {audit.disposition}."
@@ -1170,16 +1178,49 @@ class TargetCoordinator:
         connection.execute("DELETE FROM target_owner WHERE singleton = 1")
 
 
+def _identity_control_key(
+    identity: ProviderRouteIdentity,
+) -> tuple[str, str, str, str]:
+    """Return control-relevant route identity, excluding display metadata."""
+
+    return (
+        identity.role_id,
+        identity.provider_adapter_id,
+        identity.route_id,
+        identity.model_id,
+    )
+
+
+def _validate_route_operation(
+    identity: ProviderRouteIdentity,
+    operation_id: ProviderOperation,
+    capability: ProviderCapability,
+) -> None:
+    if OPERATION_ROLES[operation_id] != identity.role_id:
+        raise ControllerError("provider operation does not match role")
+    catalog = ROUTE_IDENTITIES[identity.role_id]
+    if _identity_control_key(identity) != _identity_control_key(catalog):
+        raise ControllerError("provider route identity is not recognized")
+    expected_capability: ProviderCapability = (
+        "workspace_write"
+        if identity.role_id == "implementation"
+        else "read_only"
+    )
+    if capability != expected_capability:
+        raise ControllerError("provider capability does not match role")
+
+
 def _record_provider(
     run: WorkflowRun,
-    purpose: str,
-    provider: str,
+    operation_id: ProviderOperation,
+    identity: ProviderRouteIdentity,
     execution: ProviderExecution,
     *,
     capability: ProviderCapability,
     repository_fingerprint_before: str | None = None,
     repository_fingerprint_after: str | None = None,
 ) -> ProviderExecution:
+    _validate_route_operation(identity, operation_id, capability)
     if execution.capability not in {None, capability}:
         raise ControllerError(
             f"provider execution capability mismatch: expected {capability}, "
@@ -1202,15 +1243,15 @@ def _record_provider(
     )
     execution = (
         normalize_sonnet_execution(execution)
-        if provider == "Sonnet 5 High"
+        if identity.provider_adapter_id == "claude_cli"
         else normalize_provider_execution(execution)
     )
     if execution.attempts:
         for attempt in execution.attempts:
             run.provider_runs.append(
                 ProviderRecord(
-                    provider=provider,
-                    purpose=purpose,
+                    identity=identity,
+                    operation_id=operation_id,
                     command=attempt.command,
                     returncode=attempt.returncode,
                     stdout=attempt.stdout,
@@ -1233,8 +1274,8 @@ def _record_provider(
 
     run.provider_runs.append(
         ProviderRecord(
-            provider=provider,
-            purpose=purpose,
+            identity=identity,
+            operation_id=operation_id,
             command=execution.command,
             returncode=execution.returncode,
             stdout=execution.stdout,
@@ -1283,7 +1324,10 @@ def _format_duration(seconds: float | None) -> str:
 def _report_review_history(run: WorkflowRun) -> list[ReviewResult]:
     history: list[ReviewResult] = []
     for record in run.provider_runs:
-        if record.provider != "Sonnet 5 High" or record.purpose != "implementation":
+        if (
+            record.identity.role_id != "adversarial_review"
+            or record.operation_id != "implementation_review"
+        ):
             continue
         execution = ProviderExecution(
             command=record.command,
@@ -1310,17 +1354,17 @@ def _report_review_history(run: WorkflowRun) -> list[ReviewResult]:
 
 
 def _run_report(run: WorkflowRun) -> dict[str, object]:
-    provider_counts = Counter(record.provider for record in run.provider_runs)
-    provider_seconds: Counter[str] = Counter()
+    role_counts = Counter(record.identity.role_id for record in run.provider_runs)
+    role_seconds: Counter[str] = Counter()
     untimed_counts: Counter[str] = Counter()
     failure_counts: Counter[str] = Counter()
     retry_attempts = 0
 
     for record in run.provider_runs:
         if record.duration_seconds is None:
-            untimed_counts[record.provider] += 1
+            untimed_counts[record.identity.role_id] += 1
         else:
-            provider_seconds[record.provider] += record.duration_seconds
+            role_seconds[record.identity.role_id] += record.duration_seconds
         if record.failure_kind:
             failure_counts[record.failure_kind] += 1
         if record.retry_scheduled:
@@ -1336,8 +1380,8 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
     verification_runs = sum(
         1
         for record in run.provider_runs
-        if record.provider == "Luna High"
-        and record.purpose in {"implementation", "correction"}
+        if record.identity.role_id == "implementation"
+        and record.operation_id in {"implementation_write", "correction_write"}
         and record.returncode == 0
         and record.failure_kind is None
     )
@@ -1357,17 +1401,17 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
     )
 
     return {
-        "provider_counts": dict(provider_counts),
-        "provider_seconds": dict(provider_seconds),
+        "role_counts": dict(role_counts),
+        "role_seconds": dict(role_seconds),
         "untimed_counts": dict(untimed_counts),
-        "provider_seconds_total": sum(provider_seconds.values()),
+        "provider_seconds_total": sum(role_seconds.values()),
         "provider_calls_total": len(run.provider_runs),
         "provider_failure_counts": dict(failure_counts),
         "provider_retry_attempts": retry_attempts,
         "wall_seconds": wall_seconds,
         "corrections": run.correction_cycles,
         "distinct_defects": len(defect_keys),
-        "sol_escalations": provider_counts.get("Sol High", 0),
+        "sol_escalations": role_counts.get("escalation_executive", 0),
         "policy_decisions": len(run.policy_decisions),
         "writer_recovery_decisions": len(run.writer_recovery_decisions),
         "target_ownership_state": (
@@ -1411,25 +1455,31 @@ def _print_run_report(run: WorkflowRun) -> None:
     total_calls = int(report["provider_calls_total"])
     console.print(f"Provider calls: {total_calls}")
 
-    counts = report["provider_counts"]
-    seconds = report["provider_seconds"]
+    counts = report["role_counts"]
+    seconds = report["role_seconds"]
     untimed = report["untimed_counts"]
-    preferred = ("Luna High", "Sonnet 5 High", "Sol High", "Terra High")
-    providers = list(preferred)
-    providers.extend(
-        provider for provider in counts
-        if provider not in providers
+    preferred = (
+        "implementation",
+        "adversarial_review",
+        "escalation_executive",
+        "policy_authority",
     )
+    roles = list(preferred)
+    roles.extend(role for role in counts if role not in roles)
 
-    for provider in providers:
-        count = counts.get(provider, 0)
+    for role in roles:
+        count = counts.get(role, 0)
         if not count:
             continue
-        timed = seconds.get(provider, 0.0)
-        legacy = untimed.get(provider, 0)
+        timed = seconds.get(role, 0.0)
+        legacy = untimed.get(role, 0)
         timing = _format_duration(timed) if timed else "no recorded timing"
         suffix = f"; {legacy} untimed legacy" if legacy else ""
-        console.print(f"  {provider}: {count} call(s), {timing}{suffix}")
+        route = ROUTE_IDENTITIES[role]
+        console.print(
+            f"  {role} ({route.display_name}; {route.model_id}): "
+            f"{count} call(s), {timing}{suffix}"
+        )
 
     total_timed = float(report["provider_seconds_total"])
     total_untimed = sum(untimed.values())
@@ -1607,7 +1657,10 @@ def _finding_key(result: ReviewResult) -> str:
 def _implementation_review_history(run: WorkflowRun) -> list[ReviewResult]:
     findings: list[ReviewResult] = []
     for record in run.provider_runs:
-        if record.provider != "Sonnet 5 High" or record.purpose != "implementation":
+        if (
+            record.identity.role_id != "adversarial_review"
+            or record.operation_id != "implementation_review"
+        ):
             continue
         try:
             result = parse_sonnet_review(
@@ -1760,10 +1813,33 @@ class Controller:
         self.terra = terra
         self.sol = sol
         self.luna = luna
+        self._providers_by_role: dict[
+            str,
+            Callable[[str, Path], ProviderExecution],
+        ] = {
+            "adversarial_review": self.sonnet,
+            "policy_authority": self.terra,
+            "escalation_executive": self.sol,
+            "implementation": self.luna,
+        }
         self.approval = approval or (lambda prompt: typer.confirm(prompt, default=False))
+
+    def _provider_for(
+        self,
+        identity: ProviderRouteIdentity,
+    ) -> Callable[[str, Path], ProviderExecution]:
+        catalog = ROUTE_IDENTITIES[identity.role_id]
+        if _identity_control_key(identity) != _identity_control_key(catalog):
+            raise ControllerError("saved provider route is not recognized")
+        return self._providers_by_role[identity.role_id]
 
     @staticmethod
     def _require_executable(run: WorkflowRun) -> None:
+        if run.identity_migration_audit is not None:
+            raise ControllerError(
+                "run execution refused: migrated record disposition is "
+                f"{run.identity_migration_audit.disposition}"
+            )
         if run.migration_audit is not None:
             raise ControllerError(
                 "run execution refused: migrated record disposition is "
@@ -1822,10 +1898,27 @@ class Controller:
             else None
         )
 
+        source_index = next(
+            (
+                index
+                for index in range(len(run.provider_runs) - 1, -1, -1)
+                if run.provider_runs[index].identity.role_id == "policy_authority"
+                and run.provider_runs[index].operation_id == "policy_clarification"
+                and run.provider_runs[index].returncode == 0
+                and run.provider_runs[index].failure_kind is None
+            ),
+            None,
+        )
+        if source_index is None:
+            raise ControllerError(
+                "policy approval lacks a successful policy-authority audit record"
+            )
+
         run.policy_decisions.append(
             PolicyDecision(
                 decision_id=f"policy-{len(run.policy_decisions) + 1:02d}",
                 approved_at=datetime.now(timezone.utc).isoformat(),
+                source_provider_record_index=source_index,
                 trigger_finding_key=trigger_key,
                 trigger_summary=trigger_summary,
                 recommendation=run.terra_resolution or "",
@@ -2014,19 +2107,36 @@ class Controller:
         _print_run_report(run)
         return run
 
-    def _arm_provider(self, run: WorkflowRun, stage: str, prompt: str) -> None:
+    def _arm_provider(
+        self,
+        run: WorkflowRun,
+        stage: str,
+        prompt: str,
+        identity: ProviderRouteIdentity,
+        operation_id: ProviderOperation,
+    ) -> None:
+        capability: ProviderCapability = (
+            "workspace_write"
+            if identity.role_id == "implementation"
+            else "read_only"
+        )
+        _validate_route_operation(identity, operation_id, capability)
         run.provider_resume_stage = stage
         run.provider_resume_prompt = prompt
+        run.provider_resume_identity = identity
+        run.provider_resume_operation_id = operation_id
 
     def _clear_provider(self, run: WorkflowRun) -> None:
         run.provider_resume_stage = None
         run.provider_resume_prompt = None
+        run.provider_resume_identity = None
+        run.provider_resume_operation_id = None
 
     def _block_provider(
         self,
         run: WorkflowRun,
-        provider: str,
-        purpose: str,
+        identity: ProviderRouteIdentity,
+        operation_id: ProviderOperation,
         execution: ProviderExecution,
     ) -> WorkflowRun:
         kind = (
@@ -2066,30 +2176,30 @@ class Controller:
         return self._block(
             run,
             stage,
-            f"{provider}: {description} during {purpose}; "
+            f"{identity.display_name}: {description} during {operation_id}; "
             "no alternate provider was invoked",
         )
 
     def _block_provider_output(
         self,
         run: WorkflowRun,
-        provider: str,
-        purpose: str,
+        identity: ProviderRouteIdentity,
+        operation_id: ProviderOperation,
         detail: str,
     ) -> WorkflowRun:
         return self._block(
             run,
             "blocked_provider_output",
-            f"{provider}: invalid structured output during {purpose} "
+            f"{identity.display_name}: invalid structured output during "
+            f"{operation_id} "
             f"after one same-provider retry: {detail}",
         )
 
     def _retry_structured_once(
         self,
         run: WorkflowRun,
-        provider_name: str,
-        purpose: str,
-        provider: Callable[[str, Path], ProviderExecution],
+        identity: ProviderRouteIdentity,
+        operation_id: ProviderOperation,
         parser: Callable[[ProviderExecution], object],
     ) -> object | None:
         prompt = run.provider_resume_prompt
@@ -2102,14 +2212,15 @@ class Controller:
             return None
 
         console.print(
-            f"[yellow]Invalid {provider_name} structured output; "
+            f"[yellow]Invalid {identity.display_name} structured output; "
             "retrying the same provider once.[/yellow]"
         )
+        provider = self._provider_for(identity)
         execution = provider(prompt, self.repo)
         execution = _record_provider(
             run,
-            purpose,
-            provider_name,
+            operation_id,
+            identity,
             execution,
             capability="read_only",
         )
@@ -2118,8 +2229,8 @@ class Controller:
         if execution_failed(execution):
             self._block_provider(
                 run,
-                provider_name,
-                purpose,
+                identity,
+                operation_id,
                 execution,
             )
             return None
@@ -2129,8 +2240,8 @@ class Controller:
         except Exception as exc:
             self._block_provider_output(
                 run,
-                provider_name,
-                purpose,
+                identity,
+                operation_id,
                 str(exc),
             )
             return None
@@ -2138,8 +2249,10 @@ class Controller:
     def _resume_blocked_provider(self, run: WorkflowRun) -> WorkflowRun:
         stage = run.provider_resume_stage
         prompt = run.provider_resume_prompt
+        saved_identity = run.provider_resume_identity
+        saved_operation = run.provider_resume_operation_id
 
-        if not stage or not prompt:
+        if not stage or not prompt or saved_identity is None or saved_operation is None:
             return self._block(
                 run,
                 "blocked_interrupted_provider",
@@ -2149,26 +2262,25 @@ class Controller:
         if stage in {"implementing", "correcting"}:
             return self._observe_unrecorded_writer(run)
 
-        provider_map = {
+        provider_map: dict[
+            str,
+            tuple[ProviderOperation, ProviderRouteIdentity],
+        ] = {
             "terra_resolving": (
-                "policy clarification",
-                "Terra High",
-                self.terra,
+                "policy_clarification",
+                POLICY_AUTHORITY_ROUTE,
             ),
             "sol_escalating": (
-                "escalation guidance",
-                "Sol High",
-                self.sol,
+                "escalation_guidance",
+                ESCALATION_EXECUTIVE_ROUTE,
             ),
             "spec_reviewing": (
-                "specification",
-                "Sonnet 5 High",
-                self.sonnet,
+                "specification_review",
+                ADVERSARIAL_REVIEW_ROUTE,
             ),
             "reviewing": (
-                "implementation",
-                "Sonnet 5 High",
-                self.sonnet,
+                "implementation_review",
+                ADVERSARIAL_REVIEW_ROUTE,
             ),
         }
 
@@ -2179,19 +2291,31 @@ class Controller:
                 f"unsupported provider resume stage: {stage}",
             )
 
-        purpose, provider_name, provider = provider_map[stage]
+        operation_id, identity = provider_map[stage]
+        if (
+            saved_operation != operation_id
+            or _identity_control_key(saved_identity)
+            != _identity_control_key(identity)
+        ):
+            return self._block(
+                run,
+                "blocked_interrupted_provider",
+                "saved provider identity does not match the resume stage",
+            )
+        provider = self._provider_for(saved_identity)
         run.stage = stage
         run.last_error = None
         self._save(run)
 
         console.print(
-            f"[cyan]Stage:[/cyan] Resuming {stage} — {provider_name}"
+            f"[cyan]Stage:[/cyan] Resuming {stage} — "
+            f"{saved_identity.display_name}"
         )
         execution = provider(prompt, self.repo)
         execution = _record_provider(
             run,
-            purpose,
-            provider_name,
+            operation_id,
+            saved_identity,
             execution,
             capability="read_only",
         )
@@ -2200,8 +2324,8 @@ class Controller:
         if execution_failed(execution):
             return self._block_provider(
                 run,
-                provider_name,
-                purpose,
+                saved_identity,
+                operation_id,
                 execution,
             )
 
@@ -2222,15 +2346,21 @@ class Controller:
     def _policy_stop(self, run: WorkflowRun, reason: str) -> WorkflowRun:
         run.stage = "terra_resolving"
         prompt = _terra_prompt(run, reason)
-        self._arm_provider(run, run.stage, prompt)
+        self._arm_provider(
+            run,
+            run.stage,
+            prompt,
+            POLICY_AUTHORITY_ROUTE,
+            "policy_clarification",
+        )
         self._save(run)
 
         console.print("[cyan]Stage:[/cyan] Policy clarification — Terra High")
         execution = self.terra(prompt, self.repo)
         execution = _record_provider(
             run,
-            "policy clarification",
-            "Terra High",
+            "policy_clarification",
+            POLICY_AUTHORITY_ROUTE,
             execution,
             capability="read_only",
         )
@@ -2239,8 +2369,8 @@ class Controller:
         if execution_failed(execution):
             return self._block_provider(
                 run,
-                "Terra High",
-                "policy clarification",
+                POLICY_AUTHORITY_ROUTE,
+                "policy_clarification",
                 execution,
             )
 
@@ -2271,7 +2401,18 @@ class Controller:
                 _implementation_diff(self.repo),
             )
         )
-        self._arm_provider(run, run.stage, prompt)
+        operation_id: ProviderOperation = (
+            "specification_review"
+            if purpose == "specification"
+            else "implementation_review"
+        )
+        self._arm_provider(
+            run,
+            run.stage,
+            prompt,
+            ADVERSARIAL_REVIEW_ROUTE,
+            operation_id,
+        )
         self._save(run)
 
         console.print(
@@ -2280,8 +2421,8 @@ class Controller:
         execution = self.sonnet(prompt, self.repo)
         execution = _record_provider(
             run,
-            purpose,
-            "Sonnet 5 High",
+            operation_id,
+            ADVERSARIAL_REVIEW_ROUTE,
             execution,
             capability="read_only",
         )
@@ -2290,8 +2431,8 @@ class Controller:
         if execution_failed(execution):
             self._block_provider(
                 run,
-                "Sonnet 5 High",
-                purpose,
+                ADVERSARIAL_REVIEW_ROUTE,
+                operation_id,
                 execution,
             )
             return None
@@ -2301,9 +2442,8 @@ class Controller:
         except Exception:
             retried = self._retry_structured_once(
                 run,
-                "Sonnet 5 High",
-                purpose,
-                self.sonnet,
+                ADVERSARIAL_REVIEW_ROUTE,
+                operation_id,
                 parse_sonnet_review,
             )
             if retried is None:
@@ -2398,7 +2538,18 @@ class Controller:
     ) -> None:
         run.stage = stage
         run.last_error = None
-        self._arm_provider(run, stage, prompt)
+        operation_id: ProviderOperation = (
+            "correction_write"
+            if purpose == "correction"
+            else "implementation_write"
+        )
+        self._arm_provider(
+            run,
+            stage,
+            prompt,
+            IMPLEMENTATION_ROUTE,
+            operation_id,
+        )
         run.active_writer_attempt = WriterAttemptState(
             attempt_id=f"writer-{uuid.uuid4().hex[:12]}",
             stage=stage,
@@ -2478,8 +2629,12 @@ class Controller:
 
         execution = _record_provider(
             run,
-            active.purpose,
-            "Luna High",
+            (
+                "correction_write"
+                if active.purpose == "correction"
+                else "implementation_write"
+            ),
+            IMPLEMENTATION_ROUTE,
             execution,
             capability="workspace_write",
             repository_fingerprint_before=active.pre_fingerprint,
@@ -2570,7 +2725,13 @@ class Controller:
             finding_key,
             escalation_round,
         )
-        self._arm_provider(run, run.stage, prompt)
+        self._arm_provider(
+            run,
+            run.stage,
+            prompt,
+            ESCALATION_EXECUTIVE_ROUTE,
+            "escalation_guidance",
+        )
         self._save(run)
 
         console.print(
@@ -2579,8 +2740,8 @@ class Controller:
         execution = self.sol(prompt, self.repo)
         execution = _record_provider(
             run,
-            "escalation guidance",
-            "Sol High",
+            "escalation_guidance",
+            ESCALATION_EXECUTIVE_ROUTE,
             execution,
             capability="read_only",
         )
@@ -2589,8 +2750,8 @@ class Controller:
         if execution_failed(execution):
             self._block_provider(
                 run,
-                "Sol High",
-                "escalation guidance",
+                ESCALATION_EXECUTIVE_ROUTE,
+                "escalation_guidance",
                 execution,
             )
             return False
@@ -2600,9 +2761,8 @@ class Controller:
         except Exception:
             retried = self._retry_structured_once(
                 run,
-                "Sol High",
-                "escalation guidance",
-                self.sol,
+                ESCALATION_EXECUTIVE_ROUTE,
+                "escalation_guidance",
                 _parse_sol_response,
             )
             if retried is None:
@@ -2884,9 +3044,15 @@ class Controller:
                 "writer audit linkage is invalid",
             )
         record = run.provider_runs[index]
+        expected_operation: ProviderOperation = (
+            "correction_write"
+            if active.purpose == "correction"
+            else "implementation_write"
+        )
         if (
-            record.provider != "Luna High"
-            or record.purpose != active.purpose
+            _identity_control_key(record.identity)
+            != _identity_control_key(IMPLEMENTATION_ROUTE)
+            or record.operation_id != expected_operation
             or record.capability != "workspace_write"
         ):
             active.inspection_error = "saved writer provider record does not match"
@@ -2956,13 +3122,38 @@ class Controller:
         if not run.provider_runs:
             return self._block(run, "blocked_interrupted_provider", "provider stage was interrupted before output was recorded")
         record = run.provider_runs[-1]
-        expected_provider_run = {
-            "terra_resolving": ("policy clarification", "Terra High"),
-            "sol_escalating": ("escalation guidance", "Sol High"),
-            "spec_reviewing": ("specification", "Sonnet 5 High"),
-            "reviewing": ("implementation", "Sonnet 5 High"),
+        expected_provider_run: dict[
+            str,
+            tuple[ProviderOperation, ProviderRouteIdentity],
+        ] = {
+            "terra_resolving": (
+                "policy_clarification",
+                POLICY_AUTHORITY_ROUTE,
+            ),
+            "sol_escalating": (
+                "escalation_guidance",
+                ESCALATION_EXECUTIVE_ROUTE,
+            ),
+            "spec_reviewing": (
+                "specification_review",
+                ADVERSARIAL_REVIEW_ROUTE,
+            ),
+            "reviewing": (
+                "implementation_review",
+                ADVERSARIAL_REVIEW_ROUTE,
+            ),
         }[run.stage]
-        if (record.purpose, record.provider) != expected_provider_run:
+        expected_operation, expected_identity = expected_provider_run
+        pending_identity = run.provider_resume_identity
+        if (
+            record.operation_id != expected_operation
+            or _identity_control_key(record.identity)
+            != _identity_control_key(expected_identity)
+            or pending_identity is None
+            or run.provider_resume_operation_id != expected_operation
+            or _identity_control_key(pending_identity)
+            != _identity_control_key(expected_identity)
+        ):
             return self._block(
                 run,
                 "blocked_interrupted_provider",
@@ -2987,14 +3178,14 @@ class Controller:
         )
         execution = (
             normalize_sonnet_execution(execution)
-            if record.provider == "Sonnet 5 High"
+            if record.identity.provider_adapter_id == "claude_cli"
             else normalize_provider_execution(execution)
         )
         if execution_failed(execution):
             return self._block_provider(
                 run,
-                record.provider,
-                record.purpose,
+                record.identity,
+                record.operation_id,
                 execution,
             )
         if run.stage == "terra_resolving":
@@ -3006,8 +3197,8 @@ class Controller:
             except Exception as exc:
                 return self._block_provider_output(
                     run,
-                    "Sol High",
-                    "escalation guidance",
+                    ESCALATION_EXECUTIVE_ROUTE,
+                    "escalation_guidance",
                     str(exc),
                 )
             run.sol_guidance = guidance
@@ -3026,8 +3217,8 @@ class Controller:
             except Exception as exc:
                 return self._block_provider_output(
                     run,
-                    "Sonnet 5 High",
-                    "specification",
+                    ADVERSARIAL_REVIEW_ROUTE,
+                    "specification_review",
                     str(exc),
                 )
             run.spec_review = result
@@ -3044,8 +3235,8 @@ class Controller:
             except Exception as exc:
                 return self._block_provider_output(
                     run,
-                    "Sonnet 5 High",
-                    "implementation",
+                    ADVERSARIAL_REVIEW_ROUTE,
+                    "implementation_review",
                     str(exc),
                 )
             run.implementation_review = result

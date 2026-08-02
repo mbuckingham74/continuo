@@ -17,6 +17,11 @@ import orchestrator
 import providers
 import run_migrations
 from models import (
+    ADVERSARIAL_REVIEW_ROUTE,
+    IMPLEMENTATION_ROUTE,
+    IdentityMigrationAudit,
+    POLICY_AUTHORITY_ROUTE,
+    ProviderRouteIdentity,
     RepoState,
     ReviewResult,
     TargetOwnership,
@@ -24,7 +29,13 @@ from models import (
     WriterAttemptState,
     WriterRecoveryDecision,
 )
-from providers import ProviderExecution, build_luna_command, build_sol_command, build_sonnet_command
+from providers import (
+    ProviderAttempt,
+    ProviderExecution,
+    build_luna_command,
+    build_sol_command,
+    build_sonnet_command,
+)
 
 
 CLAUDE_FIXTURES = Path(__file__).parent / "test_fixtures/claude"
@@ -76,6 +87,41 @@ def claude_fixture(name: str) -> tuple[dict[str, object], ProviderExecution]:
         fixture["stdout"],
         fixture["stderr"],
     )
+
+
+def provider_record(
+    identity,
+    operation_id,
+    *,
+    capability=None,
+    **kwargs,
+):
+    if capability is None:
+        capability = (
+            "workspace_write"
+            if identity.role_id == "implementation"
+            else "read_only"
+        )
+    return orchestrator.ProviderRecord(
+        identity=identity,
+        operation_id=operation_id,
+        capability=capability,
+        **kwargs,
+    )
+
+
+def provider_resume(
+    stage: str,
+    prompt: str,
+    identity,
+    operation_id: str,
+) -> dict[str, object]:
+    return {
+        "provider_resume_stage": stage,
+        "provider_resume_prompt": prompt,
+        "provider_resume_identity": identity,
+        "provider_resume_operation_id": operation_id,
+    }
 
 
 class ControllerTests(unittest.TestCase):
@@ -543,7 +589,7 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn("change_enumeration", run.verification)
         self.assertIn("malformed porcelain fixture", run.last_error)
         self.assertEqual(
-            [record.provider for record in run.provider_runs],
+            [record.identity.display_name for record in run.provider_runs],
             ["Sonnet 5 High"],
         )
         self.assertEqual(run.git_operations, [])
@@ -784,6 +830,16 @@ class ControllerTests(unittest.TestCase):
             "Proposed approval text:\n\n"
             "> Remote-role scope is positive evidence for remote reality.\n"
         )
+        policy_source_index = len(run.provider_runs)
+        run.provider_runs.append(
+            provider_record(
+                POLICY_AUTHORITY_ROUTE,
+                "policy_clarification",
+                command=["codex"],
+                returncode=0,
+                stdout=run.terra_resolution,
+            )
+        )
         run.last_error = "policy ambiguity requires human approval"
         orchestrator.persist(run, self.runs)
 
@@ -810,7 +866,15 @@ class ControllerTests(unittest.TestCase):
         decision = approved.policy_decisions[0]
         self.assertEqual(decision.decision_id, "policy-01")
         self.assertEqual(decision.approved_by, "human")
-        self.assertEqual(decision.source_provider, "Terra High")
+        self.assertEqual(decision.source_role_id, "policy_authority")
+        self.assertEqual(
+            decision.source_route_id,
+            POLICY_AUTHORITY_ROUTE.route_id,
+        )
+        self.assertEqual(
+            decision.source_provider_record_index,
+            policy_source_index,
+        )
         self.assertEqual(decision.trigger_finding_key, "remote-scope-ownership")
         self.assertIn("Decision 3 versus Decision 4", decision.trigger_summary)
         self.assertIn("Proposed approval text", decision.recommendation)
@@ -848,8 +912,8 @@ class ControllerTests(unittest.TestCase):
 
         orchestrator._record_provider(
             run,
-            "implementation",
-            "Luna High",
+            "implementation_write",
+            IMPLEMENTATION_ROUTE,
             ProviderExecution(
                 command=["codex"],
                 returncode=0,
@@ -861,8 +925,8 @@ class ControllerTests(unittest.TestCase):
         )
         orchestrator._record_provider(
             run,
-            "implementation",
-            "Sonnet 5 High",
+            "implementation_review",
+            ADVERSARIAL_REVIEW_ROUTE,
             ProviderExecution(
                 command=["claude"],
                 returncode=0,
@@ -875,10 +939,10 @@ class ControllerTests(unittest.TestCase):
         report = orchestrator._run_report(run)
 
         self.assertEqual(report["provider_calls_total"], 2)
-        self.assertEqual(report["provider_counts"]["Luna High"], 1)
-        self.assertEqual(report["provider_counts"]["Sonnet 5 High"], 1)
-        self.assertAlmostEqual(report["provider_seconds"]["Luna High"], 12.5)
-        self.assertEqual(report["untimed_counts"]["Sonnet 5 High"], 1)
+        self.assertEqual(report["role_counts"]["implementation"], 1)
+        self.assertEqual(report["role_counts"]["adversarial_review"], 1)
+        self.assertAlmostEqual(report["role_seconds"]["implementation"], 12.5)
+        self.assertEqual(report["untimed_counts"]["adversarial_review"], 1)
         self.assertEqual(report["verification_runs"], 1)
         self.assertEqual(report["wall_seconds"], 90.0)
 
@@ -1113,9 +1177,9 @@ class ControllerTests(unittest.TestCase):
             "attendance-linking",
         )
         run.provider_runs.append(
-            orchestrator.ProviderRecord(
-                provider="Sonnet 5 High",
-                purpose="implementation",
+            provider_record(
+                ADVERSARIAL_REVIEW_ROUTE,
+                "implementation_review",
                 command=old.command,
                 returncode=old.returncode,
                 stdout=old.stdout,
@@ -1268,11 +1332,13 @@ class ControllerTests(unittest.TestCase):
             stage="spec_reviewing",
             provider_resume_stage="spec_reviewing",
             provider_resume_prompt="saved prompt",
+            provider_resume_identity=ADVERSARIAL_REVIEW_ROUTE,
+            provider_resume_operation_id="specification_review",
         )
         run.provider_runs.append(
-            orchestrator.ProviderRecord(
-                provider="Sonnet 5 High",
-                purpose="specification",
+            provider_record(
+                ADVERSARIAL_REVIEW_ROUTE,
+                "specification_review",
                 command=["claude"],
                 returncode=providers.PROVIDER_TIMEOUT_RETURN_CODE,
                 stdout="partial",
@@ -1395,11 +1461,13 @@ class ControllerTests(unittest.TestCase):
             stage="spec_reviewing",
             provider_resume_stage="spec_reviewing",
             provider_resume_prompt="saved prompt",
+            provider_resume_identity=ADVERSARIAL_REVIEW_ROUTE,
+            provider_resume_operation_id="specification_review",
         )
         normalized = orchestrator._record_provider(
             run,
-            "specification",
-            "Sonnet 5 High",
+            "specification_review",
+            ADVERSARIAL_REVIEW_ROUTE,
             native_error,
             capability="read_only",
         )
@@ -1427,11 +1495,13 @@ class ControllerTests(unittest.TestCase):
             stage="spec_reviewing",
             provider_resume_stage="spec_reviewing",
             provider_resume_prompt="saved prompt",
+            provider_resume_identity=ADVERSARIAL_REVIEW_ROUTE,
+            provider_resume_operation_id="specification_review",
         )
         orchestrator._record_provider(
             malformed_run,
-            "specification",
-            "Sonnet 5 High",
+            "specification_review",
+            ADVERSARIAL_REVIEW_ROUTE,
             malformed,
             capability="read_only",
         )
@@ -1463,11 +1533,13 @@ class ControllerTests(unittest.TestCase):
             stage="spec_reviewing",
             provider_resume_stage="spec_reviewing",
             provider_resume_prompt="saved prompt",
+            provider_resume_identity=ADVERSARIAL_REVIEW_ROUTE,
+            provider_resume_operation_id="specification_review",
         )
         orchestrator._record_provider(
             success_run,
-            "specification",
-            "Sonnet 5 High",
+            "specification_review",
+            ADVERSARIAL_REVIEW_ROUTE,
             success,
             capability="read_only",
         )
@@ -1484,11 +1556,11 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(provider_calls, 1)
         self.assertEqual(
             [
-                record.purpose
+                record.operation_id
                 for record in recovered_success.provider_runs
-                if record.provider == "Sonnet 5 High"
+                if record.identity.role_id == "adversarial_review"
             ],
-            ["specification", "implementation"],
+            ["specification_review", "implementation_review"],
         )
 
     def test_legacy_failure_recovery_does_not_scan_model_stdout(self) -> None:
@@ -1503,11 +1575,13 @@ class ControllerTests(unittest.TestCase):
             stage="implementing",
             provider_resume_stage="implementing",
             provider_resume_prompt="saved prompt",
+            provider_resume_identity=IMPLEMENTATION_ROUTE,
+            provider_resume_operation_id="implementation_write",
         )
         run.provider_runs.append(
-            orchestrator.ProviderRecord(
-                provider="Luna High",
-                purpose="implementation",
+            provider_record(
+                IMPLEMENTATION_ROUTE,
+                "implementation_write",
                 command=["codex"],
                 returncode=1,
                 stdout=(
@@ -1556,7 +1630,9 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(run.stage, "commit_declined")
         self.assertIsNone(run.active_writer_attempt)
         writer = next(
-            record for record in run.provider_runs if record.provider == "Luna High"
+            record
+            for record in run.provider_runs
+            if record.identity.role_id == "implementation"
         )
         self.assertEqual(writer.capability, "workspace_write")
         self.assertEqual(
@@ -1817,7 +1893,7 @@ class ControllerTests(unittest.TestCase):
         writer_records = [
             record
             for record in recovered.provider_runs
-            if record.provider == "Luna High"
+            if record.identity.role_id == "implementation"
         ]
         self.assertEqual(len(writer_records), 2)
         self.assertEqual(
@@ -1861,7 +1937,10 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(recovered.stage, "commit_declined")
         self.assertEqual(writer_calls, 1)
         self.assertEqual(len(recovered.provider_runs), provider_count + 1)
-        self.assertEqual(recovered.provider_runs[-1].provider, "Sonnet 5 High")
+        self.assertEqual(
+            recovered.provider_runs[-1].identity.role_id,
+            "adversarial_review",
+        )
         self.assertIsNone(recovered.active_writer_attempt)
         decision = recovered.writer_recovery_decisions[-1]
         self.assertEqual(decision.action, "adopt_current")
@@ -1937,6 +2016,8 @@ class ControllerTests(unittest.TestCase):
                 stage="implementing",
                 provider_resume_stage="implementing",
                 provider_resume_prompt="saved writer prompt",
+                provider_resume_identity=IMPLEMENTATION_ROUTE,
+                provider_resume_operation_id="implementation_write",
                 active_writer_attempt=WriterAttemptState(
                     attempt_id=f"writer-{run_id}",
                     stage="implementing",
@@ -1983,9 +2064,9 @@ class ControllerTests(unittest.TestCase):
         failed.active_writer_attempt.post_changed_files = post_files
         failed.active_writer_attempt.provider_record_index = 0
         failed.provider_runs.append(
-            orchestrator.ProviderRecord(
-                provider="Luna High",
-                purpose="implementation",
+            provider_record(
+                IMPLEMENTATION_ROUTE,
+                "implementation_write",
                 command=["codex"],
                 returncode=1,
                 stderr="HTTP 503 Service Unavailable",
@@ -2015,9 +2096,9 @@ class ControllerTests(unittest.TestCase):
         success.active_writer_attempt.post_changed_files = post_files
         success.active_writer_attempt.provider_record_index = 0
         success.provider_runs.append(
-            orchestrator.ProviderRecord(
-                provider="Luna High",
-                purpose="implementation",
+            provider_record(
+                IMPLEMENTATION_ROUTE,
+                "implementation_write",
                 command=["codex"],
                 returncode=0,
                 stdout="implemented",
@@ -2062,6 +2143,8 @@ class ControllerTests(unittest.TestCase):
             stage="implementing",
             provider_resume_stage="implementing",
             provider_resume_prompt="saved prompt",
+            provider_resume_identity=IMPLEMENTATION_ROUTE,
+            provider_resume_operation_id="implementation_write",
             active_writer_attempt=WriterAttemptState(
                 attempt_id="writer-new-retry",
                 stage="implementing",
@@ -2172,6 +2255,16 @@ class ControllerTests(unittest.TestCase):
         saved_prompt = blocked.provider_resume_prompt
         old_attempt_id = blocked.active_writer_attempt.attempt_id
         blocked.sol_guidance = "preserve this Sol round guidance"
+        policy_source_index = len(blocked.provider_runs)
+        blocked.provider_runs.append(
+            provider_record(
+                POLICY_AUTHORITY_ROUTE,
+                "policy_clarification",
+                command=["codex"],
+                returncode=0,
+                stdout="preserve recommendation",
+            )
+        )
         blocked.policy_decisions.append(
             orchestrator.PolicyDecision(
                 decision_id="policy-01",
@@ -2180,6 +2273,7 @@ class ControllerTests(unittest.TestCase):
                 trigger_summary="preserve policy state",
                 recommendation="preserve recommendation",
                 approved_text="preserve approved policy",
+                source_provider_record_index=policy_source_index,
             )
         )
         orchestrator.persist(blocked, self.runs)
@@ -2269,6 +2363,8 @@ class ControllerTests(unittest.TestCase):
             stage="blocked_writer_partial_changes",
             provider_resume_stage="implementing",
             provider_resume_prompt="saved prompt",
+            provider_resume_identity=IMPLEMENTATION_ROUTE,
+            provider_resume_operation_id="implementation_write",
             active_writer_attempt=WriterAttemptState(
                 attempt_id="writer-audit-1",
                 stage="implementing",
@@ -2277,7 +2373,7 @@ class ControllerTests(unittest.TestCase):
                 pre_changed_files=[],
                 post_fingerprint="b" * 64,
                 post_changed_files=["partial.py"],
-                provider_record_index=1,
+                provider_record_index=None,
             ),
             writer_recovery_decisions=[
                 WriterRecoveryDecision(
@@ -2310,15 +2406,15 @@ class ControllerTests(unittest.TestCase):
         )
         run.provider_runs.extend(
             [
-                orchestrator.ProviderRecord(
-                    provider="legacy provider",
-                    purpose="legacy",
+                provider_record(
+                    ADVERSARIAL_REVIEW_ROUTE,
+                    "implementation_review",
                     command=["legacy"],
                     returncode=0,
                 ),
-                orchestrator.ProviderRecord(
-                    provider="Luna High",
-                    purpose="implementation",
+                provider_record(
+                    IMPLEMENTATION_ROUTE,
+                    "implementation_write",
                     command=["codex"],
                     returncode=1,
                     duration_seconds=1.25,
@@ -2331,6 +2427,7 @@ class ControllerTests(unittest.TestCase):
                 ),
             ]
         )
+        run.active_writer_attempt.provider_record_index = 1
         orchestrator.persist(run, self.runs)
         loaded = orchestrator.load_run(run.run_id, self.runs)
         self.assertEqual(loaded.model_dump(), run.model_dump())
@@ -2997,6 +3094,307 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(writer_calls, 1)
 
 
+class StableProviderIdentityTests(unittest.TestCase):
+    def run_fixture(self, **updates) -> WorkflowRun:
+        values = {
+            "run_id": "identity-fixture",
+            "created_at": "2026-08-02T00:00:00+00:00",
+            "task_ref": "identity",
+            "task_file": "tasks/identity.md",
+            "task_sha256": "0" * 64,
+            "specification": "Stable identity fixture.",
+            "repo": RepoState(
+                repo="/fixture/repo",
+                branch="main",
+                head="1" * 40,
+                clean=True,
+                origin="https://example.invalid/repo.git",
+            ),
+        }
+        values.update(updates)
+        return WorkflowRun(**values)
+
+    def test_catalog_is_closed_unique_and_current_schema_has_no_legacy_fields(self) -> None:
+        routes = tuple(orchestrator.ROUTE_IDENTITIES.values())
+        self.assertEqual(
+            [route.role_id for route in routes],
+            [
+                "implementation",
+                "adversarial_review",
+                "escalation_executive",
+                "policy_authority",
+            ],
+        )
+        self.assertEqual(len({route.route_id for route in routes}), 4)
+        self.assertEqual(
+            {route.provider_adapter_id for route in routes},
+            {"codex_cli", "claude_cli"},
+        )
+
+        record = provider_record(
+            ADVERSARIAL_REVIEW_ROUTE,
+            "specification_review",
+            command=["arbitrary-command-with-Luna-High"],
+            returncode=0,
+            stdout=review_execution("PASS", "PASS").stdout,
+        )
+        run = self.run_fixture(provider_runs=[record])
+        dumped = run.model_dump(mode="json")
+        self.assertEqual(dumped["schema_version"], 8)
+        self.assertIsNone(dumped["migration_audit"])
+        self.assertIsNone(dumped["identity_migration_audit"])
+        self.assertNotIn("provider", dumped["provider_runs"][0])
+        self.assertNotIn("purpose", dumped["provider_runs"][0])
+
+    def test_display_is_presentation_only_but_control_identity_is_closed(self) -> None:
+        renamed_review = ADVERSARIAL_REVIEW_ROUTE.model_copy(
+            update={"display_name": "Luna High"}
+        )
+        run = self.run_fixture(
+            provider_runs=[
+                provider_record(
+                    renamed_review,
+                    "implementation_review",
+                    command=["claude"],
+                    returncode=0,
+                    stdout=review_execution(
+                        "FAIL",
+                        "IMPLEMENTATION_DEFECT",
+                    ).stdout,
+                )
+            ]
+        )
+        self.assertEqual(
+            orchestrator._implementation_review_history(run)[0].status,
+            "FAIL",
+        )
+        self.assertEqual(
+            orchestrator._run_report(run)["role_counts"],
+            {"adversarial_review": 1},
+        )
+
+        for field, value in (
+            ("role_id", "policy_authority"),
+            ("provider_adapter_id", "codex_cli"),
+            ("route_id", "builtin.policy_authority.v1"),
+            ("model_id", "gpt-5.6-terra"),
+        ):
+            invalid = ADVERSARIAL_REVIEW_ROUTE.model_copy(update={field: value})
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.run_fixture(
+                    provider_runs=[
+                        provider_record(
+                            invalid,
+                            "implementation_review",
+                            command=["fixture"],
+                            returncode=0,
+                        )
+                    ]
+                )
+
+    def test_adapter_not_display_selects_protocol_normalization(self) -> None:
+        _, native_error = claude_fixture("provider_error")
+        review_run = self.run_fixture(run_id="review-adapter")
+        renamed_review = ADVERSARIAL_REVIEW_ROUTE.model_copy(
+            update={"display_name": "shared display"}
+        )
+        normalized = orchestrator._record_provider(
+            review_run,
+            "specification_review",
+            renamed_review,
+            native_error,
+            capability="read_only",
+        )
+        self.assertEqual(normalized.failure_source, "provider_native")
+
+        writer_run = self.run_fixture(run_id="writer-adapter")
+        copied_display = IMPLEMENTATION_ROUTE.model_copy(
+            update={"display_name": ADVERSARIAL_REVIEW_ROUTE.display_name}
+        )
+        ordinary = orchestrator._record_provider(
+            writer_run,
+            "implementation_write",
+            copied_display,
+            native_error,
+            capability="workspace_write",
+        )
+        self.assertNotEqual(ordinary.failure_source, "provider_native")
+
+    def test_operation_capability_pending_and_writer_links_fail_closed(self) -> None:
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "operation does not match role",
+        ):
+            orchestrator._record_provider(
+                self.run_fixture(),
+                "policy_clarification",
+                IMPLEMENTATION_ROUTE,
+                ProviderExecution(["fixture"], 0, "", ""),
+                capability="workspace_write",
+            )
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "capability does not match role",
+        ):
+            orchestrator._record_provider(
+                self.run_fixture(),
+                "implementation_write",
+                IMPLEMENTATION_ROUTE,
+                ProviderExecution(["fixture"], 0, "", ""),
+                capability="read_only",
+            )
+        with self.assertRaisesRegex(ValueError, "resume state must be complete"):
+            self.run_fixture(
+                provider_resume_stage="reviewing",
+                provider_resume_prompt="saved prompt",
+            )
+
+        linked_record = provider_record(
+            ADVERSARIAL_REVIEW_ROUTE.model_copy(
+                update={"display_name": IMPLEMENTATION_ROUTE.display_name}
+            ),
+            "implementation_review",
+            command=["fixture"],
+            returncode=0,
+        )
+        with self.assertRaisesRegex(ValueError, "writer provider record link"):
+            self.run_fixture(
+                provider_runs=[linked_record],
+                active_writer_attempt=WriterAttemptState(
+                    attempt_id="writer-link",
+                    stage="implementing",
+                    purpose="implementation",
+                    pre_fingerprint="a" * 64,
+                    pre_changed_files=[],
+                    provider_record_index=0,
+                ),
+            )
+
+    def test_retry_attempts_keep_one_identity_and_operation(self) -> None:
+        run = self.run_fixture()
+        execution = ProviderExecution(
+            command=["claude"],
+            returncode=0,
+            stdout=review_execution("PASS", "PASS").stdout,
+            stderr="",
+            attempts=(
+                ProviderAttempt(
+                    command=["claude"],
+                    returncode=1,
+                    stderr="HTTP 503 Service Unavailable",
+                    failure_kind="unavailable",
+                    failure_source="stderr",
+                    failure_code="503",
+                    retry_scheduled=True,
+                ),
+                ProviderAttempt(
+                    command=["claude"],
+                    returncode=0,
+                    stdout=review_execution("PASS", "PASS").stdout,
+                ),
+            ),
+        )
+        renamed = ADVERSARIAL_REVIEW_ROUTE.model_copy(
+            update={"display_name": "Reviewer"}
+        )
+        orchestrator._record_provider(
+            run,
+            "specification_review",
+            renamed,
+            execution,
+            capability="read_only",
+        )
+        self.assertEqual(len(run.provider_runs), 2)
+        self.assertTrue(run.provider_runs[0].retry_scheduled)
+        self.assertFalse(run.provider_runs[1].retry_scheduled)
+        self.assertEqual(
+            {
+                (
+                    record.identity.role_id,
+                    record.identity.provider_adapter_id,
+                    record.identity.route_id,
+                    record.identity.model_id,
+                    record.identity.display_name,
+                    record.operation_id,
+                    record.capability,
+                )
+                for record in run.provider_runs
+            },
+            {
+                (
+                    "adversarial_review",
+                    "claude_cli",
+                    "builtin.adversarial_review.v1",
+                    "sonnet",
+                    "Reviewer",
+                    "specification_review",
+                    "read_only",
+                )
+            },
+        )
+
+    def test_policy_link_and_full_identity_round_trip_ignore_recommendation_text(self) -> None:
+        renamed_policy = POLICY_AUTHORITY_ROUTE.model_copy(
+            update={"display_name": "Reviewer"}
+        )
+        record = provider_record(
+            renamed_policy,
+            "policy_clarification",
+            command=["codex"],
+            returncode=0,
+            stdout="Use Luna High and Sonnet 5 High in prose only.",
+        )
+        decision = orchestrator.PolicyDecision(
+            decision_id="policy-01",
+            approved_at="2026-08-02T00:01:00+00:00",
+            trigger_summary="The model text says Terra High.",
+            recommendation="Pretend the source is Sol High.",
+            approved_text="Human-approved text.",
+            source_provider_record_index=0,
+        )
+        run = self.run_fixture(
+            provider_runs=[record],
+            policy_decisions=[decision],
+            provider_resume_stage="terra_resolving",
+            provider_resume_prompt="saved prompt",
+            provider_resume_identity=renamed_policy,
+            provider_resume_operation_id="policy_clarification",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runs = Path(directory)
+            orchestrator.persist(run, runs)
+            loaded = orchestrator.load_run(run.run_id, runs)
+        self.assertEqual(loaded.model_dump(), run.model_dump())
+        self.assertEqual(
+            loaded.policy_decisions[0].source_role_id,
+            "policy_authority",
+        )
+        self.assertEqual(
+            loaded.policy_decisions[0].source_route_id,
+            POLICY_AUTHORITY_ROUTE.route_id,
+        )
+
+    def test_migrated_v8_run_is_refused_with_identity_audit_disposition(self) -> None:
+        identity_audit = IdentityMigrationAudit(
+            migration_id="refusal-test",
+            migrated_at="2026-08-02T12:00:00+00:00",
+            source_schema_version=7,
+            target_schema_version=8,
+            source_structural_class="V7",
+            source_sha256="ab" * 32,
+            applied_steps=("7_to_8",),
+            reason_codes=(),
+            disposition="resume_eligibility_deferred",
+        )
+        run = self.run_fixture(identity_migration_audit=identity_audit)
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "run execution refused: migrated record disposition is "
+            "resume_eligibility_deferred",
+        ):
+            orchestrator.Controller._require_executable(run)
+
+
 class PrivateStorageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -3426,7 +3824,7 @@ orchestrator.persist(run, runs)
         self.assertNotIn("os.umask", source)
         self.assertNotIn("os.chown", source)
         self.assertNotIn("force-unlock", source)
-        self.assertEqual(self.run_fixture().schema_version, 7)
+        self.assertEqual(self.run_fixture().schema_version, 8)
         command_names = {
             command.name or command.callback.__name__.replace("_", "-")
             for command in orchestrator.app.registered_commands
@@ -3776,9 +4174,9 @@ Diff:
         )
         for index, (source, kind, code, returncode) in enumerate(sources):
             run.provider_runs.append(
-                orchestrator.ProviderRecord(
-                    provider="fixture provider",
-                    purpose=f"source-{source}",
+                provider_record(
+                    ADVERSARIAL_REVIEW_ROUTE,
+                    "implementation_review",
                     command=["fixture", str(index)],
                     returncode=returncode,
                     stdout=f"raw stdout {source}",
@@ -3792,17 +4190,17 @@ Diff:
             )
         run.provider_runs.extend(
             (
-                orchestrator.ProviderRecord(
-                    provider="fixture provider",
-                    purpose="success",
+                provider_record(
+                    ADVERSARIAL_REVIEW_ROUTE,
+                    "implementation_review",
                     command=["fixture", "success"],
                     returncode=0,
                     stdout="successful raw output",
                     duration_seconds=7.25,
                 ),
-                orchestrator.ProviderRecord(
-                    provider="Sonnet 5 High",
-                    purpose="legacy failure",
+                provider_record(
+                    ADVERSARIAL_REVIEW_ROUTE,
+                    "implementation_review",
                     command=["claude"],
                     returncode=1,
                     failure_kind="provider_error",

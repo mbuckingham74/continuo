@@ -1,4 +1,4 @@
-"""Deterministic adversarial coverage for the Gate 2.2 migration contract."""
+"""Deterministic adversarial coverage for the Gate 2.2-2.3 migration contracts."""
 
 from __future__ import annotations
 
@@ -44,6 +44,38 @@ def migrated(source: bytes) -> WorkflowRun:
     ).run
 
 
+def schema7_bytes() -> bytes:
+    source = fixture_bytes("6_current")
+    classification = run_migrations.classify_run_bytes(source)
+    context = run_migrations.MigrationContext(
+        migration_id="historical-v7-fixture",
+        migrated_at="2026-08-02T11:00:00+00:00",
+        source_schema_version=6,
+        source_structural_class=classification.structural_class,
+        source_sha256=classification.source_sha256,
+        disposition=classification.disposition,
+        applied_steps=("6_to_7",),
+        reason_codes=(),
+    )
+    payload, _ = run_migrations.MIGRATION_REGISTRY[(6, 7)](
+        fixture_object("6_current"),
+        context,
+    )
+    return encoded(payload)
+
+
+def schema7_object() -> dict[str, object]:
+    return json.loads(schema7_bytes())
+
+
+def migration_source(version: int) -> bytes:
+    if version == 7:
+        return schema7_bytes()
+    if version == 6:
+        return fixture_bytes("6_base")
+    return fixture_bytes(version)
+
+
 class MigrationContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -73,14 +105,26 @@ class MigrationContractTests(unittest.TestCase):
         )
 
     def test_c1_c2_current_constant_and_noncurrent_writes_fail_closed(self) -> None:
-        payload = fixture_object("6_current")
-        payload["schema_version"] = CURRENT_RUN_SCHEMA_VERSION
-        payload["migration_audit"] = None
-        current = WorkflowRun.model_validate(payload)
-        self.assertEqual(current.schema_version, 7)
+        current = WorkflowRun(
+            run_id="current-schema-eight",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="current",
+            task_file="tasks/current.md",
+            task_sha256="0" * 64,
+            specification="Current schema fixture.",
+            repo=RepoState(
+                repo="/fixture/repo",
+                branch="main",
+                head="1" * 40,
+                clean=True,
+                origin="https://example.invalid/repo.git",
+            ),
+        )
+        self.assertEqual(current.schema_version, 8)
         self.assertIsNone(current.migration_audit)
+        self.assertIsNone(current.identity_migration_audit)
 
-        for value in (1, 6, 8, True, "7", 7.0):
+        for value in (1, 6, 7, 9, True, "8", 8.0):
             candidate = current.model_copy(deep=True)
             candidate.__dict__["schema_version"] = value
             with self.subTest(value=value):
@@ -103,15 +147,15 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(candidate.updated_at, unchanged_update)
 
     def test_c3_registry_is_exact_adjacent_closed_and_ordered(self) -> None:
-        expected = [(version, version + 1) for version in range(1, 7)]
+        expected = [(version, version + 1) for version in range(1, 8)]
         self.assertEqual(sorted(run_migrations.MIGRATION_REGISTRY), expected)
         self.assertTrue(all(callable(step) for step in run_migrations.MIGRATION_REGISTRY.values()))
-        for version in range(1, 7):
+        for version in range(1, 8):
             self.assertEqual(
                 run_migrations.migration_steps(version),
-                tuple(f"{item}_to_{item + 1}" for item in range(version, 7)),
+                tuple(f"{item}_to_{item + 1}" for item in range(version, 8)),
             )
-        for invalid in (0, 7, 8):
+        for invalid in (0, 8, 9):
             self.assertEqual(run_migrations.migration_steps(invalid), ())
 
     def test_h1_h2_all_committed_fixtures_classify_and_preserve_exact_values(self) -> None:
@@ -133,8 +177,16 @@ class MigrationContractTests(unittest.TestCase):
         original = fixture_object("6_current")
         result = migrated(source)
         dumped = result.model_dump(mode="json")
+        transformed = {
+            "schema_version",
+            "provider_runs",
+            "policy_decisions",
+            "provider_resume_stage",
+            "provider_resume_prompt",
+            "migration_audit",
+        }
         for key, value in original.items():
-            if key != "schema_version":
+            if key not in transformed:
                 self.assertEqual(dumped[key], value)
         audit = result.migration_audit
         self.assertIsNotNone(audit)
@@ -142,6 +194,10 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(audit.source_structural_class, "V6-current")
         self.assertEqual(audit.source_sha256, hashlib.sha256(source).hexdigest())
         self.assertEqual(audit.disposition, "resume_eligibility_deferred")
+        self.assertEqual(
+            result.identity_migration_audit.applied_steps,
+            ("6_to_7", "7_to_8"),
+        )
 
     def test_v1_through_v5_adjacent_transforms_preserve_history_without_inference(self) -> None:
         for version in range(1, 6):
@@ -158,8 +214,11 @@ class MigrationContractTests(unittest.TestCase):
             self.assertEqual(run.specification, source["specification"])
             self.assertEqual(run.sol_guidance, source.get("sol_guidance"))
             self.assertEqual(
-                [decision.model_dump(mode="json") for decision in run.policy_decisions],
-                source.get("policy_decisions", []),
+                [decision.approved_text for decision in run.policy_decisions],
+                [
+                    decision["approved_text"]
+                    for decision in source.get("policy_decisions", [])
+                ],
             )
             for index, provider in enumerate(source.get("provider_runs", [])):
                 self.assertEqual(run.provider_runs[index].duration_seconds, provider.get("duration_seconds"))
@@ -273,9 +332,320 @@ class MigrationContractTests(unittest.TestCase):
         classified = run_migrations.classify_run_bytes(encoded(identity))
         self.assertEqual((classified.treatment, classified.reason_code), ("archive", "ownership_evidence_incoherent"))
 
+    def test_identity_m2_all_six_legacy_pairs_map_exactly(self) -> None:
+        payload = schema7_object()
+        payload["stage"] = "created"
+        payload["active_writer_attempt"] = None
+        payload["policy_decisions"] = []
+        pairs = [
+            ("Luna High", "implementation", "workspace_write"),
+            ("Luna High", "correction", "workspace_write"),
+            ("Sonnet 5 High", "specification", "read_only"),
+            ("Sonnet 5 High", "implementation", "read_only"),
+            ("Sol High", "escalation guidance", "read_only"),
+            ("Terra High", "policy clarification", "read_only"),
+        ]
+        payload["provider_runs"] = [
+            {
+                "provider": provider,
+                "purpose": purpose,
+                "command": ["adversarial", "Luna High", "sonnet"],
+                "returncode": 0,
+                "capability": capability,
+            }
+            for provider, purpose, capability in pairs
+        ]
+
+        run = migrated(encoded(payload))
+
+        self.assertEqual(
+            [record.identity.role_id for record in run.provider_runs],
+            [
+                "implementation",
+                "implementation",
+                "adversarial_review",
+                "adversarial_review",
+                "escalation_executive",
+                "policy_authority",
+            ],
+        )
+        self.assertEqual(
+            [record.operation_id for record in run.provider_runs],
+            [
+                "implementation_write",
+                "correction_write",
+                "specification_review",
+                "implementation_review",
+                "escalation_guidance",
+                "policy_clarification",
+            ],
+        )
+        self.assertEqual(
+            [record.identity.provider_adapter_id for record in run.provider_runs],
+            [
+                "codex_cli",
+                "codex_cli",
+                "claude_cli",
+                "claude_cli",
+                "codex_cli",
+                "codex_cli",
+            ],
+        )
+        for record in run.model_dump(mode="json")["provider_runs"]:
+            self.assertNotIn("provider", record)
+            self.assertNotIn("purpose", record)
+            self.assertEqual(
+                record["command"],
+                ["adversarial", "Luna High", "sonnet"],
+            )
+
+    def test_identity_m4_m5_v7_requires_approval_and_preserves_prior_audit(self) -> None:
+        ordinary = schema7_object()
+        ordinary["migration_audit"] = None
+        ordinary_source = encoded(ordinary)
+        run_id, path = self.write_run(ordinary_source)
+        with orchestrator.console.capture():
+            declined = orchestrator.migrate_run_record(
+                run_id,
+                self.runs,
+                approval=lambda _: False,
+            )
+        self.assertIsNone(declined)
+        self.assertEqual(path.read_bytes(), ordinary_source)
+
+        migrated_ordinary = self.approve(run_id)
+        self.assertIsNotNone(migrated_ordinary)
+        self.assertIsNone(migrated_ordinary.migration_audit)
+        self.assertEqual(
+            migrated_ordinary.identity_migration_audit.source_structural_class,
+            "V7",
+        )
+        self.assertEqual(
+            migrated_ordinary.identity_migration_audit.applied_steps,
+            ("7_to_8",),
+        )
+        self.assertEqual(
+            migrated_ordinary.identity_migration_audit.disposition,
+            "resume_eligibility_deferred",
+        )
+
+        prior = schema7_object()
+        prior["run_id"] = "v7-prior-audit"
+        original_audit = copy.deepcopy(prior["migration_audit"])
+        migrated_prior = migrated(encoded(prior))
+        self.assertEqual(
+            migrated_prior.migration_audit.model_dump(mode="json"),
+            original_audit,
+        )
+        self.assertIsNotNone(migrated_prior.identity_migration_audit)
+
+    def test_identity_m6_policy_link_is_exact_or_explicitly_absent(self) -> None:
+        linked = schema7_object()
+        linked["stage"] = "created"
+        linked["active_writer_attempt"] = None
+        linked["provider_runs"].append(
+            {
+                "provider": "Terra High",
+                "purpose": "policy clarification",
+                "command": ["codex", "unrelated-model-text"],
+                "returncode": 0,
+                "stdout": "Recommendation names Sol High.",
+                "capability": "read_only",
+            }
+        )
+        linked_run = migrated(encoded(linked))
+        decision = linked_run.policy_decisions[0]
+        self.assertEqual(decision.source_role_id, "policy_authority")
+        self.assertEqual(
+            decision.source_route_id,
+            "builtin.policy_authority.v1",
+        )
+        self.assertEqual(
+            decision.source_provider_record_index,
+            len(linked["provider_runs"]) - 1,
+        )
+        self.assertIsNone(decision.source_link_reason)
+
+        absent = schema7_object()
+        absent["stage"] = "created"
+        absent["active_writer_attempt"] = None
+        absent_run = migrated(encoded(absent))
+        absent_decision = absent_run.policy_decisions[0]
+        self.assertIsNone(absent_decision.source_provider_record_index)
+        self.assertEqual(
+            absent_decision.source_link_reason,
+            "legacy_source_attempt_unlinked",
+        )
+        self.assertIn(
+            "legacy_policy_source_attempt_unlinked",
+            absent_run.identity_migration_audit.reason_codes,
+        )
+
+        terra_record = {
+            "provider": "Terra High",
+            "purpose": "policy clarification",
+            "command": ["codex", "unrelated-model-text"],
+            "returncode": 0,
+            "stdout": "Recommendation names Sol High.",
+            "capability": "read_only",
+        }
+        paired = schema7_object()
+        paired["stage"] = "created"
+        paired["active_writer_attempt"] = None
+        paired["policy_decisions"].append(
+            {
+                "decision_id": "policy-02",
+                "approved_at": "2026-08-02T00:00:00+00:00",
+                "approved_by": "human",
+                "trigger_summary": "Second ambiguity.",
+                "recommendation": "Second recommendation.",
+                "approved_text": "Second human text.",
+            }
+        )
+        paired["provider_runs"].append(copy.deepcopy(terra_record))
+        paired["provider_runs"].append(copy.deepcopy(terra_record))
+        paired_run = migrated(encoded(paired))
+        self.assertEqual(
+            [
+                (decision.source_provider_record_index, decision.source_link_reason)
+                for decision in paired_run.policy_decisions
+            ],
+            [
+                (len(paired["provider_runs"]) - 2, None),
+                (len(paired["provider_runs"]) - 1, None),
+            ],
+        )
+
+        mismatch = schema7_object()
+        mismatch["stage"] = "created"
+        mismatch["active_writer_attempt"] = None
+        mismatch["policy_decisions"].append(
+            {
+                "decision_id": "policy-02",
+                "approved_at": "2026-08-02T00:00:00+00:00",
+                "approved_by": "human",
+                "trigger_summary": "Second ambiguity.",
+                "recommendation": "Second recommendation.",
+                "approved_text": "Second human text.",
+            }
+        )
+        mismatch["provider_runs"].append(copy.deepcopy(terra_record))
+        mismatch_run = migrated(encoded(mismatch))
+        for decision in mismatch_run.policy_decisions:
+            self.assertIsNone(decision.source_provider_record_index)
+            self.assertEqual(
+                decision.source_link_reason,
+                "legacy_source_attempt_unlinked",
+            )
+
+    def test_identity_m7_pending_resume_maps_without_provider_invocation(self) -> None:
+        payload = schema7_object()
+        payload["active_writer_attempt"] = None
+        payload["stage"] = "sol_escalating"
+        payload["provider_resume_stage"] = "sol_escalating"
+        payload["provider_resume_prompt"] = "saved Sol prompt"
+
+        with patch.object(
+            orchestrator,
+            "execute_sol_escalation",
+            side_effect=AssertionError("provider invoked"),
+        ):
+            run = migrated(encoded(payload))
+
+        self.assertEqual(
+            run.provider_resume_identity.role_id,
+            "escalation_executive",
+        )
+        self.assertEqual(
+            run.provider_resume_identity.route_id,
+            "builtin.escalation_executive.v1",
+        )
+        self.assertEqual(
+            run.provider_resume_operation_id,
+            "escalation_guidance",
+        )
+
+    def test_identity_m8_m9_unknown_or_contradictory_history_archives(self) -> None:
+        variants: list[tuple[dict[str, object], str]] = []
+        unknown = schema7_object()
+        unknown["provider_runs"][0]["provider"] = "renamed reviewer"
+        variants.append((unknown, "legacy_provider_identity_unmappable"))
+        purpose = schema7_object()
+        purpose["provider_runs"][0]["purpose"] = "correction"
+        variants.append((purpose, "legacy_provider_identity_unmappable"))
+        policy = schema7_object()
+        policy["policy_decisions"][0]["source_provider"] = "Sol High"
+        variants.append((policy, "legacy_policy_source_unmappable"))
+        pending = schema7_object()
+        pending["provider_resume_stage"] = "unknown_stage"
+        pending["provider_resume_prompt"] = "saved"
+        variants.append((pending, "legacy_provider_resume_unmappable"))
+        capability = schema7_object()
+        capability["provider_runs"][0]["capability"] = "workspace_write"
+        variants.append((capability, "legacy_provider_capability_incoherent"))
+        writer = schema7_object()
+        writer["active_writer_attempt"]["provider_record_index"] = 0
+        variants.append((writer, "writer_evidence_incoherent"))
+
+        for payload, reason in variants:
+            with self.subTest(reason=reason):
+                classification = run_migrations.classify_run_bytes(encoded(payload))
+                self.assertEqual(classification.treatment, "archive")
+                self.assertEqual(classification.record_state, "ARCHIVE_ONLY")
+                self.assertEqual(classification.reason_code, reason)
+
+    def test_identity_m10_raw_command_is_preserved_not_interpreted(self) -> None:
+        payload = schema7_object()
+        payload["stage"] = "created"
+        payload["active_writer_attempt"] = None
+        command = [
+            "claude",
+            "--model",
+            "gpt-5.6-terra",
+            "Luna High / correction / unknown provider",
+        ]
+        payload["provider_runs"][0]["command"] = command
+
+        run = migrated(encoded(payload))
+
+        self.assertEqual(run.provider_runs[0].command, command)
+        self.assertEqual(
+            run.provider_runs[0].identity.role_id,
+            "adversarial_review",
+        )
+        self.assertEqual(
+            run.provider_runs[0].operation_id,
+            "specification_review",
+        )
+
+    def test_identity_migrated_v8_classifies_resume_blocked_from_identity_audit(self) -> None:
+        migrated_run = migrated(encoded(schema7_object()))
+        audit = migrated_run.identity_migration_audit
+        assert audit is not None
+        classification = run_migrations.classify_run_bytes(
+            migrated_run.model_dump_json().encode()
+        )
+        self.assertEqual(classification.treatment, "current")
+        self.assertEqual(classification.record_state, "RESUME_BLOCKED")
+        self.assertEqual(classification.disposition, audit.disposition)
+        self.assertEqual(classification.reason_code, audit.disposition)
+        self.assertEqual(
+            classification.structural_class,
+            audit.source_structural_class,
+        )
+
+    def test_identity_v8_legacy_audit_without_identity_audit_archives(self) -> None:
+        migrated_run = migrated(encoded(schema7_object()))
+        payload = json.loads(migrated_run.model_dump_json())
+        payload["identity_migration_audit"] = None
+        classification = run_migrations.classify_run_bytes(encoded(payload))
+        self.assertEqual(classification.treatment, "archive")
+        self.assertEqual(classification.record_state, "ARCHIVE_ONLY")
+        self.assertEqual(classification.reason_code, "archive_only")
+
     def test_e1_e2_e3_strict_envelope_and_version_dispatch(self) -> None:
         base = fixture_object("6_current")
-        invalid_versions = [None, True, "7", 7.0, 7.5, 0, -1]
+        invalid_versions = [None, True, "8", 8.0, 8.5, 0, -1]
         for value in invalid_versions:
             payload = copy.deepcopy(base)
             payload["schema_version"] = value
@@ -286,7 +656,7 @@ class MigrationContractTests(unittest.TestCase):
         missing = copy.deepcopy(base)
         missing.pop("schema_version")
         self.assertEqual(run_migrations.classify_run_bytes(encoded(missing)).reason_code, "invalid_schema_version")
-        for version in (8, 99):
+        for version in (9, 99):
             payload = copy.deepcopy(base)
             payload["schema_version"] = version
             classified = run_migrations.classify_run_bytes(encoded(payload))
@@ -359,7 +729,7 @@ class MigrationContractTests(unittest.TestCase):
 
         def observe_replace(source_path: Path, target_path: Path) -> None:
             candidate = json.loads(Path(source_path).read_text())
-            self.assertEqual(candidate["schema_version"], 7)
+            self.assertEqual(candidate["schema_version"], 8)
             replacements.append((Path(source_path), Path(target_path)))
             real_replace(source_path, target_path)
 
@@ -369,7 +739,7 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(len(replacements), 1)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         persisted = json.loads(path.read_text())
-        self.assertEqual(persisted["schema_version"], 7)
+        self.assertEqual(persisted["schema_version"], 8)
         self.assertEqual(persisted["migration_audit"]["source_sha256"], hashlib.sha256(source).hexdigest())
 
         stable = path.stat()
@@ -403,7 +773,7 @@ class MigrationContractTests(unittest.TestCase):
 
     def test_a1_a2_transform_validation_and_replace_failures_preserve_source(self) -> None:
         for edge in list(run_migrations.MIGRATION_REGISTRY):
-            source = fixture_bytes(edge[0]) if edge[0] < 6 else fixture_bytes("6_base")
+            source = migration_source(edge[0])
             run_id, path = self.write_run(source)
             original = run_migrations.MIGRATION_REGISTRY[edge]
 
@@ -420,7 +790,7 @@ class MigrationContractTests(unittest.TestCase):
                 path.unlink()
 
         for edge in list(run_migrations.MIGRATION_REGISTRY):
-            source = fixture_bytes(edge[0]) if edge[0] < 6 else fixture_bytes("6_base")
+            source = migration_source(edge[0])
             run_id, path = self.write_run(source)
             original = run_migrations.MIGRATION_REGISTRY[edge]
 
@@ -525,7 +895,7 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(sum(item.endswith(":success") for item in results), 1)
         self.assertEqual(sum("source_changed" in item for item in results), 1)
         persisted = json.loads(path.read_text())
-        self.assertEqual(persisted["schema_version"], 7)
+        self.assertEqual(persisted["schema_version"], 8)
         self.assertEqual(persisted["migration_audit"]["migration_id"], "migration-test-01")
 
     def test_a5_a6_crash_boundaries_leave_one_retryable_or_complete_record(self) -> None:
@@ -537,7 +907,7 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), source)
         self.assertEqual(list(self.runs.glob(".run-*.tmp")), [])
         self.approve(run_id)
-        self.assertEqual(json.loads(path.read_text())["schema_version"], 7)
+        self.assertEqual(json.loads(path.read_text())["schema_version"], 8)
 
         second_source = fixture_bytes(4)
         second_id, second_path = self.write_run(second_source)
@@ -552,7 +922,7 @@ class MigrationContractTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.approve(second_id)
         complete = second_path.read_bytes()
-        self.assertEqual(json.loads(complete)["schema_version"], 7)
+        self.assertEqual(json.loads(complete)["schema_version"], 8)
         self.approve(second_id)
         self.assertEqual(second_path.read_bytes(), complete)
 
@@ -581,7 +951,7 @@ class MigrationContractTests(unittest.TestCase):
         self.write_run(encoded(archive), "archive")
         future = copy.deepcopy(historical)
         future["run_id"] = "future"
-        future["schema_version"] = 8
+        future["schema_version"] = 9
         self.write_run(encoded(future), "future")
         self.write_run(b"CORRUPT-SECRET", "corrupt")
 
@@ -635,7 +1005,7 @@ class MigrationContractTests(unittest.TestCase):
                 with self.subTest(action=action):
                     with self.assertRaisesRegex(orchestrator.ControllerError, "migrated record disposition"):
                         action()
-        self.assertEqual(json.loads(path.read_text())["schema_version"], 7)
+        self.assertEqual(json.loads(path.read_text())["schema_version"], 8)
 
     def test_p1_p2_p3_storage_safety_redaction_and_text_independence(self) -> None:
         source = fixture_object(5)
@@ -678,7 +1048,15 @@ class MigrationContractTests(unittest.TestCase):
         self.assertIn('"direct_url.json"', compatibility_source)
         self.assertEqual(
             [key for key in run_migrations.MIGRATION_REGISTRY],
-            [(1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)],
+            [
+                (1, 2),
+                (2, 3),
+                (3, 4),
+                (4, 5),
+                (5, 6),
+                (6, 7),
+                (7, 8),
+            ],
         )
         command_names = {
             command.name or command.callback.__name__.replace("_", "-")

@@ -12,10 +12,13 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from models import (
+    ADVERSARIAL_REVIEW_ROUTE,
     CURRENT_RUN_SCHEMA_VERSION,
+    ESCALATION_EXECUTIVE_ROUTE,
     GitRecord,
+    IMPLEMENTATION_ROUTE,
     OLDEST_MIGRATABLE_RUN_SCHEMA_VERSION,
-    PolicyDecision,
+    POLICY_AUTHORITY_ROUTE,
     ProviderCapability,
     ProviderFailureKind,
     ProviderFailureSource,
@@ -96,6 +99,41 @@ class _ProviderV6(_ProviderV5):
     retry_scheduled: bool = False
 
 
+class _PolicyDecisionV4(_ClosedModel):
+    decision_id: str
+    approved_at: str
+    approved_by: Literal["human"] = "human"
+    source_provider: str = "Terra High"
+    trigger_finding_key: str | None = None
+    trigger_summary: str
+    recommendation: str
+    approved_text: str
+
+
+class _RunMigrationAuditV7(_ClosedModel):
+    migration_id: str = Field(min_length=1, max_length=64)
+    migrated_at: str
+    source_schema_version: int = Field(ge=1, lt=7)
+    target_schema_version: Literal[7] = 7
+    source_structural_class: Literal[
+        "V1",
+        "V2",
+        "V3",
+        "V4",
+        "V5",
+        "V6-base",
+        "V6-supervisor",
+        "V6-provenance",
+        "V6-writer",
+        "V6-owner",
+        "V6-current",
+    ]
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    applied_steps: tuple[str, ...] = Field(min_length=1, strict=False)
+    reason_codes: tuple[str, ...] = Field(default_factory=tuple, strict=False)
+    disposition: RunMigrationDisposition
+
+
 class _RunV1(_ClosedModel):
     schema_version: Literal[1] = 1
     run_id: str
@@ -135,7 +173,7 @@ class _RunV3(_RunV2):
 
 class _RunV4(_RunV3):
     schema_version: Literal[4] = 4
-    policy_decisions: list[PolicyDecision] = Field(default_factory=list)
+    policy_decisions: list[_PolicyDecisionV4] = Field(default_factory=list)
 
 
 class _RunV5(_RunV4):
@@ -156,6 +194,11 @@ class _RunV6(_RunV5):
     provider_runs: list[_ProviderV6] = Field(default_factory=list)
 
 
+class _RunV7(_RunV6):
+    schema_version: Literal[7] = 7
+    migration_audit: _RunMigrationAuditV7 | None = None
+
+
 _HISTORICAL_MODELS: dict[int, type[BaseModel]] = {
     1: _RunV1,
     2: _RunV2,
@@ -163,6 +206,7 @@ _HISTORICAL_MODELS: dict[int, type[BaseModel]] = {
     4: _RunV4,
     5: _RunV5,
     6: _RunV6,
+    7: _RunV7,
 }
 
 
@@ -376,10 +420,112 @@ def _v6_coherence_reason(run: _RunV6) -> tuple[str, str | None] | None:
     return None
 
 
+_LEGACY_PROVIDER_IDENTITIES = {
+    ("Luna High", "implementation"): (
+        IMPLEMENTATION_ROUTE,
+        "implementation_write",
+    ),
+    ("Luna High", "correction"): (
+        IMPLEMENTATION_ROUTE,
+        "correction_write",
+    ),
+    ("Sonnet 5 High", "specification"): (
+        ADVERSARIAL_REVIEW_ROUTE,
+        "specification_review",
+    ),
+    ("Sonnet 5 High", "implementation"): (
+        ADVERSARIAL_REVIEW_ROUTE,
+        "implementation_review",
+    ),
+    ("Sol High", "escalation guidance"): (
+        ESCALATION_EXECUTIVE_ROUTE,
+        "escalation_guidance",
+    ),
+    ("Terra High", "policy clarification"): (
+        POLICY_AUTHORITY_ROUTE,
+        "policy_clarification",
+    ),
+}
+
+_LEGACY_RESUME_IDENTITIES = {
+    "implementing": (IMPLEMENTATION_ROUTE, "implementation_write"),
+    "correcting": (IMPLEMENTATION_ROUTE, "correction_write"),
+    "spec_reviewing": (ADVERSARIAL_REVIEW_ROUTE, "specification_review"),
+    "reviewing": (ADVERSARIAL_REVIEW_ROUTE, "implementation_review"),
+    "sol_escalating": (ESCALATION_EXECUTIVE_ROUTE, "escalation_guidance"),
+    "terra_resolving": (POLICY_AUTHORITY_ROUTE, "policy_clarification"),
+}
+
+
+def _legacy_identity_reason(
+    payload: dict[str, Any],
+) -> tuple[str, str | None] | None:
+    providers = payload.get("provider_runs", [])
+    if isinstance(providers, list):
+        for index, record in enumerate(providers):
+            if not isinstance(record, dict):
+                continue
+            mapped = _LEGACY_PROVIDER_IDENTITIES.get(
+                (record.get("provider"), record.get("purpose"))
+            )
+            if mapped is None:
+                return (
+                    "legacy_provider_identity_unmappable",
+                    f"provider_runs.{index}",
+                )
+            identity, _ = mapped
+            capability = record.get("capability")
+            expected = (
+                "workspace_write"
+                if identity.role_id == "implementation"
+                else "read_only"
+            )
+            if capability is not None and capability != expected:
+                return (
+                    "legacy_provider_capability_incoherent",
+                    f"provider_runs.{index}.capability",
+                )
+
+    decisions = payload.get("policy_decisions", [])
+    if isinstance(decisions, list):
+        for index, decision in enumerate(decisions):
+            if (
+                isinstance(decision, dict)
+                and decision.get("source_provider", "Terra High") != "Terra High"
+            ):
+                return (
+                    "legacy_policy_source_unmappable",
+                    f"policy_decisions.{index}.source_provider",
+                )
+
+    if "provider_resume_stage" in payload or "provider_resume_prompt" in payload:
+        stage = payload.get("provider_resume_stage")
+        prompt = payload.get("provider_resume_prompt")
+        if (stage is None) != (prompt is None):
+            return (
+                "legacy_provider_resume_incoherent",
+                "provider_resume_stage",
+            )
+        if stage is not None and stage not in _LEGACY_RESUME_IDENTITIES:
+            return (
+                "legacy_provider_resume_unmappable",
+                "provider_resume_stage",
+            )
+    return None
+
+
 def _migration_disposition(
     payload: dict[str, Any],
     schema_version: int,
 ) -> RunMigrationDisposition:
+    if schema_version == 7:
+        audit = payload.get("migration_audit")
+        if isinstance(audit, dict) and audit.get("disposition") in {
+            "resume_eligibility_deferred",
+            "resume_blocked",
+            "inspection_only",
+        }:
+            return audit["disposition"]
     if schema_version < 6:
         return "resume_eligibility_deferred"
     blocked_stages = {
@@ -473,27 +619,35 @@ def classify_run_bytes(source: bytes) -> RecordClassification:
                 reason_code="archive_only",
                 field_path=_bounded_field_path(exc),
             )
-        if run.migration_audit is None:
-            state: RecordState = "CURRENT"
-            disposition = None
-        else:
+        if run.identity_migration_audit is not None:
+            state: RecordState = "RESUME_BLOCKED"
+            disposition = run.identity_migration_audit.disposition
+            structural_class = (
+                run.identity_migration_audit.source_structural_class
+            )
+        elif run.migration_audit is not None:
+            # Unreachable for schema 8: WorkflowRun validation requires the
+            # identity audit whenever a legacy audit is present. Kept as an
+            # explicit total branch so a migrated record can never be
+            # classified as current.
             state = "RESUME_BLOCKED"
             disposition = run.migration_audit.disposition
+            structural_class = run.migration_audit.source_structural_class
+        else:
+            state = "CURRENT"
+            disposition = None
+            structural_class = None
         return RecordClassification(
             treatment="current",
             record_state=state,
             source_sha256=source_sha256,
             schema_version=version,
-            structural_class=(
-                run.migration_audit.source_structural_class
-                if run.migration_audit is not None
-                else None
-            ),
+            structural_class=structural_class,
             disposition=disposition,
             reason_code=(
                 "current"
-                if run.migration_audit is None
-                else run.migration_audit.disposition
+                if disposition is None
+                else disposition
             ),
             field_path=None,
             run_id=run.run_id,
@@ -533,7 +687,7 @@ def classify_run_bytes(source: bytes) -> RecordClassification:
     structural_class: RunStructuralClass = (
         _v6_structural_class(payload) if version == 6 else f"V{version}"  # type: ignore[assignment]
     )
-    if version == 6:
+    if version in {6, 7}:
         coherence = _v6_coherence_reason(historical)  # type: ignore[arg-type]
         if coherence is not None:
             reason, field_path = coherence
@@ -551,6 +705,24 @@ def classify_run_bytes(source: bytes) -> RecordClassification:
                 stage=_bounded_identity(payload.get("stage")),
                 payload=payload,
             )
+
+    identity_reason = _legacy_identity_reason(payload)
+    if identity_reason is not None:
+        reason, field_path = identity_reason
+        return RecordClassification(
+            treatment="archive",
+            record_state="ARCHIVE_ONLY",
+            source_sha256=source_sha256,
+            schema_version=version,
+            structural_class=structural_class,
+            disposition="inspection_only",
+            reason_code=reason,
+            field_path=field_path,
+            run_id=_bounded_identity(payload.get("run_id")),
+            task_ref=_bounded_identity(payload.get("task_ref")),
+            stage=_bounded_identity(payload.get("stage")),
+            payload=payload,
+        )
 
     disposition = _migration_disposition(payload, version)
     return RecordClassification(
@@ -658,12 +830,12 @@ def _step_6_to_7(
     payload: dict[str, Any], context: MigrationContext
 ) -> tuple[dict[str, Any], list[str]]:
     result = copy.deepcopy(payload)
-    result["schema_version"] = CURRENT_RUN_SCHEMA_VERSION
+    result["schema_version"] = 7
     result["migration_audit"] = {
         "migration_id": context.migration_id,
         "migrated_at": context.migrated_at,
         "source_schema_version": context.source_schema_version,
-        "target_schema_version": CURRENT_RUN_SCHEMA_VERSION,
+        "target_schema_version": 7,
         "source_structural_class": context.source_structural_class,
         "source_sha256": context.source_sha256,
         "applied_steps": list(context.applied_steps),
@@ -671,6 +843,95 @@ def _step_6_to_7(
         "disposition": context.disposition,
     }
     return result, []
+
+
+def _step_7_to_8(
+    payload: dict[str, Any], context: MigrationContext
+) -> tuple[dict[str, Any], list[str]]:
+    result = copy.deepcopy(payload)
+    reasons: list[str] = []
+
+    providers = result.get("provider_runs", [])
+    for record in providers:
+        if not isinstance(record, dict):
+            raise MigrationError("migration_step_failed", "provider_runs")
+        mapped = _LEGACY_PROVIDER_IDENTITIES.get(
+            (record.pop("provider", None), record.pop("purpose", None))
+        )
+        if mapped is None:
+            raise MigrationError(
+                "legacy_provider_identity_unmappable",
+                "provider_runs",
+            )
+        identity, operation_id = mapped
+        record["identity"] = identity.model_dump(mode="json")
+        record["operation_id"] = operation_id
+    if providers:
+        reasons.append("legacy_display_identity_mapped")
+
+    successful_policy_records = [
+        index
+        for index, record in enumerate(providers)
+        if isinstance(record, dict)
+        and record.get("identity", {}).get("role_id") == "policy_authority"
+        and record.get("operation_id") == "policy_clarification"
+        and record.get("returncode") == 0
+        and record.get("failure_kind") is None
+    ]
+    policy_decisions = result.get("policy_decisions", [])
+    paired = (
+        len(successful_policy_records) == len(policy_decisions) > 0
+    )
+    for index, decision in enumerate(policy_decisions):
+        if not isinstance(decision, dict):
+            raise MigrationError("migration_step_failed", "policy_decisions")
+        if decision.pop("source_provider", "Terra High") != "Terra High":
+            raise MigrationError(
+                "legacy_policy_source_unmappable",
+                "policy_decisions.source_provider",
+            )
+        decision["source_role_id"] = "policy_authority"
+        decision["source_route_id"] = POLICY_AUTHORITY_ROUTE.route_id
+        if paired:
+            decision["source_provider_record_index"] = successful_policy_records[index]
+            decision["source_link_reason"] = None
+        else:
+            decision["source_provider_record_index"] = None
+            decision["source_link_reason"] = "legacy_source_attempt_unlinked"
+            reasons.append("legacy_policy_source_attempt_unlinked")
+    if policy_decisions:
+        reasons.append("legacy_policy_source_mapped")
+
+    stage = result.get("provider_resume_stage")
+    prompt = result.get("provider_resume_prompt")
+    if stage is None and prompt is None:
+        result["provider_resume_identity"] = None
+        result["provider_resume_operation_id"] = None
+    else:
+        mapped_resume = _LEGACY_RESUME_IDENTITIES.get(stage)
+        if mapped_resume is None or prompt is None:
+            raise MigrationError(
+                "legacy_provider_resume_unmappable",
+                "provider_resume_stage",
+            )
+        identity, operation_id = mapped_resume
+        result["provider_resume_identity"] = identity.model_dump(mode="json")
+        result["provider_resume_operation_id"] = operation_id
+        reasons.append("legacy_provider_resume_identity_mapped")
+
+    result["schema_version"] = CURRENT_RUN_SCHEMA_VERSION
+    result["identity_migration_audit"] = {
+        "migration_id": context.migration_id,
+        "migrated_at": context.migrated_at,
+        "source_schema_version": context.source_schema_version,
+        "target_schema_version": CURRENT_RUN_SCHEMA_VERSION,
+        "source_structural_class": context.source_structural_class,
+        "source_sha256": context.source_sha256,
+        "applied_steps": list(context.applied_steps),
+        "reason_codes": sorted(set((*context.reason_codes, *reasons))),
+        "disposition": context.disposition,
+    }
+    return result, reasons
 
 
 MigrationStep = Callable[
@@ -684,6 +945,7 @@ MIGRATION_REGISTRY: dict[tuple[int, int], MigrationStep] = {
     (4, 5): _step_4_to_5,
     (5, 6): _step_5_to_6,
     (6, 7): _step_6_to_7,
+    (7, 8): _step_7_to_8,
 }
 
 
@@ -772,7 +1034,7 @@ def migrate_classification(
         )
         payload, reasons = step(payload, context)
         version += 1
-        if version <= 6:
+        if version <= 7:
             _validate_historical(payload, version)
         reason_codes.extend(reasons)
         applied_steps.append(next_step)
@@ -786,17 +1048,40 @@ def migrate_classification(
             "migration_step_failed",
             _bounded_field_path(exc),
         ) from exc
-    audit = run.migration_audit
+    identity_audit = run.identity_migration_audit
     if (
-        audit is None
-        or audit.source_schema_version != source_version
-        or audit.target_schema_version != CURRENT_RUN_SCHEMA_VERSION
-        or audit.source_structural_class != classification.structural_class
-        or audit.source_sha256 != classification.source_sha256
-        or audit.applied_steps != tuple(applied_steps)
-        or audit.disposition != classification.disposition
+        identity_audit is None
+        or identity_audit.source_schema_version != source_version
+        or identity_audit.target_schema_version != CURRENT_RUN_SCHEMA_VERSION
+        or identity_audit.source_structural_class
+        != classification.structural_class
+        or identity_audit.source_sha256 != classification.source_sha256
+        or identity_audit.applied_steps != tuple(applied_steps)
+        or identity_audit.disposition != classification.disposition
     ):
-        raise MigrationError("migration_audit_invalid")
+        raise MigrationError("identity_migration_audit_invalid")
+
+    if source_version <= 6:
+        audit = run.migration_audit
+        if (
+            audit is None
+            or audit.source_schema_version != source_version
+            or audit.target_schema_version != 7
+            or audit.source_structural_class != classification.structural_class
+            or audit.source_sha256 != classification.source_sha256
+            or audit.applied_steps != tuple(applied_steps[:-1])
+            or audit.disposition != classification.disposition
+        ):
+            raise MigrationError("migration_audit_invalid")
+    else:
+        original_audit = classification.payload.get("migration_audit")
+        migrated_audit = (
+            run.migration_audit.model_dump(mode="json")
+            if run.migration_audit is not None
+            else None
+        )
+        if migrated_audit != original_audit:
+            raise MigrationError("migration_audit_invalid")
     return MigrationResult(
         run=run,
         source_sha256=classification.source_sha256,
