@@ -454,7 +454,7 @@ After each successful Luna call, the controller verifies that:
 - `git diff --check` passes; and
 - at least one changed file exists.
 
-It records the changed-file list and a SHA-256 working-tree fingerprint. The fingerprint covers porcelain status, unstaged binary diff, staged binary diff, and the names and bytes of changed files that exist. This includes readable untracked files.
+It records the changed-file list and a SHA-256 working-tree fingerprint. The fingerprint covers porcelain status, unstaged binary diff, staged binary diff, every enumerated path identity, and the bytes of changed paths that exist as files. This includes readable untracked files and retains deleted or renamed source paths by identity.
 
 ### Resume guard
 
@@ -490,7 +490,7 @@ After Sonnet passes the implementation:
 2. prints the run report, changed files, and review summary;
 3. asks `Commit these changes?`, defaulting to no;
 4. rechecks repository safety after approval;
-5. stages only the recorded changed-file paths with `git add -A -- ...`;
+5. stages a safe projection of the recorded changed-file paths with `git add -A -- ...`, omitting only absent paths whose deletion is already represented in the index;
 6. commits with `Implement task <task-ref>`; and
 7. records Git commands, outputs, result codes, commit hash, and message.
 
@@ -625,7 +625,7 @@ Lists recent runs or prints one run's complete JSON.
 
 ## 20. Current tests and what they cover
 
-The current suite has 19 `unittest` cases. It creates isolated temporary Git repositories and substitutes deterministic fake provider functions; it does not call live model providers or mutate the real Jobs repository.
+The current suite has 31 `unittest` cases. It creates isolated temporary Git repositories and substitutes deterministic fake provider functions; it does not call live model providers or mutate the real Jobs repository.
 
 ### Preflight and repository safety
 

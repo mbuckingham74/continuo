@@ -47,7 +47,7 @@ tasks/<task-ref>-*.md
 
 For example, task `009` must resolve to exactly one file such as `tasks/009-example.md`. The controller persists the specification and its SHA-256, coordinates the run, and stores local run state under `runs/`.
 
-The controller and its safety behavior are implemented and covered by 19 unit tests. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
+The controller and its safety behavior are implemented and covered by 31 unit tests. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
 
 ## How it works
 
@@ -243,7 +243,7 @@ uv sync
 uv run python -m unittest -v
 ```
 
-The 19 tests exercise temporary repositories and fake providers. They cover preflight safety, task resolution, correction budgets, repeat-finding escalation, policy decisions, provider failures and retries, provider-stop resume behavior, sandbox command construction, reporting, and Git approval defaults.
+The 31 tests exercise temporary repositories and fake providers. They cover preflight safety, task resolution, correction budgets, repeat-finding escalation, policy decisions, provider failures and retries, provider-stop resume behavior, sandbox command construction, reporting, Git approval defaults, and adversarial Git change parsing, fingerprinting, persistence, recovery, and staging behavior.
 
 Before committing changes, also check the diff:
 

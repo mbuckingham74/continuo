@@ -57,6 +57,25 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
     return result
 
 
+def _git_bytes(
+    repo: Path,
+    *args: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        detail = (
+            result.stderr.decode(errors="replace").strip()
+            or result.stdout.decode(errors="replace").strip()
+        )
+        raise ControllerError(f"git {' '.join(args)} failed: {detail}")
+    return result
+
+
 def git_text(repo: Path, *args: str) -> str:
     return _git(repo, *args).stdout.strip()
 
@@ -97,31 +116,94 @@ def resolve_task(repo: Path, task_ref: str) -> tuple[str, Path, str]:
     return str(path.relative_to(repo)), path, content
 
 
-def changed_files(repo: Path) -> list[str]:
-    result = _git(repo, "status", "--porcelain=v1", "--untracked-files=all")
+_PORCELAIN_V1_STATUS_BYTES = frozenset(b" MADRCUT?!X")
+
+
+def _decode_porcelain_path(raw: bytes) -> str:
+    try:
+        path = os.fsdecode(raw)
+    except UnicodeError as exc:
+        raise ControllerError(
+            "Git path cannot be decoded with the platform filesystem encoding"
+        ) from exc
+    if os.fsencode(path) != raw:
+        raise ControllerError(
+            "Git path does not round-trip through the platform filesystem encoding"
+        )
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ControllerError(
+            "Git path cannot be represented by the current UTF-8 run-state format"
+        ) from exc
+    return path
+
+
+def _parse_porcelain_v1_z(output: bytes) -> list[str]:
     files: list[str] = []
-    for line in result.stdout.splitlines():
-        if len(line) < 4:
-            continue
-        value = line[3:]
-        if " -> " in value:
-            old, new = value.split(" -> ", 1)
-            files.extend([old, new])
-        else:
-            files.append(value)
+    cursor = 0
+
+    while cursor < len(output):
+        if len(output) - cursor < 4:
+            raise ControllerError("Git porcelain status contains a truncated record")
+
+        status = output[cursor : cursor + 2]
+        if any(value not in _PORCELAIN_V1_STATUS_BYTES for value in status):
+            raise ControllerError(
+                "Git porcelain status contains an invalid status code"
+            )
+        if output[cursor + 2] != 0x20:
+            raise ControllerError(
+                "Git porcelain status record is missing its path separator"
+            )
+
+        path_start = cursor + 3
+        path_end = output.find(b"\0", path_start)
+        if path_end < 0:
+            raise ControllerError("Git porcelain status contains an unterminated path")
+        if path_end == path_start:
+            raise ControllerError("Git porcelain status contains an empty path")
+
+        files.append(_decode_porcelain_path(output[path_start:path_end]))
+        cursor = path_end + 1
+
+        if status[0] in b"RC" or status[1] in b"RC":
+            source_end = output.find(b"\0", cursor)
+            if source_end < 0:
+                raise ControllerError(
+                    "Git porcelain rename/copy record is missing its source path"
+                )
+            if source_end == cursor:
+                raise ControllerError(
+                    "Git porcelain rename/copy record contains an empty source path"
+                )
+            files.append(_decode_porcelain_path(output[cursor:source_end]))
+            cursor = source_end + 1
+
     return sorted(set(files))
 
 
-def working_tree_fingerprint(repo: Path) -> str:
+def changed_files(repo: Path) -> list[str]:
+    result = _git_bytes(
+        repo,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    )
+    return _parse_porcelain_v1_z(result.stdout)
+
+
+def working_tree_fingerprint(repo: Path, files: list[str] | None = None) -> str:
     digest = hashlib.sha256()
     status = _git(repo, "status", "--porcelain=v1", "--untracked-files=all").stdout
     digest.update(status.encode())
     for command in (("diff", "--no-ext-diff", "--binary"), ("diff", "--cached", "--no-ext-diff", "--binary")):
         digest.update(_git(repo, *command).stdout.encode())
-    for relative in changed_files(repo):
+    for relative in files if files is not None else changed_files(repo):
         path = repo / relative
+        digest.update(relative.encode())
         if path.is_file():
-            digest.update(relative.encode())
             digest.update(path.read_bytes())
     return digest.hexdigest()
 
@@ -449,13 +531,44 @@ def _terra_prompt(run: WorkflowRun, reason: str) -> str:
 
 def _implementation_diff(repo: Path) -> str:
     tracked = _git(repo, "diff", "HEAD", "--no-ext-diff").stdout
-    untracked = [f for f in changed_files(repo) if not _git(repo, "ls-files", "--error-unmatch", f, check=False).stdout.strip()]
+    untracked = [
+        relative
+        for relative in changed_files(repo)
+        if not _git(
+            repo,
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            relative,
+            check=False,
+        ).stdout.strip()
+    ]
     extra = []
     for relative in untracked:
         path = repo / relative
         if path.is_file():
             extra.append(f"\n--- untracked: {relative}\n{path.read_text(encoding='utf-8', errors='replace')}")
     return tracked + "".join(extra)
+
+
+def _stageable_changed_files(repo: Path, files: list[str]) -> list[str]:
+    """Exclude absent paths whose deletion is already represented in the index."""
+
+    return [
+        relative
+        for relative in files
+        if os.path.lexists(repo / relative)
+        or bool(
+            _git(
+                repo,
+                "ls-files",
+                "--error-unmatch",
+                "--",
+                relative,
+                check=False,
+            ).stdout.strip()
+        )
+    ]
 
 
 MAX_TOTAL_CORRECTIONS = 12
@@ -998,10 +1111,27 @@ class Controller:
             "head_matches": current.head == run.repo.head,
             "origin_matches": current.origin == run.repo.origin,
         }
-        files = changed_files(self.repo)
+        try:
+            files = changed_files(self.repo)
+        except ControllerError as exc:
+            checks.update(
+                {
+                    "change_enumeration": False,
+                    "change_enumeration_error": str(exc),
+                }
+            )
+            run.verification = checks
+            self._save(run)
+            self._block(
+                run,
+                "blocked_unexpected_repo_state",
+                f"could not enumerate repository changes: {exc}",
+            )
+            return False
+        checks["change_enumeration"] = True
         clean_diff, diff_message = diff_check(self.repo)
         run.changed_files = files
-        run.working_tree_fingerprint = working_tree_fingerprint(self.repo)
+        run.working_tree_fingerprint = working_tree_fingerprint(self.repo, files)
         checks.update({"diff_check": clean_diff, "diff_check_output": diff_message, "changed_files": files})
         run.verification = checks
         self._save(run)
@@ -1199,10 +1329,12 @@ class Controller:
                 console.print("Commit not approved; no Git commit was made.")
                 return run
             self._resume_guard(run)
-            add = _git(self.repo, "add", "-A", "--", *run.changed_files, check=False)
-            _record_git(run, "stage changed files", add)
-            if add.returncode != 0:
-                return self._block(run, "blocked_git_failure", add.stderr.strip() or "git add failed")
+            stageable = _stageable_changed_files(self.repo, run.changed_files)
+            if stageable:
+                add = _git(self.repo, "add", "-A", "--", *stageable, check=False)
+                _record_git(run, "stage changed files", add)
+                if add.returncode != 0:
+                    return self._block(run, "blocked_git_failure", add.stderr.strip() or "git add failed")
             message = f"Implement task {run.task_ref}"
             commit = _git(self.repo, "commit", "-m", message, check=False)
             _record_git(run, "commit", commit)

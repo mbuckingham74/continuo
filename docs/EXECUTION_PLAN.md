@@ -86,8 +86,158 @@ were demonstrated, not merely that code was written.
 - [x] Decide against a wholesale rewrite or copying the controller into Jobs.
 - [x] Review and approve this execution plan.
   - Evidence (2026-08-02): approved for commit and push by the repository owner.
-- [ ] Convert the first implementation item, M0.1/C-1, into a bounded execution
+- [x] Convert the first implementation item, M0.1/C-1, into a bounded execution
   note with its adversarial test matrix.
+  - Evidence (2026-08-02): the draft execution contract and adversarial matrix
+    below were derived from the authoritative C-1 decision, current consumers,
+    installed Git documentation, and an isolated temporary-repository probe.
+    They were approved by the repository owner before M0.1 implementation began.
+  - Validation (2026-08-02): all 19 existing unit tests passed with fake
+    providers; 10 local Markdown link targets and all 20 matrix rows were
+    checked; `git diff --check` passed. Only this documentation file changed.
+
+### M0.1 / C-1 bounded execution note (approved 2026-08-02)
+
+**Status and boundary.** This note specifies the first Gate 1 implementation
+item. The repository owner approved it on 2026-08-02 before source and test
+changes began.
+
+**Invariant and reproduced problem.** Every path reported by Git as changed must
+remain an exact, unambiguous repository-relative path through changed-file
+enumeration, reviewer input, working-tree fingerprinting, resume checks, and the
+approval-gated staging pathspec. At baseline
+`42f1d4bb7d523daf627e6074f789ca0abe24c5f9`, `changed_files()` parses the
+human-readable, newline-delimited porcelain display by slicing each line and
+splitting on ` -> `. Git may quote or escape that display. A literal ` -> ` in
+a filename is indistinguishable from the display delimiter. As recorded in
+[`ENGINE_ROADMAP.md`](ENGINE_ROADMAP.md#c-1--git-porcelain-parsing), the result
+can omit actual untracked content from review and fingerprint coverage. The
+observed staging failure was loud, so this note does not claim that the defect
+silently published incorrect work.
+
+The affected flow is deliberately small but safety-critical:
+
+1. `_verify()` persists `changed_files` and the working-tree fingerprint.
+2. `_implementation_diff()` uses the same enumeration to append readable
+   untracked contents to the tracked diff supplied to reviewers.
+3. `_resume_guard()` recomputes the fingerprint before resume and again around
+   approval processing.
+4. `_approval_gates()` passes the persisted paths after `--` to
+   `git add -A`, then blocks on a nonzero staging result.
+
+**Verified Git record contract.** M0.1 will request
+`git status --porcelain=v1 -z --untracked-files=all` and parse the result as
+bytes. In porcelain v1 `-z`, an ordinary record is `XY SP path NUL`. A rename or
+copy has `R` or `C` in the two-byte status and is `XY SP target NUL source NUL`:
+the destination is first and the origin is the following field. There is no
+` -> ` token, quoting, or backslash escaping. The parser must treat a rename or
+copy indicator in either status column as a two-path record and must not assume
+Git record order is sorted.
+
+This ordering was checked on 2026-08-02 against Apple Git 2.50.1 both in the
+installed `git-status(1)` documentation and in an isolated repository. The raw
+probe emitted `R  new -> 名称.txt\0old.txt\0` and, with copy detection enabled
+for the fixture, `C  copied.txt\0source.txt\0`. The arrow in the rename target
+was filename data, not a separator.
+
+**Bounded implementation contract.** The M0.1 diff must:
+
+- add one byte-oriented porcelain v1 `-z` parser and the smallest Git invocation
+  boundary needed to supply it; do not convert unrelated Git commands to bytes
+  or introduce the future repository adapter;
+- validate the two status bytes, required separating space, nonempty path,
+  terminating NUL, and required second path for rename/copy records; malformed
+  or truncated output fails closed instead of skipping a record;
+- split records before decoding paths, decode each complete path with
+  `os.fsdecode()`, require an `os.fsencode()` round trip, preserve the platform's
+  exact spelling without Unicode normalization, and never use replacement
+  decoding;
+- reject a path that cannot be represented by the current UTF-8/Pydantic JSON
+  persistence contract with an explicit controller error. On POSIX this includes
+  raw non-UTF-8 names decoded to surrogate escapes. A local probe confirmed that
+  filesystem round-trip succeeds for such a name while current Pydantic JSON
+  serialization fails; lossily changing the name is not acceptable;
+- return a deterministic, de-duplicated, sorted list of actual path strings.
+  Ordinary records contribute one path; rename/copy records contribute both the
+  source and target even though Git presents the target first;
+- preserve the existing review-diff policy: the full `git diff HEAD` represents
+  tracked states and rename/copy metadata, while readable untracked files are
+  appended using exact decoded paths. Deleted paths remain enumerated even
+  though no worktree file can be read;
+- make the fingerprint include every enumerated path identity whether or not the
+  path currently exists, plus bytes for paths that are files. Retain the existing
+  status/diff hash inputs for unaffected paths so M0.1 does not become a general
+  fingerprint redesign;
+- preserve approval authority and stage only a safe projection of the recorded
+  paths. Existing paths and absent paths still represented in the index are
+  passed after `git add -A --`; an already-staged deletion or rename source is
+  omitted because Git treats that now-unmatched pathspec as fatal. A copy stages
+  its existing source and target. A nonzero `git add` remains a persisted Git
+  operation and `blocked_git_failure`; and
+- add only deterministic temporary-repository tests with fake providers where a
+  controller path is exercised. No live provider, external target, commit to
+  `origin`, or push is permitted.
+
+**State and lifecycle impact.** No persisted field or schema-version change is
+planned: corrected paths continue to use `WorkflowRun.changed_files: list[str]`,
+the fingerprint remains a string, and parser/failure evidence fits the existing
+verification and `last_error` records. New records must contain decoded actual
+paths, never Git's quoted display form. A change-enumeration failure during
+verification must persist a failed verification result and block before review
+or approval; the same failure during a resume guard must refuse resume. There is
+no automatic provider retry because parsing is deterministic controller work.
+The persisted `changed_files` list remains the complete audit view even when the
+approval-time staging projection omits an absent path already removed from the
+index. If every recorded path is already staged and absent, no `git add`
+subprocess or fabricated Git-operation record is needed before the approved
+commit uses the existing index.
+
+M0.1 must not rewrite historical run JSON or trust a legacy affected path list.
+Correctly incorporating all path identities means a pre-M0.1 fingerprint for an
+affected special name, deletion, or rename can mismatch after upgrade; refusing
+resume is the intended safe migration behavior. Unaffected ordinary-file
+fingerprints should remain stable. A crash after successful verification is
+handled by the existing saved fingerprint and exact-stage recovery: resume
+re-enumerates the tree before provider or Git work. A crash or exception before
+the corrected verification record is saved cannot advance to review or staging.
+Raw provider records, retry budgets, correction policy, and approval semantics
+do not change.
+
+**Adversarial test matrix.** Each path assertion compares exact strings, not a
+display-rendered Git line. Integration cases use temporary Git repositories and
+must run without provider CLIs.
+
+| ID | Fixture / state | Required assertions |
+|---|---|---|
+| P1 | Untracked names containing Unicode, spaces, embedded quotes, and a literal ` -> `, separately and combined | Each `??` record yields exactly one unchanged path; no quote characters or escape text are invented; the arrow is never split; readable content appears in reviewer input; content and path changes alter the fingerprint; staging addresses the exact file. |
+| P2 | Tracked unstaged edit of a special-character path | ` M` yields that one path; `git diff HEAD` contains the edit; fingerprint changes with bytes; staging produces the expected cached modification. |
+| P3 | Staged edit of a special-character path | `M ` yields that one path; review includes the staged diff; fingerprint includes the cached diff and file; approval staging is idempotent. |
+| P4 | One tracked file changed differently in index and worktree | `MM` yields one de-duplicated path; review covers the combined `HEAD` diff; fingerprint changes when either layer changes. |
+| P5 | Staged addition and a separate untracked file | `A ` and `??` both enumerate; review gets the added diff and untracked contents; staging includes both without broadening beyond the recorded list. |
+| P6 | Unstaged deletion | ` D` retains the absent path; review includes the deletion; fingerprint includes its identity; because the index still tracks it, `git add -A -- <path>` stages the deletion. |
+| P7 | Staged deletion | `D ` retains the absent path; cached deletion reaches review and fingerprint; staging safely omits the absent, already-removed index path rather than failing on an unmatched pathspec. |
+| P8 | Staged rename whose source/target contain spaces, quotes, Unicode, or literal arrows | Raw record is asserted as `R? target\0source\0`; the parser consumes target then source but returns both exact paths; review includes rename metadata; fingerprint includes both identities and target bytes; staging includes the target and safely omits the absent, already-staged source. |
+| P9 | Copy detection enabled in the fixture, with a changed source so Git emits a copy record | Raw record is asserted as `C? target\0source\0`; both exact paths enumerate in deterministic order; review/fingerprint include target and source effects; staging both is harmless and complete. |
+| P10 | Mixed tracked, untracked, staged, unstaged, deleted, rename, and copy records created in deliberately nonsorted order | The result is the sorted unique union with no dropped or duplicate path; reviewer input, fingerprint coverage, and staged index collectively represent every state. |
+| P11 | Filename changed after verification but before resume or a positive approval | Recomputed fingerprint differs and the existing guard refuses the transition; no provider retry, staging, commit, or push occurs. |
+| F1 | Git status exits nonzero | Existing Git/controller error propagation is preserved; verification cannot pass and no partial list is persisted as valid evidence. |
+| F2 | Synthetic payload has a short status, wrong separator, empty path, missing final NUL, or trailing partial record | Parser raises a bounded controller error for every form; it never silently continues with a prefix. |
+| F3 | Synthetic rename/copy payload ends after its first NUL-delimited path | Parser reports a truncated two-path record and blocks without returning a partial list. |
+| F4 | Platform-created Unicode filename | `os.fsdecode()`/`os.fsencode()` round-trips exactly and the path survives `WorkflowRun` persist/load; this runs on every supported platform without assuming macOS normalization. |
+| F5 | POSIX-only filename containing a raw non-UTF-8 byte | Parsing preserves the byte through surrogate escape, then the explicit persistence-compatibility check rejects it before review or staging; no replacement character is allowed. |
+| F6 | `git add -A -- <stageable recorded paths>` returns nonzero | The Git operation is audited, the run becomes `blocked_git_failure`, and commit/push are not attempted. |
+| R1 | Persist and reload a verified run containing supported special paths | `changed_files`, verification evidence, and fingerprint round-trip unchanged; resume recomputation succeeds only for the same tree. |
+| R2 | Resume a pre-M0.1-style record whose quoted/split paths or old deletion/rename fingerprint differ under corrected enumeration | Resume fails closed without rewriting the legacy record, invoking a provider, or staging. |
+| R3 | Simulated crash immediately before and after corrected verification persistence | Before-save recovery cannot skip verification; after-save recovery uses the saved exact paths/fingerprint and does not intentionally repeat completed provider work. |
+
+**Explicit exclusions.** M0.1 does not adopt porcelain v2; add diff-size,
+binary-content, symlink, submodule, merge-conflict, or ignored-file policy; add
+allowed-path enforcement; redesign Git audit records; harden `.git`; change
+provider supervision/retry behavior; migrate the run schema; generalize the
+Jobs compatibility profile; rename `jobs-orchestrator`, `JOBS_REPO`, or
+`src/jobs_orchestrator`; or alter commit/push/human authority. Those remain in
+their roadmap items. Tests may expose an unrelated defect, but fixing it requires
+a separate bounded note and human decision.
 
 **Exit criteria:** the plan is approved, no open sequencing disagreement remains,
 and M0.1 has an agreed scope that excludes generalization and unrelated cleanup.
@@ -97,9 +247,32 @@ and M0.1 has an agreed scope that excludes generalization and unrelated cleanup.
 **Goal:** make the current implementation safe enough to serve as the behavioral
 baseline for extraction. No live Jobs pilot occurs in this gate.
 
-- [ ] **M0.1 / C-1:** parse Git changes using verified NUL-delimited porcelain
+- [x] **M0.1 / C-1:** parse Git changes using verified NUL-delimited porcelain
   semantics; cover Unicode, spaces, quotes, literal ` -> ` names, and rename/copy
   field ordering.
+  - Implementation evidence (2026-08-02): `orchestrator.py` now parses
+    byte-oriented porcelain v1 `-z` records, verifies target/source ordering,
+    rejects malformed or non-persistable paths, and preserves exact decoded paths
+    across enumeration, reviewer input, fingerprints, resume guards, and bounded
+    staging.
+  - State/recovery evidence (2026-08-02): supported paths round-trip through run
+    persistence; parser failures persist failed verification and block before
+    review; affected legacy fingerprints refuse resume; crashes around
+    verification persistence do not repeat the writer; no schema, provider retry,
+    role, or approval-authority contract changed.
+  - Adversarial evidence (2026-08-02): temporary repositories cover Unicode,
+    spaces, quotes, literal arrows, real Git rename/copy ordering, tracked,
+    untracked, staged, unstaged, deleted, and mixed states, exact review content,
+    fingerprints, staging projections/failures, persistence, and crash/resume.
+    The suite passes all 31 tests with fake providers.
+  - Validation (2026-08-02): the root CLI and `jobs-orchestrator` from a clean
+    temporary editable install both pass their help smoke checks; no repository
+    packaging change was needed. Local Markdown targets and the matrix structure
+    validate; `git diff --check` passes. No live provider, external target,
+    commit, or push was used.
+  - Review decision (2026-08-02): the repository owner approved the complete
+    five-file diff and explicitly authorized commit and push. M0.1 is complete;
+    M0.2 remains a separate bounded item.
 - [ ] **M0.2 / C-2:** add provider deadlines, cancellation, process-group cleanup,
   partial-output capture, and real child-process failure tests.
 - [ ] **M0.3 / C-3/C-4:** normalize failure evidence sources and distinguish Claude

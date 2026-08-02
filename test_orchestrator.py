@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -7,7 +8,7 @@ from unittest.mock import patch
 
 import orchestrator
 import providers
-from models import RepoState, ReviewResult
+from models import RepoState, ReviewResult, WorkflowRun
 from providers import ProviderExecution, build_luna_command, build_sol_command, build_sonnet_command
 
 
@@ -91,6 +92,422 @@ class ControllerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(orchestrator.ControllerError, "ambiguous"):
             orchestrator.resolve_task(self.repo, "009")
+
+    def test_special_paths_are_exact_in_enumeration_review_fingerprint_and_staging(self) -> None:
+        paths = [
+            "unicode-名称.txt",
+            "space name.txt",
+            'embedded-"quote".txt',
+            "literal -> arrow.txt",
+            'combined 名称 " -> value.txt',
+        ]
+        for index, relative in enumerate(paths):
+            (self.repo / relative).write_text(f"special content {index}\n")
+
+        self.assertEqual(orchestrator.changed_files(self.repo), sorted(paths))
+        review_diff = orchestrator._implementation_diff(self.repo)
+        for relative in paths:
+            self.assertIn(f"--- untracked: {relative}", review_diff)
+
+        before = orchestrator.working_tree_fingerprint(self.repo)
+        (self.repo / paths[0]).write_text("changed bytes\n")
+        after = orchestrator.working_tree_fingerprint(self.repo)
+        self.assertNotEqual(before, after)
+
+        git(self.repo, "add", "-A", "--", *paths)
+        self.assertEqual(orchestrator.changed_files(self.repo), sorted(paths))
+
+    def test_porcelain_parser_handles_target_source_order_and_malformed_records(self) -> None:
+        raw = (
+            "R  target -> 名称.txt\0source name.txt\0"
+            "C  copy target.txt\0copy source.txt\0"
+            '?? embedded-"quote".txt\0'
+        ).encode()
+
+        self.assertEqual(
+            orchestrator._parse_porcelain_v1_z(raw),
+            sorted(
+                [
+                    "target -> 名称.txt",
+                    "source name.txt",
+                    "copy target.txt",
+                    "copy source.txt",
+                    'embedded-"quote".txt',
+                ]
+            ),
+        )
+
+        malformed = (
+            b"?",
+            b"Z? path\0",
+            b"??\tpath\0",
+            b"?? \0",
+            b"?? unterminated",
+            b"R  target\0",
+            b"C  target\0\0",
+        )
+        for payload in malformed:
+            with self.subTest(payload=payload):
+                with self.assertRaises(orchestrator.ControllerError):
+                    orchestrator._parse_porcelain_v1_z(payload)
+
+        with self.assertRaises(orchestrator.ControllerError):
+            orchestrator._parse_porcelain_v1_z(b"?? invalid-\xff.txt\0")
+
+    def test_git_bytes_failure_raises_controller_error(self) -> None:
+        missing = Path(self.temp.name) / "not-a-repository"
+        missing.mkdir()
+
+        with self.assertRaisesRegex(orchestrator.ControllerError, "git status"):
+            orchestrator._git_bytes(
+                missing,
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+            )
+
+    def test_real_git_rename_and_copy_records_are_target_then_source(self) -> None:
+        source = self.repo / "copy source.txt"
+        old = self.repo / 'old "name".txt'
+        source.write_text("copy content\n")
+        old.write_text("rename content\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "add rename and copy fixtures")
+
+        copied = self.repo / "copied -> 名称.txt"
+        copied.write_bytes(source.read_bytes())
+        source.write_text("copy content\nsource changed\n")
+        target = self.repo / 'new -> 名称 "name".txt'
+        old.rename(target)
+        git(self.repo, "add", "-A")
+        git(self.repo, "config", "status.renames", "copies")
+
+        raw = orchestrator._git_bytes(
+            self.repo,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ).stdout
+        self.assertIn(
+            b"C  " + copied.name.encode() + b"\0" + source.name.encode() + b"\0",
+            raw,
+        )
+        self.assertIn(
+            b"R  " + target.name.encode() + b"\0" + old.name.encode() + b"\0",
+            raw,
+        )
+        self.assertEqual(
+            orchestrator.changed_files(self.repo),
+            sorted([source.name, copied.name, old.name, target.name]),
+        )
+        self.assertEqual(
+            orchestrator._stageable_changed_files(
+                self.repo,
+                orchestrator.changed_files(self.repo),
+            ),
+            sorted([source.name, copied.name, target.name]),
+        )
+
+    def test_mixed_git_states_are_complete_deduplicated_and_stageable(self) -> None:
+        tracked = {
+            "unstaged.txt": "base\n",
+            "staged.txt": "base\n",
+            "mixed.txt": "base\n",
+            "delete unstaged.txt": "base\n",
+            "delete staged.txt": "base\n",
+            "rename old.txt": "base\n",
+        }
+        for relative, content in tracked.items():
+            (self.repo / relative).write_text(content)
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "add mixed-state fixtures")
+
+        (self.repo / "unstaged.txt").write_text("unstaged\n")
+        (self.repo / "staged.txt").write_text("staged\n")
+        git(self.repo, "add", "staged.txt")
+        (self.repo / "mixed.txt").write_text("index\n")
+        git(self.repo, "add", "mixed.txt")
+        (self.repo / "mixed.txt").write_text("worktree\n")
+        (self.repo / "delete unstaged.txt").unlink()
+        (self.repo / "delete staged.txt").unlink()
+        git(self.repo, "add", "-A", "--", "delete staged.txt")
+        (self.repo / "untracked 名称.txt").write_text("untracked\n")
+        (self.repo / "added staged.txt").write_text("added\n")
+        git(self.repo, "add", "added staged.txt")
+        (self.repo / "rename old.txt").rename(self.repo / "rename new -> value.txt")
+        git(self.repo, "add", "-A", "--", "rename old.txt", "rename new -> value.txt")
+
+        expected = sorted(
+            [
+                "unstaged.txt",
+                "staged.txt",
+                "mixed.txt",
+                "delete unstaged.txt",
+                "delete staged.txt",
+                "untracked 名称.txt",
+                "added staged.txt",
+                "rename old.txt",
+                "rename new -> value.txt",
+            ]
+        )
+        self.assertEqual(orchestrator.changed_files(self.repo), expected)
+
+        stageable = orchestrator._stageable_changed_files(self.repo, expected)
+        self.assertEqual(
+            stageable,
+            [
+                "added staged.txt",
+                "delete unstaged.txt",
+                "mixed.txt",
+                "rename new -> value.txt",
+                "staged.txt",
+                "unstaged.txt",
+                "untracked 名称.txt",
+            ],
+        )
+        git(self.repo, "add", "-A", "--", *stageable)
+        raw = orchestrator._git_bytes(
+            self.repo,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ).stdout
+        cursor = 0
+        while cursor < len(raw):
+            self.assertEqual(raw[cursor + 1 : cursor + 2], b" ")
+            path_end = raw.index(b"\0", cursor + 3)
+            status = raw[cursor : cursor + 2]
+            cursor = path_end + 1
+            if status[0] in b"RC" or status[1] in b"RC":
+                cursor = raw.index(b"\0", cursor) + 1
+
+    def test_deleted_path_identity_changes_legacy_fingerprint_and_blocks_resume(self) -> None:
+        deleted = self.repo / 'deleted -> "名称".txt'
+        deleted.write_text("delete me\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "add deletion fixture")
+        snapshot = orchestrator.repo_state(self.repo)
+        deleted.unlink()
+
+        legacy = hashlib.sha256()
+        legacy.update(
+            orchestrator._git(
+                self.repo,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ).stdout.encode()
+        )
+        for command in (
+            ("diff", "--no-ext-diff", "--binary"),
+            ("diff", "--cached", "--no-ext-diff", "--binary"),
+        ):
+            legacy.update(orchestrator._git(self.repo, *command).stdout.encode())
+
+        corrected = orchestrator.working_tree_fingerprint(self.repo)
+        self.assertNotEqual(legacy.hexdigest(), corrected)
+
+        run = self.controller(self.passing_sonnet, approval=lambda prompt: False).new_run("009")
+        run.repo = snapshot
+        run.stage = "commit_declined"
+        run.changed_files = ['"deleted -> \\345\\220\\215\\347\\247\\260.txt"']
+        run.working_tree_fingerprint = legacy.hexdigest()
+        orchestrator.persist(run, self.runs)
+
+        with self.assertRaisesRegex(orchestrator.ControllerError, "working tree"):
+            self.controller(self.passing_sonnet).resume(run.run_id)
+
+    def test_special_path_round_trips_run_state_and_controller_staging(self) -> None:
+        special = 'implementation 名称 " -> result.py'
+        review_prompts = []
+
+        def luna(prompt, repo):
+            (repo / special).write_text("# implementation\n")
+            return ProviderExecution(["codex"], 0, "implemented", "")
+
+        def sonnet(prompt, repo):
+            review_prompts.append(prompt)
+            return review_execution("PASS", "PASS")
+
+        approvals = iter([True, False])
+        run = self.controller(
+            sonnet,
+            luna=luna,
+            approval=lambda prompt: next(approvals),
+        ).new_run("009")
+
+        self.assertEqual(run.stage, "push_declined")
+        self.assertEqual(run.changed_files, [special])
+        self.assertIn(special, review_prompts[-1])
+        self.assertEqual(
+            orchestrator.load_run(run.run_id, self.runs).changed_files,
+            [special],
+        )
+        stage = next(
+            record
+            for record in run.git_operations
+            if record.operation == "stage changed files"
+        )
+        self.assertEqual(stage.returncode, 0)
+        self.assertIn(special, stage.command)
+        committed_names = subprocess.run(
+            ["git", "-C", str(self.repo), "show", "--format=", "--name-only", "-z", "HEAD"],
+            capture_output=True,
+            check=True,
+        ).stdout.split(b"\0")
+        self.assertIn(special.encode(), committed_names)
+
+    def test_resume_guard_detects_special_path_change_before_provider_or_staging(self) -> None:
+        special = 'implementation 名称 " -> result.py'
+        provider_calls = 0
+
+        def luna(prompt, repo):
+            nonlocal provider_calls
+            provider_calls += 1
+            (repo / special).write_text("# implementation\n")
+            return ProviderExecution(["codex"], 0, "implemented", "")
+
+        run = self.controller(
+            self.passing_sonnet,
+            luna=luna,
+            approval=lambda prompt: False,
+        ).new_run("009")
+        calls_before_resume = provider_calls
+        (self.repo / special).write_text("# changed after verification\n")
+
+        with self.assertRaisesRegex(orchestrator.ControllerError, "working tree"):
+            self.controller(
+                self.passing_sonnet,
+                luna=luna,
+                approval=lambda prompt: True,
+            ).resume(run.run_id)
+
+        self.assertEqual(provider_calls, calls_before_resume)
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), run.repo.head)
+        self.assertEqual(run.git_operations, [])
+
+    def test_already_staged_deletion_commits_without_fabricated_add_record(self) -> None:
+        deleted = self.repo / 'already staged -> "名称".txt'
+        deleted.write_text("delete me\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "add staged deletion fixture")
+        snapshot = orchestrator.repo_state(self.repo)
+        deleted.unlink()
+        git(self.repo, "add", "-A", "--", deleted.name)
+
+        run = WorkflowRun(
+            run_id="staged-delete",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Delete the fixture.",
+            repo=snapshot,
+            stage="awaiting_commit_approval",
+            changed_files=[deleted.name],
+            working_tree_fingerprint=orchestrator.working_tree_fingerprint(self.repo),
+        )
+        approvals = iter([True, False])
+
+        result = self.controller(
+            self.passing_sonnet,
+            approval=lambda prompt: next(approvals),
+        )._approval_gates(run)
+
+        self.assertEqual(result.stage, "push_declined")
+        self.assertFalse(deleted.exists())
+        self.assertIsNotNone(result.commit_hash)
+        self.assertNotIn(
+            "stage changed files",
+            [record.operation for record in result.git_operations],
+        )
+
+    def test_verification_crash_boundaries_resume_without_repeating_writer(self) -> None:
+        luna_calls = 0
+        special = "crash resume 名称.txt"
+
+        def luna(prompt, repo):
+            nonlocal luna_calls
+            luna_calls += 1
+            (repo / special).write_text("implementation\n")
+            return ProviderExecution(["codex"], 0, "implemented", "")
+
+        controller = self.controller(
+            self.passing_sonnet,
+            luna=luna,
+            approval=lambda prompt: False,
+        )
+        completed = controller.new_run("009")
+        calls_after_implementation = luna_calls
+
+        before_save = completed.model_copy(deep=True)
+        before_save.run_id = "before-verification-save"
+        before_save.stage = "implementation_completed"
+        before_save.changed_files = []
+        before_save.working_tree_fingerprint = None
+        before_save.implementation_review = None
+        orchestrator.persist(before_save, self.runs)
+        resumed_before = controller.resume(before_save.run_id)
+        self.assertEqual(resumed_before.stage, "commit_declined")
+        self.assertEqual(luna_calls, calls_after_implementation)
+        self.assertEqual(resumed_before.changed_files, [special])
+
+        after_save = completed.model_copy(deep=True)
+        after_save.run_id = "after-verification-save"
+        after_save.stage = "implementation_verified"
+        after_save.implementation_review = None
+        orchestrator.persist(after_save, self.runs)
+        resumed_after = controller.resume(after_save.run_id)
+        self.assertEqual(resumed_after.stage, "commit_declined")
+        self.assertEqual(luna_calls, calls_after_implementation)
+
+    def test_change_enumeration_failure_blocks_before_implementation_review(self) -> None:
+        sonnet_calls = 0
+
+        def sonnet(prompt, repo):
+            nonlocal sonnet_calls
+            sonnet_calls += 1
+            return review_execution("PASS", "PASS")
+
+        with patch.object(
+            orchestrator,
+            "_git_bytes",
+            side_effect=orchestrator.ControllerError("malformed porcelain fixture"),
+        ):
+            run = self.controller(sonnet, approval=lambda prompt: False).new_run("009")
+
+        self.assertEqual(run.stage, "blocked_unexpected_repo_state")
+        self.assertEqual(sonnet_calls, 1)
+        self.assertFalse(run.verification["change_enumeration"])
+        self.assertIn("malformed porcelain fixture", run.verification["change_enumeration_error"])
+        self.assertEqual(run.git_operations, [])
+
+    def test_staging_failure_is_audited_and_blocks_commit(self) -> None:
+        original_git = orchestrator._git
+
+        def fail_add(repo, *args, check=True):
+            if args and args[0] == "add":
+                return subprocess.CompletedProcess(
+                    ["git", "-C", str(repo), *args],
+                    128,
+                    "",
+                    "synthetic staging failure",
+                )
+            return original_git(repo, *args, check=check)
+
+        with patch.object(orchestrator, "_git", side_effect=fail_add):
+            run = self.controller(
+                self.passing_sonnet,
+                approval=lambda prompt: True,
+            ).new_run("009")
+
+        self.assertEqual(run.stage, "blocked_git_failure")
+        self.assertIsNone(run.commit_hash)
+        self.assertEqual(run.git_operations[-1].operation, "stage changed files")
+        self.assertEqual(run.git_operations[-1].returncode, 128)
 
     def test_resume_snapshot_mismatch_blocks(self) -> None:
         run = self.controller(self.passing_sonnet, approval=lambda prompt: False).new_run("009")
