@@ -352,6 +352,9 @@ baseline for extraction. No live Jobs pilot occurs in this gate.
   - Review decision (2026-08-02): the repository owner approved the complete
     14-file implementation diff and explicitly authorized commit and direct push
     to `origin/main`. M0.3 is complete; M0.4 remains a separate bounded item.
+  - Publication evidence (2026-08-02): commit
+    `4a3262eda14e41c60a21b7b3d3d152dffe48a286` (`Normalize provider failure
+    evidence`) was pushed directly to `origin/main` with all 59 tests passing.
 - [ ] **M0.4 / A-1:** make the provider-attempt lifecycle capability-aware; allow
   bounded read-only retry while blocking uncertain write-capable recovery when
   partial changes exist.
