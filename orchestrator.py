@@ -2243,6 +2243,16 @@ class Controller:
         try:
             return parser(execution)
         except Exception as exc:
+            if identity.role_id == "adversarial_review":
+                run.unreadable_review_records.append(
+                    UnreadableReviewRecord(
+                        recorded_at=datetime.now(timezone.utc).isoformat(),
+                        operation_id=operation_id,
+                        provider_record_index=len(run.provider_runs) - 1,
+                        reason_code=_unreadable_review_reason(exc),
+                    )
+                )
+                self._save(run)
             self._block_provider_output(
                 run,
                 identity,
