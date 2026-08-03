@@ -64,6 +64,30 @@ def schema7_bytes() -> bytes:
     return encoded(payload)
 
 
+def schema8_bytes() -> bytes:
+    source = schema7_bytes()
+    classification = run_migrations.classify_run_bytes(source)
+    context = run_migrations.MigrationContext(
+        migration_id="historical-v8-fixture",
+        migrated_at="2026-08-02T11:30:00+00:00",
+        source_schema_version=classification.schema_version,
+        source_structural_class=classification.structural_class,
+        source_sha256=classification.source_sha256,
+        disposition=classification.disposition,
+        applied_steps=("6_to_7", "7_to_8"),
+        reason_codes=(),
+    )
+    payload, _ = run_migrations.MIGRATION_REGISTRY[(7, 8)](
+        classification.payload,
+        context,
+    )
+    return encoded(payload)
+
+
+def schema8_object() -> dict[str, object]:
+    return json.loads(schema8_bytes())
+
+
 def schema7_object() -> dict[str, object]:
     return json.loads(schema7_bytes())
 
@@ -71,9 +95,111 @@ def schema7_object() -> dict[str, object]:
 def migration_source(version: int) -> bytes:
     if version == 7:
         return schema7_bytes()
+    if version == 8:
+        return schema8_bytes()
     if version == 6:
         return fixture_bytes("6_base")
     return fixture_bytes(version)
+
+
+def review_stdout(
+    status: str,
+    category: str,
+    summary: str,
+    finding_key: str | None = None,
+) -> str:
+    if finding_key is None:
+        finding_key = "PASS" if category == "PASS" else "test-finding"
+    return json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "structured_output": {
+                "status": status,
+                "category": category,
+                "finding_key": finding_key,
+                "summary": summary,
+            },
+        }
+    )
+
+
+def v8_review_record(
+    operation: str,
+    stdout: str,
+    *,
+    returncode: int = 0,
+    failure_kind: str | None = None,
+) -> dict[str, object]:
+    return {
+        "identity": {
+            "role_id": "adversarial_review",
+            "provider_adapter_id": "claude_cli",
+            "route_id": "builtin.adversarial_review.v1",
+            "model_id": "sonnet",
+            "display_name": "Sonnet 5 High",
+        },
+        "operation_id": operation,
+        "command": ["claude", "fixture"],
+        "returncode": returncode,
+        "stdout": stdout,
+        "stderr": "",
+        "duration_seconds": 1.0,
+        "failure_kind": failure_kind,
+        "failure_source": None,
+        "failure_code": None,
+        "capability": "read_only",
+        "repository_fingerprint_before": None,
+        "repository_fingerprint_after": None,
+        "retry_scheduled": False,
+    }
+
+
+def v8_ordinary_payload(
+    records: list[dict[str, object]] | None = None,
+    *,
+    spec_review: dict[str, object] | None = None,
+    implementation_review: dict[str, object] | None = None,
+    stage: str = "created",
+    run_id: str = "v8-review-backfill",
+) -> dict[str, object]:
+    payload = schema8_object()
+    payload["run_id"] = run_id
+    payload["migration_audit"] = None
+    payload["identity_migration_audit"] = None
+    payload["stage"] = stage
+    payload["active_writer_attempt"] = None
+    payload["policy_decisions"] = []
+    payload["provider_resume_stage"] = None
+    payload["provider_resume_prompt"] = None
+    payload["provider_resume_identity"] = None
+    payload["provider_resume_operation_id"] = None
+    payload["provider_runs"] = records if records is not None else []
+    payload["spec_review"] = spec_review
+    payload["implementation_review"] = implementation_review
+    return payload
+
+
+def pass_payload(summary: str = "fixture spec pass.") -> dict[str, object]:
+    return {
+        "status": "PASS",
+        "category": "PASS",
+        "finding_key": "PASS",
+        "summary": summary,
+    }
+
+
+def fail_payload(
+    summary: str,
+    finding_key: str,
+) -> dict[str, object]:
+    return {
+        "status": "FAIL",
+        "category": "IMPLEMENTATION_DEFECT",
+        "finding_key": finding_key,
+        "summary": summary,
+    }
 
 
 class MigrationContractTests(unittest.TestCase):
@@ -120,11 +246,14 @@ class MigrationContractTests(unittest.TestCase):
                 origin="https://example.invalid/repo.git",
             ),
         )
-        self.assertEqual(current.schema_version, 8)
+        self.assertEqual(current.schema_version, 9)
         self.assertIsNone(current.migration_audit)
         self.assertIsNone(current.identity_migration_audit)
+        self.assertIsNone(current.review_migration_audit)
+        self.assertEqual(current.review_records, [])
+        self.assertEqual(current.unreadable_review_records, [])
 
-        for value in (1, 6, 7, 9, True, "8", 8.0):
+        for value in (1, 6, 7, 8, 10, True, "9", 9.0):
             candidate = current.model_copy(deep=True)
             candidate.__dict__["schema_version"] = value
             with self.subTest(value=value):
@@ -147,15 +276,15 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(candidate.updated_at, unchanged_update)
 
     def test_c3_registry_is_exact_adjacent_closed_and_ordered(self) -> None:
-        expected = [(version, version + 1) for version in range(1, 8)]
+        expected = [(version, version + 1) for version in range(1, 9)]
         self.assertEqual(sorted(run_migrations.MIGRATION_REGISTRY), expected)
         self.assertTrue(all(callable(step) for step in run_migrations.MIGRATION_REGISTRY.values()))
-        for version in range(1, 8):
+        for version in range(1, 9):
             self.assertEqual(
                 run_migrations.migration_steps(version),
-                tuple(f"{item}_to_{item + 1}" for item in range(version, 8)),
+                tuple(f"{item}_to_{item + 1}" for item in range(version, 9)),
             )
-        for invalid in (0, 8, 9):
+        for invalid in (0, 9, 10):
             self.assertEqual(run_migrations.migration_steps(invalid), ())
 
     def test_h1_h2_all_committed_fixtures_classify_and_preserve_exact_values(self) -> None:
@@ -635,8 +764,7 @@ class MigrationContractTests(unittest.TestCase):
         )
 
     def test_identity_v8_legacy_audit_without_identity_audit_archives(self) -> None:
-        migrated_run = migrated(encoded(schema7_object()))
-        payload = json.loads(migrated_run.model_dump_json())
+        payload = schema8_object()
         payload["identity_migration_audit"] = None
         classification = run_migrations.classify_run_bytes(encoded(payload))
         self.assertEqual(classification.treatment, "archive")
@@ -656,7 +784,7 @@ class MigrationContractTests(unittest.TestCase):
         missing = copy.deepcopy(base)
         missing.pop("schema_version")
         self.assertEqual(run_migrations.classify_run_bytes(encoded(missing)).reason_code, "invalid_schema_version")
-        for version in (9, 99):
+        for version in (10, 99):
             payload = copy.deepcopy(base)
             payload["schema_version"] = version
             classified = run_migrations.classify_run_bytes(encoded(payload))
@@ -729,7 +857,7 @@ class MigrationContractTests(unittest.TestCase):
 
         def observe_replace(source_path: Path, target_path: Path) -> None:
             candidate = json.loads(Path(source_path).read_text())
-            self.assertEqual(candidate["schema_version"], 8)
+            self.assertEqual(candidate["schema_version"], 9)
             replacements.append((Path(source_path), Path(target_path)))
             real_replace(source_path, target_path)
 
@@ -739,7 +867,7 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(len(replacements), 1)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         persisted = json.loads(path.read_text())
-        self.assertEqual(persisted["schema_version"], 8)
+        self.assertEqual(persisted["schema_version"], 9)
         self.assertEqual(persisted["migration_audit"]["source_sha256"], hashlib.sha256(source).hexdigest())
 
         stable = path.stat()
@@ -895,7 +1023,7 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(sum(item.endswith(":success") for item in results), 1)
         self.assertEqual(sum("source_changed" in item for item in results), 1)
         persisted = json.loads(path.read_text())
-        self.assertEqual(persisted["schema_version"], 8)
+        self.assertEqual(persisted["schema_version"], 9)
         self.assertEqual(persisted["migration_audit"]["migration_id"], "migration-test-01")
 
     def test_a5_a6_crash_boundaries_leave_one_retryable_or_complete_record(self) -> None:
@@ -907,7 +1035,7 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), source)
         self.assertEqual(list(self.runs.glob(".run-*.tmp")), [])
         self.approve(run_id)
-        self.assertEqual(json.loads(path.read_text())["schema_version"], 8)
+        self.assertEqual(json.loads(path.read_text())["schema_version"], 9)
 
         second_source = fixture_bytes(4)
         second_id, second_path = self.write_run(second_source)
@@ -922,7 +1050,7 @@ class MigrationContractTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.approve(second_id)
         complete = second_path.read_bytes()
-        self.assertEqual(json.loads(complete)["schema_version"], 8)
+        self.assertEqual(json.loads(complete)["schema_version"], 9)
         self.approve(second_id)
         self.assertEqual(second_path.read_bytes(), complete)
 
@@ -1005,7 +1133,7 @@ class MigrationContractTests(unittest.TestCase):
                 with self.subTest(action=action):
                     with self.assertRaisesRegex(orchestrator.ControllerError, "migrated record disposition"):
                         action()
-        self.assertEqual(json.loads(path.read_text())["schema_version"], 8)
+        self.assertEqual(json.loads(path.read_text())["schema_version"], 9)
 
     def test_p1_p2_p3_storage_safety_redaction_and_text_independence(self) -> None:
         source = fixture_object(5)
@@ -1056,6 +1184,7 @@ class MigrationContractTests(unittest.TestCase):
                 (5, 6),
                 (6, 7),
                 (7, 8),
+                (8, 9),
             ],
         )
         command_names = {
@@ -1063,6 +1192,476 @@ class MigrationContractTests(unittest.TestCase):
             for command in orchestrator.app.registered_commands
         }
         self.assertIn("migrate-run", command_names)
+
+
+class ReviewBackfillMigrationTests(unittest.TestCase):
+    """Gate 2.4 M-matrix: exact V8 model, one adjacent 8_to_9 step, audit."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.runs = Path(self.temp.name) / "runs"
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def write_run(self, source: bytes, run_id: str | None = None) -> tuple[str, Path]:
+        classification = run_migrations.classify_run_bytes(source)
+        resolved = run_id or classification.run_id
+        if resolved is None:
+            raise AssertionError("test fixture requires an explicit run id")
+        self.runs.mkdir(mode=0o700, exist_ok=True)
+        path = self.runs / f"{resolved}.json"
+        path.write_bytes(source)
+        path.chmod(0o600)
+        return resolved, path
+
+    def approve(self, run_id: str) -> WorkflowRun | None:
+        return orchestrator.migrate_run_record(
+            run_id,
+            self.runs,
+            approval=lambda _: True,
+            now=lambda: "2026-08-02T12:00:00+00:00",
+            migration_id=lambda: "migration-review-01",
+        )
+
+    def test_m1_registry_steps_remain_literal_and_v8_model_is_exact(self) -> None:
+        registry_source = Path(run_migrations.__file__).read_text(encoding="utf-8")
+        self.assertIn('"target_schema_version": 8', registry_source)
+        self.assertIn("result[\"schema_version\"] = 8", registry_source)
+        self.assertIn('"target_schema_version": 7', registry_source)
+        for name in ("_step_6_to_7", "_step_7_to_8"):
+            start = registry_source.index(f"def {name}")
+            following = registry_source.index("def ", start + 1)
+            self.assertNotIn(
+                "CURRENT_RUN_SCHEMA_VERSION",
+                registry_source[start:following],
+            )
+        self.assertEqual(len(run_migrations._HISTORICAL_MODELS), 8)
+        self.assertEqual(run_migrations._HISTORICAL_MODELS[8].__name__, "_RunV8")
+
+        historical = run_migrations._HISTORICAL_MODELS[8]
+        fields = historical.model_fields
+        self.assertIn("identity_migration_audit", fields)
+        self.assertIn("provider_resume_identity", fields)
+        self.assertIn("provider_resume_operation_id", fields)
+        self.assertNotIn("review_records", fields)
+        self.assertNotIn("review_migration_audit", fields)
+        self.assertNotIn("unreadable_review_records", fields)
+
+        payload = schema8_object()
+        self.assertEqual(
+            run_migrations.classify_run_bytes(encoded(payload)).structural_class,
+            "V8",
+        )
+        for version in (1, 2, 3, 4, 5):
+            run_migrations._validate_historical(
+                fixture_object(version),
+                version,
+            )
+        run_migrations._validate_historical(fixture_object("6_base"), 6)
+        run_migrations._validate_historical(schema7_object(), 7)
+        run_migrations._validate_historical(payload, 8)
+
+    def test_m2_v8_ordinary_record_backfills_parsed_records_only(self) -> None:
+        spec_stdout = review_stdout("PASS", "PASS", "fixture spec pass.")
+        impl_stdout = review_stdout(
+            "FAIL",
+            "IMPLEMENTATION_DEFECT",
+            "fixture defect",
+            "fixture-defect",
+        )
+        records = [
+            v8_review_record("specification_review", spec_stdout),
+            v8_review_record("implementation_review", impl_stdout),
+            v8_review_record(
+                "implementation_review",
+                "truncated attempt",
+                failure_kind="quota",
+            ),
+            v8_review_record(
+                "implementation_review",
+                impl_stdout,
+                returncode=1,
+            ),
+        ]
+        source = encoded(
+            v8_ordinary_payload(
+                records,
+                spec_review=pass_payload(),
+                implementation_review=fail_payload("fixture defect", "fixture-defect"),
+            )
+        )
+        run_id, path = self.write_run(source)
+        before = path.read_bytes()
+        run = self.approve(run_id)
+        self.assertIsNotNone(run)
+        self.assertEqual(path.read_bytes() == before, False)
+
+        self.assertEqual(run.schema_version, 9)
+        self.assertIsNone(run.identity_migration_audit)
+        self.assertIsNone(run.migration_audit)
+        audit = run.review_migration_audit
+        self.assertIsNotNone(audit)
+        self.assertEqual(
+            [item.provider_record_index for item in run.review_records],
+            [0, 1],
+        )
+        self.assertEqual(run.unreadable_review_records, [])
+        self.assertEqual(audit.parsed_count, 2)
+        self.assertEqual(audit.unreadable_count, 0)
+        self.assertEqual(audit.applied_steps, ("8_to_9",))
+        self.assertEqual(audit.source_structural_class, "V8")
+        self.assertEqual(audit.source_schema_version, 8)
+        self.assertEqual(audit.source_sha256, hashlib.sha256(source).hexdigest())
+        self.assertEqual(audit.disposition, "resume_eligibility_deferred")
+        self.assertEqual(audit.reason_codes, ())
+        self.assertEqual(
+            run.spec_review.model_dump(mode="json"),
+            pass_payload(),
+        )
+        self.assertEqual(
+            run.implementation_review.model_dump(mode="json"),
+            fail_payload("fixture defect", "fixture-defect"),
+        )
+        self.assertEqual(run.provider_runs[2].failure_kind, "quota")
+        self.assertEqual(run.provider_runs[3].returncode, 1)
+
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "migrated record disposition is resume_eligibility_deferred",
+        ):
+            orchestrator.Controller._require_executable(run)
+
+    def test_m3_v1_through_v8_chain_preserves_prior_audits_and_appends_review(self) -> None:
+        for version in range(1, 7):
+            source = migration_source(version)
+            run = migrated(source)
+            with self.subTest(version=version):
+                self.assertEqual(run.schema_version, 9)
+                self.assertIsNotNone(run.migration_audit)
+                self.assertIsNotNone(run.identity_migration_audit)
+                audit = run.review_migration_audit
+                self.assertIsNotNone(audit)
+                self.assertEqual(audit.applied_steps[-1], "8_to_9")
+                self.assertEqual(
+                    audit.applied_steps,
+                    tuple(
+                        f"{item}_to_{item + 1}"
+                        for item in range(version, 9)
+                    ),
+                )
+                self.assertEqual(
+                    run.identity_migration_audit.applied_steps,
+                    audit.applied_steps[:-1],
+                )
+                self.assertEqual(
+                    audit.source_schema_version,
+                    version,
+                )
+                self.assertEqual(
+                    audit.parsed_count,
+                    len(run.review_records),
+                )
+                self.assertEqual(
+                    audit.unreadable_count,
+                    len(run.unreadable_review_records),
+                )
+                self.assertEqual(
+                    run.migration_audit.applied_steps,
+                    tuple(
+                        f"{item}_to_{item + 1}"
+                        for item in range(version, 7)
+                    ),
+                )
+
+        migrated_v8 = migrated(schema8_bytes())
+        self.assertEqual(
+            migrated_v8.identity_migration_audit.applied_steps,
+            ("6_to_7", "7_to_8"),
+        )
+        self.assertEqual(
+            migrated_v8.review_migration_audit.applied_steps,
+            ("8_to_9",),
+        )
+
+    def test_m4_v8_with_identity_audit_preserves_audit_and_appends_review_audit(self) -> None:
+        payload = schema8_object()
+        payload["run_id"] = "v8-carried-identity"
+        original_identity = copy.deepcopy(payload["identity_migration_audit"])
+        original_legacy = copy.deepcopy(payload["migration_audit"])
+        source = encoded(payload)
+        run = migrated(source)
+
+        self.assertEqual(
+            run.identity_migration_audit.model_dump(mode="json"),
+            original_identity,
+        )
+        self.assertEqual(
+            run.migration_audit.model_dump(mode="json"),
+            original_legacy,
+        )
+        audit = run.review_migration_audit
+        self.assertEqual(audit.source_schema_version, 8)
+        self.assertEqual(audit.applied_steps, ("8_to_9",))
+        self.assertEqual(audit.parsed_count, len(run.review_records))
+        self.assertEqual(audit.unreadable_count, len(run.unreadable_review_records))
+        self.assertNotEqual(audit.migration_id, original_identity["migration_id"])
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "migrated record disposition",
+        ):
+            orchestrator.Controller._require_executable(run)
+        self.assertEqual(run.identity_migration_audit.disposition, audit.disposition)
+
+    def test_m5_current_v9_source_reports_already_current_without_rewrite(self) -> None:
+        current = WorkflowRun(
+            run_id="v9-current-m5",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="current",
+            task_file="tasks/current.md",
+            task_sha256="0" * 64,
+            specification="Current schema fixture.",
+            repo=RepoState(
+                repo="/fixture/repo",
+                branch="main",
+                head="1" * 40,
+                clean=True,
+                origin="https://example.invalid/repo.git",
+            ),
+        )
+        source = current.model_dump_json().encode()
+        run_id, path = self.write_run(source)
+        before = path.stat()
+        with orchestrator.console.capture() as capture:
+            again = self.approve(run_id)
+        self.assertIsNotNone(again)
+        self.assertEqual(path.read_bytes(), source)
+        after = path.stat()
+        self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+        self.assertIn("already current", capture.get())
+
+    def test_m6_unreadable_legacy_reviews_get_bounded_markers(self) -> None:
+        records = [
+            v8_review_record("specification_review", "truncated stdout"),
+            v8_review_record("implementation_review", "{not valid json"),
+            v8_review_record(
+                "implementation_review",
+                review_stdout(
+                    "FAIL",
+                    "IMPLEMENTATION_DEFECT",
+                    "broken semantics",
+                )
+                .replace('"summary"', '"unexpected"')
+                .replace('"broken semantics"', '"removed"'),
+            ),
+            v8_review_record("implementation_review", review_stdout("PASS", "PASS", "ok")),
+        ]
+        source = encoded(
+            v8_ordinary_payload(records, spec_review=pass_payload())
+        )
+        run = migrated(source)
+        self.assertEqual(len(run.unreadable_review_records), 3)
+        self.assertEqual(
+            [item.provider_record_index for item in run.unreadable_review_records],
+            [0, 1, 2],
+        )
+        self.assertEqual(
+            [item.reason_code for item in run.unreadable_review_records],
+            [
+                "invalid_review_envelope",
+                "invalid_review_envelope",
+                "invalid_review_schema",
+            ],
+        )
+        self.assertEqual(
+            [item.provider_record_index for item in run.review_records],
+            [3],
+        )
+        self.assertEqual(
+            run.review_migration_audit.parsed_count,
+            1,
+        )
+        self.assertEqual(
+            run.review_migration_audit.unreadable_count,
+            3,
+        )
+        self.assertIn("current_review_unreadable", run.review_migration_audit.reason_codes)
+        self.assertIsNone(run.implementation_review)
+        classification = run_migrations.classify_run_bytes(
+            run.model_dump_json().encode()
+        )
+        self.assertEqual(classification.record_state, "RESUME_BLOCKED")
+
+    def test_m7_legacy_retry_pairs_and_failed_attempts_backfill_once(self) -> None:
+        first = v8_review_record(
+            "implementation_review",
+            "{invalid first attempt",
+        )
+        first["retry_scheduled"] = True
+        second = v8_review_record(
+            "implementation_review",
+            review_stdout("FAIL", "IMPLEMENTATION_DEFECT", "retried", "retry-key"),
+        )
+        failed = v8_review_record(
+            "implementation_review",
+            "partial transport output",
+            failure_kind="unavailable",
+        )
+        source = encoded(
+            v8_ordinary_payload(
+                [first, second, failed],
+                implementation_review=fail_payload("retried", "retry-key"),
+            )
+        )
+        run = migrated(source)
+        self.assertEqual(
+            [item.provider_record_index for item in run.review_records],
+            [1],
+        )
+        self.assertEqual(
+            [item.provider_record_index for item in run.unreadable_review_records],
+            [0],
+        )
+        self.assertEqual(
+            run.unreadable_review_records[0].reason_code,
+            "invalid_review_envelope",
+        )
+        self.assertEqual(
+            run.review_migration_audit.parsed_count,
+            1,
+        )
+        self.assertEqual(
+            run.review_migration_audit.unreadable_count,
+            1,
+        )
+        self.assertEqual(
+            run.implementation_review.finding_key,
+            "retry-key",
+        )
+
+    def test_m8_preserved_field_mismatch_records_bounded_reason_and_stays_blocked(self) -> None:
+        parsed = review_stdout("PASS", "PASS", "actual pass")
+        records = [v8_review_record("implementation_review", parsed)]
+        field_absent = v8_ordinary_payload(
+            records,
+            implementation_review=None,
+        )
+        absent_run = migrated(encoded(field_absent))
+        self.assertIn(
+            "resume_review_field_absent",
+            absent_run.review_migration_audit.reason_codes,
+        )
+        self.assertIsNone(absent_run.implementation_review)
+
+        stale_field = v8_ordinary_payload(
+            records,
+            implementation_review=fail_payload("stale failure", "stale-key"),
+        )
+        stale_run = migrated(encoded(stale_field))
+        self.assertIn(
+            "current_review_unreadable",
+            stale_run.review_migration_audit.reason_codes,
+        )
+        self.assertEqual(
+            stale_run.implementation_review.finding_key,
+            "stale-key",
+        )
+        for run in (absent_run, stale_run):
+            classification = run_migrations.classify_run_bytes(
+                run.model_dump_json().encode()
+            )
+            self.assertEqual(classification.record_state, "RESUME_BLOCKED")
+            with self.assertRaisesRegex(
+                orchestrator.ControllerError,
+                "migrated record disposition",
+            ):
+                orchestrator.Controller._require_executable(run)
+
+    def test_m9_backfill_incoherence_and_count_tampering_fail_closed(self) -> None:
+        records = [
+            v8_review_record(
+                "implementation_write",
+                review_stdout("PASS", "PASS", "not a review"),
+            ),
+        ]
+        incoherent = v8_ordinary_payload(records)
+        source = encoded(incoherent)
+        run_id, path = self.write_run(source)
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "migration_step_failed",
+        ):
+            self.approve(run_id)
+        self.assertEqual(path.read_bytes(), source)
+        self.assertEqual(len(run_migrations.classify_run_bytes(source).payload["provider_runs"]), 1)
+
+        clean = v8_ordinary_payload(
+            [
+                v8_review_record(
+                    "implementation_review",
+                    review_stdout("PASS", "PASS", "ok"),
+                )
+            ],
+            implementation_review=pass_payload(),
+            run_id="v8-count-tamper",
+        )
+        clean_source = encoded(clean)
+        clean_id, clean_path = self.write_run(clean_source, "v8-count-tamper")
+        original = run_migrations.MIGRATION_REGISTRY[(8, 9)]
+
+        def corrupt_counts(
+            payload: dict[str, object],
+            context: run_migrations.MigrationContext,
+        ) -> tuple[dict[str, object], list[str]]:
+            result, reasons = original(payload, context)
+            result["review_migration_audit"]["parsed_count"] = 99
+            return result, reasons
+
+        run_migrations.MIGRATION_REGISTRY[(8, 9)] = corrupt_counts  # type: ignore[assignment]
+        try:
+            with self.assertRaisesRegex(
+                orchestrator.ControllerError,
+                "migration_step_failed",
+            ):
+                self.approve(clean_id)
+        finally:
+            run_migrations.MIGRATION_REGISTRY[(8, 9)] = original
+        self.assertEqual(clean_path.read_bytes(), clean_source)
+
+    def test_migrated_v9_refuses_execution_and_preserves_raw_review_stdout(self) -> None:
+        impl_stdout = review_stdout(
+            "FAIL",
+            "IMPLEMENTATION_DEFECT",
+            "preserved defect",
+            "preserved-key",
+        )
+        source = encoded(
+            v8_ordinary_payload(
+                [
+                    v8_review_record("specification_review", review_stdout("PASS", "PASS", "ok")),
+                    v8_review_record("implementation_review", impl_stdout),
+                ],
+                spec_review=pass_payload(),
+                implementation_review=fail_payload("preserved defect", "preserved-key"),
+            )
+        )
+        run = migrated(source)
+        self.assertEqual(run.provider_runs[1].stdout, impl_stdout)
+        self.assertEqual(run.review_records[1].result.finding_key, "preserved-key")
+        classification = run_migrations.classify_run_bytes(
+            run.model_dump_json().encode()
+        )
+        self.assertEqual(classification.treatment, "current")
+        self.assertEqual(classification.record_state, "RESUME_BLOCKED")
+        self.assertEqual(
+            classification.structural_class,
+            run.review_migration_audit.source_structural_class,
+        )
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "run execution refused",
+        ):
+            orchestrator.Controller._require_executable(run)
 
 
 if __name__ == "__main__":

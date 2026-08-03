@@ -37,8 +37,10 @@ from models import (
     ProviderRouteIdentity,
     ROUTE_IDENTITIES,
     RepoState,
+    ReviewRecord,
     ReviewResult,
     TargetOwnership,
+    UnreadableReviewRecord,
     WorkflowRun,
     WriterAttemptPurpose,
     WriterAttemptStage,
@@ -66,6 +68,7 @@ from run_migrations import (
     classify_run_bytes,
     migrate_classification,
     migration_steps,
+    _unreadable_review_reason,
 )
 
 app = typer.Typer(
@@ -778,9 +781,12 @@ def migrate_run_record(
         if exc.field_path:
             detail = f"{detail}:{exc.field_path}"
         raise ControllerError(f"run migration {detail}") from exc
-    audit = result.run.identity_migration_audit
+    audit = (
+        result.run.identity_migration_audit
+        or result.run.review_migration_audit
+    )
     if audit is None:
-        raise ControllerError("run migration identity_migration_audit_invalid")
+        raise ControllerError("run migration migration_audit_invalid")
     console.print(
         f"Migrated run {run_id} to schema {CURRENT_RUN_SCHEMA_VERSION}; "
         f"disposition is {audit.disposition}."
@@ -1322,35 +1328,11 @@ def _format_duration(seconds: float | None) -> str:
 
 
 def _report_review_history(run: WorkflowRun) -> list[ReviewResult]:
-    history: list[ReviewResult] = []
-    for record in run.provider_runs:
-        if (
-            record.identity.role_id != "adversarial_review"
-            or record.operation_id != "implementation_review"
-        ):
-            continue
-        execution = ProviderExecution(
-            command=record.command,
-            returncode=record.returncode,
-            stdout=record.stdout,
-            stderr=record.stderr,
-            duration_seconds=record.duration_seconds,
-            failure_kind=record.failure_kind,
-            failure_source=record.failure_source,
-            failure_code=record.failure_code,
-            capability=record.capability,
-            repository_fingerprint_before=(
-                record.repository_fingerprint_before
-            ),
-            repository_fingerprint_after=(
-                record.repository_fingerprint_after
-            ),
-        )
-        try:
-            history.append(parse_sonnet_review(execution))
-        except Exception:
-            continue
-    return history
+    return [
+        record.result
+        for record in run.review_records
+        if record.operation_id == "implementation_review"
+    ]
 
 
 def _run_report(run: WorkflowRun) -> dict[str, object]:
@@ -1376,6 +1358,14 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
         for review in reviews
         if review.category not in {"PASS", "POLICY_AMBIGUITY"}
     }
+    unreadable_review_records = [
+        {
+            "operation_id": record.operation_id,
+            "provider_record_index": record.provider_record_index,
+            "reason_code": record.reason_code,
+        }
+        for record in run.unreadable_review_records
+    ]
 
     verification_runs = sum(
         1
@@ -1411,6 +1401,8 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
         "wall_seconds": wall_seconds,
         "corrections": run.correction_cycles,
         "distinct_defects": len(defect_keys),
+        "unreadable_review_count": len(unreadable_review_records),
+        "unreadable_review_records": unreadable_review_records,
         "sol_escalations": role_counts.get("escalation_executive", 0),
         "policy_decisions": len(run.policy_decisions),
         "writer_recovery_decisions": len(run.writer_recovery_decisions),
@@ -1499,6 +1491,16 @@ def _print_run_report(run: WorkflowRun) -> None:
 
     console.print(f"Corrections: {report['corrections']}")
     console.print(f"Distinct defects: {report['distinct_defects']}")
+    unreadable = report["unreadable_review_records"]
+    if unreadable:
+        console.print(
+            f"{len(unreadable)} unreadable review record(s)"
+        )
+        for item in unreadable:
+            console.print(
+                f"  #{item['provider_record_index']} {item['operation_id']}: "
+                f"{item['reason_code']}"
+            )
     console.print(f"Sol escalations: {report['sol_escalations']}")
     console.print(f"Verification runs: {report['verification_runs']}")
 
@@ -1570,7 +1572,18 @@ def _implementation_review_prompt(run: WorkflowRun, diff: str) -> str:
     prior_text = "\n".join(
         f"- {_finding_key(item)}: {item.summary[:500]}"
         for item in prior
-    ) or "(none)"
+    )
+    unreadable = [
+        record
+        for record in run.unreadable_review_records
+        if record.operation_id == "implementation_review"
+    ]
+    if unreadable:
+        prior_text += "\n" + "\n".join(
+            f"- unreadable review record: {record.reason_code}"
+            for record in unreadable
+        )
+    prior_text = prior_text or "(none)"
 
     return (
         "You are performing a fresh-context, read-only adversarial implementation review. "
@@ -1655,37 +1668,12 @@ def _finding_key(result: ReviewResult) -> str:
 
 
 def _implementation_review_history(run: WorkflowRun) -> list[ReviewResult]:
-    findings: list[ReviewResult] = []
-    for record in run.provider_runs:
-        if (
-            record.identity.role_id != "adversarial_review"
-            or record.operation_id != "implementation_review"
-        ):
-            continue
-        try:
-            result = parse_sonnet_review(
-                ProviderExecution(
-                    record.command,
-                    record.returncode,
-                    record.stdout,
-                    record.stderr,
-                    failure_kind=record.failure_kind,
-                    failure_source=record.failure_source,
-                    failure_code=record.failure_code,
-                    capability=record.capability,
-                    repository_fingerprint_before=(
-                        record.repository_fingerprint_before
-                    ),
-                    repository_fingerprint_after=(
-                        record.repository_fingerprint_after
-                    ),
-                )
-            )
-        except Exception:
-            continue
-        if result.category != "PASS":
-            findings.append(result)
-    return findings
+    return [
+        record.result
+        for record in run.review_records
+        if record.operation_id == "implementation_review"
+        and record.result.category != "PASS"
+    ]
 
 
 def _current_finding_streak(run: WorkflowRun, result: ReviewResult) -> int:
@@ -1708,7 +1696,19 @@ def _sol_prompt(
     history = "\n\n".join(
         f"Finding {index} [{_finding_key(finding)}]:\n{finding.summary}"
         for index, finding in enumerate(findings, start=1)
-    ) or "(no parseable prior implementation findings)"
+    )
+    unreadable = [
+        record
+        for record in run.unreadable_review_records
+        if record.operation_id == "implementation_review"
+    ]
+    if unreadable:
+        history += "\n\n" + "\n".join(
+            f"Finding {index} (unreadable, {record.reason_code}): "
+            "review output is not parseable"
+            for index, record in enumerate(unreadable, start=1)
+        )
+    history = history or "(no parseable prior implementation findings)"
 
     prior_guidance = run.sol_guidance or "(none)"
 
@@ -1844,6 +1844,11 @@ class Controller:
             raise ControllerError(
                 "run execution refused: migrated record disposition is "
                 f"{run.migration_audit.disposition}"
+            )
+        if run.review_migration_audit is not None:
+            raise ControllerError(
+                "run execution refused: migrated record disposition is "
+                f"{run.review_migration_audit.disposition}"
             )
 
     def _save(self, run: WorkflowRun) -> None:
@@ -2451,6 +2456,14 @@ class Controller:
             result = retried
 
         self._clear_provider(run)
+        run.review_records.append(
+            ReviewRecord(
+                recorded_at=datetime.now(timezone.utc).isoformat(),
+                operation_id=operation_id,
+                result=result,
+                provider_record_index=len(run.provider_runs) - 1,
+            )
+        )
 
         if purpose == "specification":
             run.spec_review = result
@@ -3188,6 +3201,78 @@ class Controller:
                 record.operation_id,
                 execution,
             )
+        if run.stage in {"spec_reviewing", "reviewing"}:
+            last_index = len(run.provider_runs) - 1
+            persisted = next(
+                (
+                    review
+                    for review in run.review_records
+                    if review.provider_record_index == last_index
+                ),
+                None,
+            )
+            if persisted is not None:
+                result = persisted.result
+            else:
+                if any(
+                    review.provider_record_index == last_index
+                    for review in run.unreadable_review_records
+                ):
+                    return self._block_provider_output(
+                        run,
+                        ADVERSARIAL_REVIEW_ROUTE,
+                        expected_operation,
+                        "review output is unreadable",
+                    )
+                try:
+                    result = parse_sonnet_review(execution)
+                except Exception as exc:
+                    run.unreadable_review_records.append(
+                        UnreadableReviewRecord(
+                            recorded_at=datetime.now(timezone.utc).isoformat(),
+                            operation_id=expected_operation,
+                            provider_record_index=last_index,
+                            reason_code=_unreadable_review_reason(exc),
+                        )
+                    )
+                    self._save(run)
+                    return self._block_provider_output(
+                        run,
+                        ADVERSARIAL_REVIEW_ROUTE,
+                        expected_operation,
+                        str(exc),
+                    )
+                run.review_records.append(
+                    ReviewRecord(
+                        recorded_at=datetime.now(timezone.utc).isoformat(),
+                        operation_id=expected_operation,
+                        result=result,
+                        provider_record_index=last_index,
+                    )
+                )
+            if run.stage == "spec_reviewing":
+                run.spec_review = result
+                run.stage = (
+                    "spec_review_passed"
+                    if result.category == "PASS"
+                    else "spec_review_failed"
+                )
+                self._clear_provider(run)
+                self._save(run)
+                if result.category == "POLICY_AMBIGUITY":
+                    return self._policy_stop(run, result.summary)
+                if result.category != "PASS":
+                    return self._block(
+                        run,
+                        "blocked_spec_review",
+                        f"specification review failed: {result.summary}",
+                    )
+                return self._run_from(run)
+            run.implementation_review = result
+            run.stage = "implementation_reviewed"
+            self._clear_provider(run)
+            self._save(run)
+            return self._review_and_correct(run)
         if run.stage == "terra_resolving":
             run.terra_resolution = execution.stdout or execution.stderr
             return self._block(run, "blocked_policy_ambiguity", "policy ambiguity requires human approval")
@@ -3211,38 +3296,6 @@ class Controller:
             run.stage = "sol_guidance_ready"
             self._save(run)
             return self._run_from(run)
-        if run.stage == "spec_reviewing":
-            try:
-                result = parse_sonnet_review(execution)
-            except Exception as exc:
-                return self._block_provider_output(
-                    run,
-                    ADVERSARIAL_REVIEW_ROUTE,
-                    "specification_review",
-                    str(exc),
-                )
-            run.spec_review = result
-            run.stage = "spec_review_passed" if result.category == "PASS" else "spec_review_failed"
-            self._save(run)
-            if result.category == "POLICY_AMBIGUITY":
-                return self._policy_stop(run, result.summary)
-            if result.category != "PASS":
-                return self._block(run, "blocked_spec_review", f"specification review failed: {result.summary}")
-            return self._run_from(run)
-        if run.stage == "reviewing":
-            try:
-                result = parse_sonnet_review(execution)
-            except Exception as exc:
-                return self._block_provider_output(
-                    run,
-                    ADVERSARIAL_REVIEW_ROUTE,
-                    "implementation_review",
-                    str(exc),
-                )
-            run.implementation_review = result
-            run.stage = "implementation_reviewed"
-            self._save(run)
-            return self._review_and_correct(run)
 
         raise ControllerError(f"unsupported recoverable provider stage: {run.stage}")
 

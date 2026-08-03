@@ -16,6 +16,7 @@ from unittest.mock import patch
 import orchestrator
 import providers
 import run_migrations
+import typer
 from models import (
     ADVERSARIAL_REVIEW_ROUTE,
     IMPLEMENTATION_ROUTE,
@@ -23,8 +24,11 @@ from models import (
     POLICY_AUTHORITY_ROUTE,
     ProviderRouteIdentity,
     RepoState,
+    ReviewMigrationAudit,
+    ReviewRecord,
     ReviewResult,
     TargetOwnership,
+    UnreadableReviewRecord,
     WorkflowRun,
     WriterAttemptState,
     WriterRecoveryDecision,
@@ -539,7 +543,6 @@ class ControllerTests(unittest.TestCase):
         before_save.stage = "implementation_completed"
         before_save.changed_files = []
         before_save.working_tree_fingerprint = None
-        before_save.implementation_review = None
         before_save.target_ownership = None
         before_runs = self.runs / "before-verification-save"
         orchestrator.persist(before_save, before_runs)
@@ -556,7 +559,6 @@ class ControllerTests(unittest.TestCase):
         after_save = completed.model_copy(deep=True)
         after_save.run_id = "after-verification-save"
         after_save.stage = "implementation_verified"
-        after_save.implementation_review = None
         after_save.target_ownership = None
         after_runs = self.runs / "after-verification-save"
         orchestrator.persist(after_save, after_runs)
@@ -793,10 +795,34 @@ class ControllerTests(unittest.TestCase):
 
         run.stage = "blocked_after_correction"
         run.correction_cycles = 1
-        run.implementation_review = ReviewResult(
+        result = ReviewResult(
             status="FAIL",
             category="IMPLEMENTATION_DEFECT",
             summary="legacy blocked finding",
+        )
+        run.implementation_review = result
+        attempt = review_execution(
+            "FAIL",
+            "IMPLEMENTATION_DEFECT",
+            "legacy blocked finding",
+        )
+        index = len(run.provider_runs)
+        run.provider_runs.append(
+            provider_record(
+                ADVERSARIAL_REVIEW_ROUTE,
+                "implementation_review",
+                command=attempt.command,
+                returncode=0,
+                stdout=attempt.stdout,
+            )
+        )
+        run.review_records.append(
+            orchestrator.ReviewRecord(
+                recorded_at="2026-08-02T00:00:00+00:00",
+                operation_id="implementation_review",
+                result=result,
+                provider_record_index=index,
+            )
         )
         run.last_error = "implementation review still fails after one correction"
         orchestrator.persist(run, self.runs)
@@ -818,11 +844,36 @@ class ControllerTests(unittest.TestCase):
         ).new_run("009")
 
         run.stage = "blocked_policy_ambiguity"
-        run.implementation_review = ReviewResult(
+        review_result = ReviewResult(
             status="FAIL",
             category="IMPLEMENTATION_DEFECT",
             finding_key="remote-scope-ownership",
             summary="remote scope ownership remains unresolved",
+        )
+        run.implementation_review = review_result
+        attempt = review_execution(
+            "FAIL",
+            "IMPLEMENTATION_DEFECT",
+            "remote scope ownership remains unresolved",
+            "remote-scope-ownership",
+        )
+        review_index = len(run.provider_runs)
+        run.provider_runs.append(
+            provider_record(
+                ADVERSARIAL_REVIEW_ROUTE,
+                "implementation_review",
+                command=attempt.command,
+                returncode=0,
+                stdout=attempt.stdout,
+            )
+        )
+        run.review_records.append(
+            orchestrator.ReviewRecord(
+                recorded_at="2026-08-02T00:00:00+00:00",
+                operation_id="implementation_review",
+                result=review_result,
+                provider_record_index=review_index,
+            )
         )
         run.sol_guidance = "Decision 3 versus Decision 4 ownership is ambiguous."
         run.terra_resolution = (
@@ -1176,6 +1227,8 @@ class ControllerTests(unittest.TestCase):
             "old attendance defect",
             "attendance-linking",
         )
+        old_result = providers.parse_sonnet_review(old)
+        old_index = len(run.provider_runs)
         run.provider_runs.append(
             provider_record(
                 ADVERSARIAL_REVIEW_ROUTE,
@@ -1186,16 +1239,43 @@ class ControllerTests(unittest.TestCase):
                 stderr=old.stderr,
             )
         )
+        run.review_records.append(
+            orchestrator.ReviewRecord(
+                recorded_at="2026-08-02T00:00:00+00:00",
+                operation_id="implementation_review",
+                result=old_result,
+                provider_record_index=old_index,
+            )
+        )
 
         # Simulate the real T008-style hard stop: Sol path exhausted,
         # but final QA has uncovered a genuinely new defect.
         run.stage = "blocked_after_escalation"
         run.correction_cycles = 3
-        run.implementation_review = ReviewResult(
+        new_result = ReviewResult(
             status="FAIL",
             category="IMPLEMENTATION_DEFECT",
             finding_key="geography-modal-alternatives",
             summary="new geography modal defect",
+        )
+        run.implementation_review = new_result
+        new_index = len(run.provider_runs)
+        run.provider_runs.append(
+            provider_record(
+                ADVERSARIAL_REVIEW_ROUTE,
+                "implementation_review",
+                command=old.command,
+                returncode=0,
+                stdout=old.stdout,
+            )
+        )
+        run.review_records.append(
+            orchestrator.ReviewRecord(
+                recorded_at="2026-08-02T00:00:00+00:00",
+                operation_id="implementation_review",
+                result=new_result,
+                provider_record_index=new_index,
+            )
         )
         run.last_error = "implementation review still fails after Sol-guided final correction"
         orchestrator.persist(run, self.runs)
@@ -3140,7 +3220,7 @@ class StableProviderIdentityTests(unittest.TestCase):
         )
         run = self.run_fixture(provider_runs=[record])
         dumped = run.model_dump(mode="json")
-        self.assertEqual(dumped["schema_version"], 8)
+        self.assertEqual(dumped["schema_version"], 9)
         self.assertIsNone(dumped["migration_audit"])
         self.assertIsNone(dumped["identity_migration_audit"])
         self.assertNotIn("provider", dumped["provider_runs"][0])
@@ -3149,6 +3229,12 @@ class StableProviderIdentityTests(unittest.TestCase):
     def test_display_is_presentation_only_but_control_identity_is_closed(self) -> None:
         renamed_review = ADVERSARIAL_REVIEW_ROUTE.model_copy(
             update={"display_name": "Luna High"}
+        )
+        review_result = ReviewResult(
+            status="FAIL",
+            category="IMPLEMENTATION_DEFECT",
+            finding_key="test-finding",
+            summary="renamed reviewer fixture",
         )
         run = self.run_fixture(
             provider_runs=[
@@ -3162,7 +3248,16 @@ class StableProviderIdentityTests(unittest.TestCase):
                         "IMPLEMENTATION_DEFECT",
                     ).stdout,
                 )
-            ]
+            ],
+            review_records=[
+                orchestrator.ReviewRecord(
+                    recorded_at="2026-08-02T00:00:00+00:00",
+                    operation_id="implementation_review",
+                    result=review_result,
+                    provider_record_index=0,
+                )
+            ],
+            implementation_review=review_result,
         )
         self.assertEqual(
             orchestrator._implementation_review_history(run)[0].status,
@@ -3824,7 +3919,7 @@ orchestrator.persist(run, runs)
         self.assertNotIn("os.umask", source)
         self.assertNotIn("os.chown", source)
         self.assertNotIn("force-unlock", source)
-        self.assertEqual(self.run_fixture().schema_version, 8)
+        self.assertEqual(self.run_fixture().schema_version, 9)
         command_names = {
             command.name or command.callback.__name__.replace("_", "-")
             for command in orchestrator.app.registered_commands
@@ -3834,6 +3929,1046 @@ orchestrator.persist(run, runs)
                 {"export", "purge", "redact", "cleanup", "clean-runs"}
             )
         )
+
+
+class ImmutableReviewHistoryTests(unittest.TestCase):
+    """Gate 2.4 / C-6 matrix: parsed review history, recovery, visibility."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temp.name) / "jobs"
+        self.repo.mkdir()
+        git(self.repo, "init", "-b", "main")
+        git(self.repo, "config", "user.email", "tests@example.invalid")
+        git(self.repo, "config", "user.name", "Controller Tests")
+        git(self.repo, "remote", "add", "origin", "https://example.invalid/jobs.git")
+        (self.repo / "tasks").mkdir()
+        (self.repo / "tasks/009-example.md").write_text("Implement the example task.\n")
+        (self.repo / "README.md").write_text("fixture\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "fixture")
+        self.runs = Path(self.temp.name) / "runs"
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def controller(self, sonnet, terra=None, sol=None, luna=None, approval=None, runs_dir=None):
+        return orchestrator.Controller(
+            self.repo,
+            runs_dir or self.runs,
+            sonnet=sonnet,
+            terra=terra or (lambda prompt, repo: providers.ProviderExecution(["codex"], 0, "resolved", "")),
+            sol=sol or (lambda prompt, repo: providers.ProviderExecution(["codex"], 0, "GUIDANCE: bounded guidance", "")),
+            luna=luna or self.luna,
+            approval=approval,
+        )
+
+    def luna(self, prompt, repo):
+        (repo / "implementation.py").write_text("# implementation\n")
+        return providers.ProviderExecution(["codex"], 0, "implemented", "")
+
+    def passing_sonnet(self, prompt, repo):
+        return review_execution("PASS", "PASS")
+
+    def run_fixture(self, **updates) -> WorkflowRun:
+        values = {
+            "run_id": "review-history-fixture",
+            "created_at": "2026-08-02T00:00:00+00:00",
+            "task_ref": "009",
+            "task_file": "tasks/009-example.md",
+            "task_sha256": "0" * 64,
+            "specification": "Review history fixture.",
+            "repo": RepoState(
+                repo="/fixture/repo",
+                branch="main",
+                head="1" * 40,
+                clean=True,
+                origin="https://example.invalid/repo.git",
+            ),
+        }
+        values.update(updates)
+        return WorkflowRun(**values)
+
+    def review_result(self, category, summary="fixture", finding_key=None):
+        if category == "PASS":
+            return ReviewResult(
+                status="PASS",
+                category="PASS",
+                finding_key="PASS",
+                summary=summary,
+            )
+        return ReviewResult(
+            status="FAIL",
+            category=category,
+            finding_key=finding_key or "fixture-finding",
+            summary=summary,
+        )
+
+    def review_record(self, index, result, operation="implementation_review"):
+        return ReviewRecord(
+            recorded_at="2026-08-02T00:00:00+00:00",
+            operation_id=operation,
+            result=result,
+            provider_record_index=index,
+        )
+
+    def unreadable_record(self, index, reason="invalid_review_semantics", operation="implementation_review"):
+        return UnreadableReviewRecord(
+            recorded_at="2026-08-02T00:00:00+00:00",
+            operation_id=operation,
+            provider_record_index=index,
+            reason_code=reason,
+        )
+
+    def raw_review(self, index, stdout, operation="implementation_review", returncode=0):
+        return provider_record(
+            ADVERSARIAL_REVIEW_ROUTE,
+            operation,
+            command=["claude", "fixture"],
+            returncode=returncode,
+            stdout=stdout,
+        )
+
+    def armed_review_run(self, stage, operation, *, stdout=None, **updates):
+        run = WorkflowRun(
+            run_id=f"{stage}-recovery",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Recovery fixture.",
+            repo=orchestrator.repo_state(self.repo),
+            stage=stage,
+            provider_resume_stage=stage,
+            provider_resume_prompt="saved prompt",
+            provider_resume_identity=ADVERSARIAL_REVIEW_ROUTE,
+            provider_resume_operation_id=operation,
+        )
+        if stdout is not None:
+            run.provider_runs.append(
+                self.raw_review(0, stdout, operation=operation)
+            )
+        for key, value in updates.items():
+            setattr(run, key, value)
+        return run
+
+    def test_i1_model_shapes_schema_and_no_raw_reparse_in_control(self) -> None:
+        self.assertEqual(orchestrator.CURRENT_RUN_SCHEMA_VERSION, 9)
+        self.assertEqual(self.run_fixture().schema_version, 9)
+        for model in (
+            orchestrator.ReviewRecord,
+            orchestrator.UnreadableReviewRecord,
+            ReviewMigrationAudit,
+        ):
+            self.assertTrue(model.model_config.get("frozen"))
+            self.assertEqual(model.model_config.get("extra"), "forbid")
+            self.assertEqual(model.model_config.get("strict"), True)
+        self.assertNotIn("purpose", orchestrator.ReviewRecord.model_fields)
+        self.assertNotIn("purpose", orchestrator.UnreadableReviewRecord.model_fields)
+        self.assertEqual(
+            set(orchestrator.ReviewRecord.model_fields["operation_id"].annotation.__args__),
+            {"specification_review", "implementation_review"},
+        )
+        self.assertNotIn("sol_guidance", orchestrator.ReviewRecord.model_fields)
+        self.assertNotIn("terra_resolution", orchestrator.ReviewRecord.model_fields)
+        source = Path(orchestrator.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("parse_sonnet_review(ProviderExecution", source)
+        self.assertEqual(
+            source.count("parse_sonnet_review("),
+            2,
+        )
+        self.assertEqual(
+            Path(run_migrations.__file__)
+            .read_text(encoding="utf-8")
+            .count("parse_sonnet_review("),
+            1,
+        )
+
+    def test_i2_raw_stdout_is_audit_only_and_never_a_control_oracle(self) -> None:
+        result = self.review_result("IMPLEMENTATION_DEFECT", "fixture defect")
+        clean_stdout = review_execution(
+            "FAIL", "IMPLEMENTATION_DEFECT", "fixture defect", "fixture-finding"
+        ).stdout
+        edited_stdout = clean_stdout[:-10] + "EDITED"
+        runs = []
+        for stdout in (clean_stdout, "not json at all", edited_stdout):
+            run = self.run_fixture(
+                provider_runs=[self.raw_review(0, stdout)],
+                review_records=[self.review_record(0, result)],
+                implementation_review=result,
+            )
+            runs.append(run)
+        histories = [orchestrator._implementation_review_history(run) for run in runs]
+        self.assertEqual(histories[0], histories[1])
+        self.assertEqual(histories[1], histories[2])
+        self.assertEqual(
+            [orchestrator._current_finding_streak(run, result) for run in runs],
+            [1, 1, 1],
+        )
+        reports = [orchestrator._run_report(run) for run in runs]
+        self.assertEqual(
+            [report["distinct_defects"] for report in reports],
+            [1, 1, 1],
+        )
+        self.assertEqual(
+            [report["provider_calls_total"] for report in reports],
+            [1, 1, 1],
+        )
+
+    def test_i3_only_implementation_operations_feed_control_and_spec_is_visible(self) -> None:
+        spec = self.review_result("PASS", "spec pass")
+        impl = self.review_result("IMPLEMENTATION_DEFECT", "impl defect")
+        run = self.run_fixture(
+            provider_runs=[
+                self.raw_review(0, "raw spec", operation="specification_review"),
+                self.raw_review(1, "raw impl"),
+            ],
+            review_records=[
+                self.review_record(0, spec, operation="specification_review"),
+                self.review_record(1, impl),
+            ],
+            spec_review=spec,
+            implementation_review=impl,
+        )
+        self.assertEqual(
+            [item.finding_key for item in orchestrator._implementation_review_history(run)],
+            ["fixture-finding"],
+        )
+        self.assertEqual(
+            [item.finding_key for item in orchestrator._report_review_history(run)],
+            ["fixture-finding"],
+        )
+        self.assertEqual(orchestrator._current_finding_streak(run, impl), 1)
+        self.assertEqual(len(run.review_records), 2)
+        sol_prompt = orchestrator._sol_prompt(run, self.repo, "fixture-finding", 1)
+        self.assertIn("impl defect", sol_prompt)
+        self.assertNotIn("spec pass", sol_prompt)
+
+    def test_i4_review_links_fail_closed_before_any_control_use(self) -> None:
+        result = self.review_result("PASS")
+        non_review = provider_record(
+            IMPLEMENTATION_ROUTE,
+            "implementation_write",
+            command=["codex"],
+            returncode=0,
+            capability="workspace_write",
+        )
+        mismatch = provider_record(
+            ADVERSARIAL_REVIEW_ROUTE,
+            "specification_review",
+            command=["claude"],
+            returncode=0,
+        )
+        failed = provider_record(
+            ADVERSARIAL_REVIEW_ROUTE,
+            "implementation_review",
+            command=["claude"],
+            returncode=1,
+            failure_kind="unavailable",
+        )
+        out_of_range = self.review_record(9, result)
+        duplicated = self.review_record(0, result)
+        variants = [
+            ("non-review record", [non_review], [self.review_record(0, result)], None),
+            ("mismatched operation", [mismatch], [self.review_record(0, result)], None),
+            ("failed attempt", [failed], [self.review_record(0, result)], None),
+            ("out of range", [self.raw_review(0, "x")], [out_of_range], None),
+            (
+                "duplicated index",
+                [self.raw_review(0, "x")],
+                [duplicated, self.unreadable_record(0)],
+                None,
+            ),
+        ]
+        for label, records, reviews, field in variants:
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    self.run_fixture(
+                        provider_runs=records,
+                        review_records=reviews,
+                        implementation_review=field,
+                    )
+
+    def test_i5_current_field_contradictions_reject_and_migrated_need_reason(self) -> None:
+        result = self.review_result("PASS")
+        with self.assertRaisesRegex(ValueError, "contradicts parsed history"):
+            self.run_fixture(
+                provider_runs=[self.raw_review(0, "raw")],
+                review_records=[self.review_record(0, result)],
+                implementation_review=self.review_result("IMPLEMENTATION_DEFECT", "stale"),
+            )
+        with self.assertRaisesRegex(ValueError, "contradicts parsed history"):
+            self.run_fixture(
+                provider_runs=[self.raw_review(0, "raw")],
+                review_records=[self.review_record(0, result)],
+            )
+        with self.assertRaisesRegex(ValueError, "contradicts parsed history"):
+            self.run_fixture(
+                implementation_review=self.review_result("IMPLEMENTATION_DEFECT"),
+            )
+
+        audit = ReviewMigrationAudit(
+            migration_id="review-reason-audit",
+            migrated_at="2026-08-02T12:00:00+00:00",
+            source_schema_version=8,
+            target_schema_version=9,
+            source_structural_class="V8",
+            source_sha256="ab" * 32,
+            applied_steps=("8_to_9",),
+            reason_codes=("current_review_unreadable",),
+            parsed_count=1,
+            unreadable_count=0,
+            disposition="resume_eligibility_deferred",
+        )
+        migrated = self.run_fixture(
+            provider_runs=[self.raw_review(0, "raw")],
+            review_records=[self.review_record(0, result)],
+            implementation_review=self.review_result("IMPLEMENTATION_DEFECT", "stale"),
+            review_migration_audit=audit,
+        )
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "migrated record disposition is resume_eligibility_deferred",
+        ):
+            orchestrator.Controller._require_executable(migrated)
+
+        missing_reason = audit.model_copy(
+            update={"reason_codes": ("legacy_policy_source_attempt_unlinked",)}
+        )
+        with self.assertRaisesRegex(ValueError, "contradicts migrated history"):
+            self.run_fixture(
+                provider_runs=[self.raw_review(0, "raw")],
+                review_records=[self.review_record(0, result)],
+                implementation_review=self.review_result("IMPLEMENTATION_DEFECT", "stale"),
+                review_migration_audit=missing_reason,
+            )
+
+    def test_p1_new_run_has_empty_review_state_and_no_audits(self) -> None:
+        run = self.run_fixture()
+        self.assertEqual(run.schema_version, 9)
+        self.assertEqual(run.review_records, [])
+        self.assertEqual(run.unreadable_review_records, [])
+        self.assertIsNone(run.review_migration_audit)
+        self.assertIsNone(run.identity_migration_audit)
+        self.assertIsNone(run.migration_audit)
+        dumped = run.model_dump(mode="json")
+        for key in ("review_records", "unreadable_review_records", "review_migration_audit"):
+            self.assertIn(key, dumped)
+        self.assertNotIn("reviews", dumped)
+
+    def test_p2_each_successful_review_persists_one_parsed_record_atomically(self) -> None:
+        snapshots = []
+        real_persist = orchestrator.persist
+
+        def observe(run, runs_dir):
+            snapshots.append(run.model_dump())
+            return real_persist(run, runs_dir)
+
+        with patch.object(orchestrator, "persist", side_effect=observe):
+            run = self.controller(
+                self.passing_sonnet,
+                approval=lambda prompt: False,
+            ).new_run("009")
+
+        self.assertEqual(run.stage, "commit_declined")
+        records = run.review_records
+        self.assertEqual(len(records), 2)
+        self.assertEqual(
+            [record.operation_id for record in records],
+            ["specification_review", "implementation_review"],
+        )
+        self.assertEqual(
+            [record.provider_record_index for record in records],
+            [0, 2],
+        )
+        spec_snapshot = next(
+            snapshot
+            for snapshot in snapshots
+            if len(snapshot["review_records"]) == 1
+        )
+        self.assertEqual(spec_snapshot["stage"], "spec_review_passed")
+        self.assertIsNotNone(spec_snapshot["spec_review"])
+        self.assertIsNone(spec_snapshot["implementation_review"])
+        impl_snapshot = next(
+            snapshot
+            for snapshot in snapshots
+            if len(snapshot["review_records"]) == 2
+        )
+        self.assertEqual(impl_snapshot["stage"], "implementation_reviewed")
+        self.assertIsNotNone(impl_snapshot["implementation_review"])
+
+    def test_p3_transport_retries_yield_only_one_parsed_record(self) -> None:
+        attempts = (
+            providers.ProviderAttempt(
+                ["claude"], 1, "", "HTTP 503", failure_kind="unavailable",
+                failure_source="stderr", failure_code="503", retry_scheduled=True,
+            ),
+            providers.ProviderAttempt(
+                ["claude"], 1, "", "HTTP 503", failure_kind="unavailable",
+                failure_source="stderr", failure_code="503", retry_scheduled=True,
+            ),
+            providers.ProviderAttempt(
+                ["claude"], 0, review_execution("PASS", "PASS").stdout, "",
+            ),
+        )
+        execution = providers.ProviderExecution(
+            ["claude"], 0, review_execution("PASS", "PASS").stdout, "",
+            attempts=attempts,
+        )
+        run = self.run_fixture()
+        result = self.controller(lambda prompt, repo: execution)._review(run, "specification")
+        self.assertIsNotNone(result)
+        self.assertEqual(len(run.provider_runs), 3)
+        self.assertEqual(
+            [record.retry_scheduled for record in run.provider_runs],
+            [True, True, False],
+        )
+        self.assertEqual(len(run.review_records), 1)
+        self.assertEqual(run.review_records[0].provider_record_index, 2)
+        self.assertEqual(run.unreadable_review_records, [])
+
+    def test_p4_content_retry_links_the_retry_attempt_exactly_once(self) -> None:
+        calls = []
+
+        def sonnet(prompt, repo):
+            calls.append(1)
+            if len(calls) == 1:
+                return providers.ProviderExecution(
+                    ["claude"], 0, "{malformed envelope", ""
+                )
+            return review_execution("PASS", "PASS")
+
+        run = self.run_fixture()
+        result = self.controller(sonnet)._review(run, "specification")
+        self.assertIsNotNone(result)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(run.provider_runs), 2)
+        self.assertEqual(len(run.review_records), 1)
+        self.assertEqual(run.review_records[0].provider_record_index, 1)
+        self.assertEqual(run.unreadable_review_records, [])
+
+    def test_p5_crash_after_raw_save_recovery_reparses_once(self) -> None:
+        run = self.armed_review_run(
+            "reviewing",
+            "implementation_review",
+            stdout=review_execution(
+                "FAIL", "IMPLEMENTATION_DEFECT", "crash fixture", "crash-key"
+            ).stdout,
+        )
+        orchestrator.persist(run, self.runs)
+
+        calls = []
+
+        def unexpected_sonnet(prompt, repo):
+            calls.append(1)
+            return review_execution("PASS", "PASS")
+
+        recovered = self.controller(
+            unexpected_sonnet,
+            approval=lambda prompt: False,
+        ).resume(run.run_id)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(recovered.stage, "commit_declined")
+        self.assertEqual(
+            [
+                record.result.finding_key
+                for record in recovered.review_records
+            ],
+            ["crash-key", "PASS"],
+        )
+        self.assertEqual(
+            recovered.review_records[0].provider_record_index,
+            0,
+        )
+        self.assertEqual(
+            recovered.implementation_review.finding_key,
+            "PASS",
+        )
+        self.assertEqual(recovered.unreadable_review_records, [])
+        self.assertIsNone(recovered.provider_resume_stage)
+
+        persisted = json.loads(
+            next(self.runs.glob(f"{run.run_id}.json")).read_text()
+        )
+        self.assertEqual(
+            [item["provider_record_index"] for item in persisted["review_records"]],
+            [0, 2],
+        )
+
+    def test_p6_full_current_state_round_trips_exactly(self) -> None:
+        from test_run_migrations import v8_ordinary_payload, v8_review_record, review_stdout
+
+        payload = v8_ordinary_payload(
+            [
+                v8_review_record(
+                    "specification_review",
+                    review_stdout("PASS", "PASS", "round trip"),
+                ),
+                v8_review_record(
+                    "implementation_review",
+                    review_stdout(
+                        "FAIL",
+                        "IMPLEMENTATION_DEFECT",
+                        "round trip defect",
+                        "round-trip-key",
+                    ),
+                ),
+            ],
+            spec_review={
+                "status": "PASS",
+                "category": "PASS",
+                "finding_key": "PASS",
+                "summary": "round trip",
+            },
+            implementation_review={
+                "status": "FAIL",
+                "category": "IMPLEMENTATION_DEFECT",
+                "finding_key": "round-trip-key",
+                "summary": "round trip defect",
+            },
+            run_id="round-trip-migrated",
+        )
+        migrated = run_migrations.migrate_classification(
+            run_migrations.classify_run_bytes(
+                (json.dumps(payload, ensure_ascii=False) + "\n").encode()
+            ),
+            migration_id="round-trip-migration",
+            migrated_at="2026-08-02T12:00:00+00:00",
+        ).run
+        with tempfile.TemporaryDirectory() as directory:
+            runs = Path(directory)
+            orchestrator.persist(migrated, runs)
+            loaded = orchestrator.load_run(migrated.run_id, runs)
+        self.assertEqual(loaded.model_dump(), migrated.model_dump())
+        self.assertEqual(len(loaded.review_records), 2)
+        self.assertEqual(loaded.unreadable_review_records, [])
+        self.assertIsNotNone(loaded.review_migration_audit)
+        self.assertEqual(
+            loaded.review_migration_audit.parsed_count,
+            2,
+        )
+
+    def test_c1_display_renames_never_change_control_values(self) -> None:
+        result = self.review_result("IMPLEMENTATION_DEFECT", "display fixture")
+        renamed = ADVERSARIAL_REVIEW_ROUTE.model_copy(
+            update={"display_name": IMPLEMENTATION_ROUTE.display_name}
+        )
+        run = self.run_fixture(
+            provider_runs=[
+                provider_record(
+                    renamed,
+                    "implementation_review",
+                    command=["claude"],
+                    returncode=0,
+                    stdout=review_execution(
+                        "FAIL",
+                        "IMPLEMENTATION_DEFECT",
+                    ).stdout,
+                )
+            ],
+            review_records=[self.review_record(0, result)],
+            implementation_review=result,
+        )
+        self.assertEqual(
+            orchestrator._current_finding_streak(run, result),
+            1,
+        )
+        self.assertEqual(orchestrator._run_report(run)["distinct_defects"], 1)
+        prompt = orchestrator._sol_prompt(run, self.repo, "fixture-finding", 1)
+        self.assertNotIn("Luna High", prompt)
+
+    def test_c2_streak_counts_implementation_records_in_physical_order(self) -> None:
+        first = self.review_result("IMPLEMENTATION_DEFECT", "first defect", "first-finding")
+        second = self.review_result("IMPLEMENTATION_DEFECT", "second defect", "second-finding")
+        run = self.run_fixture(
+            provider_runs=[
+                self.raw_review(0, "a", operation="specification_review"),
+                self.raw_review(1, "b"),
+                self.raw_review(2, "c", operation="specification_review"),
+                self.raw_review(3, "d"),
+            ],
+            review_records=[
+                self.review_record(0, first, operation="specification_review"),
+                self.review_record(1, first),
+                self.review_record(2, second, operation="specification_review"),
+                self.review_record(3, first),
+            ],
+            implementation_review=first,
+            spec_review=second,
+        )
+        self.assertEqual(orchestrator._current_finding_streak(run, first), 2)
+        self.assertEqual(
+            orchestrator._current_finding_streak(run, second),
+            1,
+        )
+
+    def test_c3_r6_reparse_failure_blocks_with_marker_and_no_duplicate(self) -> None:
+        malformed = self.armed_review_run(
+            "reviewing",
+            "implementation_review",
+            stdout="{not valid",
+        )
+        malformed.unreadable_review_records = [
+            self.unreadable_record(0, "invalid_review_envelope")
+        ]
+        orchestrator.persist(malformed, self.runs)
+
+        calls = []
+
+        def unexpected_sonnet(prompt, repo):
+            calls.append(1)
+            return providers.ProviderExecution(
+                ["claude"], 0, "{not valid", ""
+            )
+
+        recovered = self.controller(unexpected_sonnet).resume(malformed.run_id)
+        self.assertEqual(calls, [])
+        self.assertEqual(recovered.stage, "blocked_provider_output")
+        self.assertEqual(len(recovered.unreadable_review_records), 1)
+        self.assertEqual(recovered.unreadable_review_records[0].provider_record_index, 0)
+        self.assertEqual(recovered.review_records, [])
+
+        resumed_again = self.controller(unexpected_sonnet).resume(malformed.run_id)
+        self.assertEqual(resumed_again.stage, "blocked_provider_output")
+        self.assertEqual(len(resumed_again.unreadable_review_records), 2)
+        self.assertEqual(
+            [
+                record.provider_record_index
+                for record in resumed_again.unreadable_review_records
+            ],
+            [0, 1],
+        )
+        self.assertEqual(resumed_again.review_records, [])
+        self.assertEqual(len(resumed_again.provider_runs), 2)
+        self.assertEqual(len(calls), 1)
+
+    def test_c4_r5_recovery_consumes_persisted_record_without_reparse(self) -> None:
+        result = self.review_result(
+            "IMPLEMENTATION_DEFECT", "persisted recovery", "persisted-key"
+        )
+        run = self.armed_review_run(
+            "reviewing",
+            "implementation_review",
+            stdout="{garbage that would never parse",
+        )
+        run.review_records = [self.review_record(0, result)]
+        run.implementation_review = result
+        orchestrator.persist(run, self.runs)
+
+        calls = []
+
+        def unexpected_sonnet(prompt, repo):
+            calls.append(1)
+            return review_execution("PASS", "PASS")
+
+        recovered = self.controller(
+            unexpected_sonnet,
+            approval=lambda prompt: False,
+        ).resume(run.run_id)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(recovered.stage, "commit_declined")
+        self.assertEqual(
+            [
+                record.result.finding_key
+                for record in recovered.review_records
+            ],
+            ["persisted-key", "PASS"],
+        )
+        self.assertEqual(
+            recovered.review_records[0].provider_record_index,
+            0,
+        )
+        self.assertEqual(
+            recovered.implementation_review.finding_key,
+            "PASS",
+        )
+        self.assertEqual(recovered.unreadable_review_records, [])
+
+    def test_c5_streak_uses_parsed_history_and_two_sol_escalations_exact(self) -> None:
+        sonnet_calls = []
+        sol_calls = []
+
+        def sonnet(prompt, repo):
+            sonnet_calls.append(1)
+            count = len(sonnet_calls)
+            if count == 1:
+                return review_execution("PASS", "PASS")
+            if count <= 4:
+                return review_execution(
+                    "FAIL", "IMPLEMENTATION_DEFECT", "same defect", "same-key"
+                )
+            if count == 5:
+                return review_execution(
+                    "FAIL", "IMPLEMENTATION_DEFECT", "new defect", "new-key"
+                )
+            return review_execution("PASS", "PASS")
+
+        def sol(prompt, repo):
+            sol_calls.append(1)
+            return providers.ProviderExecution(["codex"], 0, "GUIDANCE: bounded", "")
+
+        run = self.controller(
+            sonnet,
+            sol=sol,
+            approval=lambda prompt: False,
+        ).new_run("009")
+
+        self.assertEqual(run.stage, "commit_declined")
+        self.assertEqual(len(sol_calls), 2)
+        self.assertEqual(run.correction_cycles, 4)
+        keys = [
+            record.result.finding_key
+            for record in run.review_records
+            if record.operation_id == "implementation_review"
+        ]
+        self.assertEqual(
+            keys,
+            ["same-key", "same-key", "same-key", "new-key", "PASS"],
+        )
+        self.assertEqual(len(run.unreadable_review_records), 0)
+
+    def test_c6_unreadable_markers_visible_and_never_change_values(self) -> None:
+        result = self.review_result("IMPLEMENTATION_DEFECT", "visible defect")
+        run = self.run_fixture(
+            run_id="unreadable-report",
+            provider_runs=[
+                self.raw_review(0, "raw parsed"),
+                self.raw_review(1, "truncated", returncode=0),
+            ],
+            review_records=[self.review_record(0, result)],
+            unreadable_review_records=[
+                self.unreadable_record(1, "invalid_review_envelope")
+            ],
+            implementation_review=result,
+        )
+        report = orchestrator._run_report(run)
+        self.assertEqual(report["distinct_defects"], 1)
+        self.assertEqual(report["unreadable_review_count"], 1)
+        self.assertEqual(
+            report["unreadable_review_records"],
+            [
+                {
+                    "operation_id": "implementation_review",
+                    "provider_record_index": 1,
+                    "reason_code": "invalid_review_envelope",
+                }
+            ],
+        )
+        self.assertEqual(orchestrator._current_finding_streak(run, result), 1)
+        sol_prompt = orchestrator._sol_prompt(run, self.repo, "fixture-finding", 1)
+        self.assertIn("Finding 1 [fixture-finding]:", sol_prompt)
+        self.assertIn(
+            "Finding 1 (unreadable, invalid_review_envelope): "
+            "review output is not parseable",
+            sol_prompt,
+        )
+
+        with orchestrator.console.capture() as capture:
+            orchestrator._print_run_report(run)
+        output = capture.get()
+        self.assertIn("1 unreadable review record(s)", output)
+        self.assertIn("#1 implementation_review: invalid_review_envelope", output)
+        self.assertNotIn("truncated", output)
+
+        orchestrator.persist(run, self.runs)
+        with patch.object(orchestrator, "RUNS", self.runs), orchestrator.console.capture() as capture:
+            orchestrator.status(run.run_id)
+        status_output = capture.get()
+        self.assertIn("unreadable_review_records", status_output)
+        self.assertIn("invalid_review_envelope", status_output)
+        self.assertIn("review_records", status_output)
+
+    def test_c7_prompts_render_parsed_summaries_and_explicit_unreadable(self) -> None:
+        result = self.review_result("IMPLEMENTATION_DEFECT", "parsed summary")
+        run = self.run_fixture(
+            provider_runs=[
+                self.raw_review(0, "SECRET RAW STDOUT", returncode=0),
+                self.raw_review(1, "SECRET RAW STDOUT 2", returncode=0),
+            ],
+            review_records=[self.review_record(0, result)],
+            unreadable_review_records=[
+                self.unreadable_record(1, "invalid_review_semantics")
+            ],
+            implementation_review=result,
+        )
+        review_prompt = orchestrator._implementation_review_prompt(run, "FIXTURE DIFF")
+        self.assertIn("parsed summary", review_prompt)
+        self.assertIn("unreadable review record: invalid_review_semantics", review_prompt)
+        self.assertNotIn("SECRET RAW STDOUT", review_prompt)
+
+        sol_prompt = orchestrator._sol_prompt(run, self.repo, "fixture-finding", 1)
+        self.assertIn("parsed summary", sol_prompt)
+        self.assertIn("unreadable, invalid_review_semantics", sol_prompt)
+        self.assertNotIn("SECRET RAW STDOUT", sol_prompt)
+
+    def test_r1_unavailable_retry_keeps_one_identity_and_raw_only(self) -> None:
+        attempts = (
+            providers.ProviderAttempt(
+                ["claude"], 1, "", "HTTP 503", failure_kind="unavailable",
+                failure_source="stderr", failure_code="503", retry_scheduled=True,
+            ),
+            providers.ProviderAttempt(
+                ["claude"], 1, "", "HTTP 503", failure_kind="unavailable",
+                failure_source="stderr", failure_code="503", retry_scheduled=True,
+            ),
+            providers.ProviderAttempt(
+                ["claude"], 0, review_execution("PASS", "PASS").stdout, "",
+            ),
+        )
+        execution = providers.ProviderExecution(
+            ["claude"], 0, review_execution("PASS", "PASS").stdout, "",
+            attempts=attempts,
+        )
+        run = self.run_fixture()
+        result = self.controller(lambda prompt, repo: execution)._review(run, "specification")
+        self.assertIsNotNone(result)
+        identities = {
+            (
+                record.identity.role_id,
+                record.identity.provider_adapter_id,
+                record.identity.route_id,
+                record.identity.model_id,
+                record.operation_id,
+            )
+            for record in run.provider_runs
+        }
+        self.assertEqual(
+            identities,
+            {
+                (
+                    "adversarial_review",
+                    "claude_cli",
+                    "builtin.adversarial_review.v1",
+                    "sonnet",
+                    "specification_review",
+                )
+            },
+        )
+        self.assertEqual(
+            [record.failure_kind for record in run.provider_runs[:2]],
+            ["unavailable", "unavailable"],
+        )
+        self.assertEqual(len(run.review_records), 1)
+
+    def test_r2_content_retry_uses_same_route_and_operation(self) -> None:
+        calls = []
+
+        def sonnet(prompt, repo):
+            calls.append(1)
+            if len(calls) == 1:
+                return providers.ProviderExecution(
+                    ["claude"], 0, "{malformed envelope", ""
+                )
+            return review_execution("PASS", "PASS")
+
+        run = self.run_fixture()
+        result = self.controller(sonnet)._review(run, "specification")
+        self.assertIsNotNone(result)
+        for record in run.provider_runs:
+            self.assertEqual(record.identity.route_id, "builtin.adversarial_review.v1")
+            self.assertEqual(record.operation_id, "specification_review")
+        self.assertEqual(run.review_records[0].provider_record_index, 1)
+        self.assertEqual(len(run.provider_runs), 2)
+
+    def test_r3_crash_before_raw_save_blocks_without_invocation(self) -> None:
+        run = self.armed_review_run("reviewing", "implementation_review", stdout=None)
+        orchestrator.persist(run, self.runs)
+
+        calls = []
+
+        def unexpected_sonnet(prompt, repo):
+            calls.append(1)
+            return review_execution("PASS", "PASS")
+
+        recovered = self.controller(unexpected_sonnet).resume(run.run_id)
+        self.assertEqual(calls, [])
+        self.assertEqual(recovered.stage, "blocked_interrupted_provider")
+        self.assertEqual(recovered.review_records, [])
+        self.assertEqual(recovered.unreadable_review_records, [])
+
+    def test_r4_crash_after_raw_save_both_review_stages_recover_once(self) -> None:
+        for stage, operation in (
+            ("spec_reviewing", "specification_review"),
+            ("reviewing", "implementation_review"),
+        ):
+            with self.subTest(stage=stage):
+                stdout = (
+                    review_execution(
+                        "PASS", "PASS", "spec recovery"
+                    ).stdout
+                    if stage == "spec_reviewing"
+                    else review_execution(
+                        "FAIL", "IMPLEMENTATION_DEFECT", "impl recovery", "recovery-key"
+                    ).stdout
+                )
+                stage_runs = self.runs / stage
+                run = self.armed_review_run(stage, operation, stdout=stdout)
+                orchestrator.persist(run, stage_runs)
+
+                calls = []
+
+                def unexpected_sonnet(prompt, repo):
+                    calls.append(1)
+                    return review_execution("PASS", "PASS")
+
+                recovered = self.controller(
+                    unexpected_sonnet,
+                    approval=lambda prompt: False,
+                    runs_dir=stage_runs,
+                ).resume(run.run_id)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(len(recovered.review_records), 2)
+                self.assertEqual(
+                    recovered.review_records[0].provider_record_index,
+                    0,
+                )
+                self.assertEqual(
+                    recovered.review_records[0].operation_id,
+                    operation,
+                )
+                self.assertEqual(recovered.unreadable_review_records, [])
+                self.assertIsNone(recovered.provider_resume_stage)
+                self.assertEqual(recovered.stage, "commit_declined")
+                if stage == "spec_reviewing":
+                    self.assertEqual(recovered.spec_review.category, "PASS")
+                    self.assertEqual(
+                        [
+                            record.result.finding_key
+                            for record in recovered.review_records
+                        ],
+                        ["PASS", "PASS"],
+                    )
+                else:
+                    self.assertEqual(
+                        [
+                            record.result.finding_key
+                            for record in recovered.review_records
+                        ],
+                        ["recovery-key", "PASS"],
+                    )
+                    self.assertEqual(
+                        recovered.implementation_review.finding_key,
+                        "PASS",
+                    )
+
+    def test_l1_report_and_status_expose_review_state_under_privacy_warning(self) -> None:
+        run = self.controller(
+            self.passing_sonnet,
+            approval=lambda prompt: False,
+        ).new_run("009")
+        self.assertEqual(run.stage, "commit_declined")
+
+        with orchestrator.console.capture() as capture:
+            orchestrator._print_run_report(run)
+        report_output = capture.get()
+        self.assertIn("Distinct defects: 0", report_output)
+        self.assertNotIn("unreadable review record(s)", report_output)
+
+        with patch.object(orchestrator, "RUNS", self.runs), orchestrator.console.capture() as capture:
+            orchestrator.status(run.run_id)
+        status_output = capture.get()
+        self.assertIn("review_records", status_output)
+        self.assertIn("specification_review", status_output)
+        self.assertIn("implementation_review", status_output)
+        self.assertIn("unreadable_review_records", status_output)
+        self.assertIn("Implement the example task.", status_output)
+
+    def test_l2_historical_and_migrated_reads_remain_bounded(self) -> None:
+        from test_run_migrations import schema8_bytes
+
+        source = schema8_bytes()
+        run_id = json.loads(source)["run_id"]
+        self.runs.mkdir(mode=0o700, exist_ok=True)
+        path = self.runs / f"{run_id}.json"
+        path.write_bytes(source)
+        path.chmod(0o600)
+
+        with patch.object(orchestrator, "RUNS", self.runs), orchestrator.console.capture() as capture:
+            orchestrator.status(run_id)
+        bounded = capture.get()
+        self.assertIn("MIGRATION_REQUIRED", bounded)
+        self.assertNotIn("Synthetic current review output", bounded)
+
+        with orchestrator.console.capture():
+            with self.assertRaises(typer.Exit):
+                orchestrator.report(run_id)
+
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "migration_required",
+        ):
+            self.controller(self.passing_sonnet).resume(run_id)
+
+        migrated = run_migrations.migrate_classification(
+            run_migrations.classify_run_bytes(source),
+            migration_id="l2-migration",
+            migrated_at="2026-08-02T12:00:00+00:00",
+        ).run
+        path.write_bytes(migrated.model_dump_json().encode() + b"\n")
+        path.chmod(0o600)
+        with patch.object(orchestrator, "RUNS", self.runs), orchestrator.console.capture() as capture:
+            orchestrator.status(run_id)
+        blocked = capture.get()
+        self.assertIn("RESUME_BLOCKED", blocked)
+        self.assertNotIn("Synthetic current review output", blocked)
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "run execution refused",
+        ):
+            self.controller(self.passing_sonnet).resume(run_id)
+
+    def test_l3_commands_and_compatibility_shims_remain(self) -> None:
+        command_names = {
+            command.name or command.callback.__name__.replace("_", "-")
+            for command in orchestrator.app.registered_commands
+        }
+        for expected in (
+            "run",
+            "resume",
+            "recover-writer",
+            "release-target",
+            "approve-policy",
+            "report",
+            "migrate-run",
+            "status",
+        ):
+            self.assertIn(expected, command_names)
+        shim = Path(__file__).parent / "src" / "jobs_orchestrator" / "__init__.py"
+        self.assertTrue(shim.is_file())
+        self.assertIn("metadata.distribution(\"jobs-orchestrator\")", shim.read_text(encoding="utf-8"))
+
+    def test_b1_b4_gate24_boundaries_and_deterministic_scope(self) -> None:
+        source = Path(orchestrator.__file__).read_text(encoding="utf-8")
+        models_source = Path(__file__).parent.joinpath("models.py").read_text(encoding="utf-8")
+        migration_source = Path(run_migrations.__file__).read_text(encoding="utf-8")
+        combined = source + models_source + migration_source
+        for excluded in (
+            "bulk-migrate",
+            "--force",
+            "doctor",
+            "dry-run",
+            "model_catalog",
+            "route_override",
+            "capability_discovery",
+            "eventsourcing",
+            "telemetry",
+            "versioned_json",
+            "resolved_policy",
+            "approval_request",
+            "logical_calls",
+        ):
+            self.assertNotIn(excluded, combined)
+        self.assertIn('os.environ.get("JOBS_REPO"', source)
+        review_models = models_source[
+            models_source.index("class ReviewRecord") : models_source.index(
+                "class RepoState"
+            )
+        ]
+        self.assertNotIn("purpose", review_models)
+        self.assertNotIn("sol_guidance", review_models)
+        self.assertNotIn("terra_resolution", review_models)
 
 
 class ProviderFailureContractTests(unittest.TestCase):

@@ -37,6 +37,7 @@ This controller moves those decisions into inspectable Python. It provides:
 - separate human approval for policy, commit, and push;
 - provider attempt deadlines, process-group cleanup, timing, heartbeats, and audit records;
 - explicit, audited schema migration with fail-closed historical execution; and
+- immutable parsed review history linked to raw physical attempts; and
 - concise per-run reporting.
 
 ## Current status
@@ -49,7 +50,7 @@ tasks/<task-ref>-*.md
 
 For example, task `009` must resolve to exactly one file such as `tasks/009-example.md`. The controller persists the specification and its SHA-256, coordinates the run, and stores local run state under `runs/`.
 
-The controller and its safety behavior are implemented and covered by 135 unit tests. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
+The controller and its safety behavior are implemented and covered by 174 unit tests. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
 
 ## How it works
 
@@ -308,7 +309,7 @@ Using uv's supported `UV_NO_EDITABLE=1` mode avoids that platform failure. The
 compatibility package resolves the local checkout from installed direct-URL
 metadata, so `uv run jobs-orchestrator` remains the same command in that mode.
 
-The 135 tests exercise temporary repositories, committed synthetic historical
+The 174 tests exercise temporary repositories, committed synthetic historical
 run fixtures, recorded sanitized provider fixtures, fake
 providers, and real local child/grandchild processes. They cover preflight
 safety, task resolution, correction budgets, repeat-finding escalation, policy
@@ -320,7 +321,9 @@ target identity, cross-controller mutex contention, durable ownership, clean
 release, stale/corrupt coordination recovery, reporting, Git approval defaults,
 strict schema dispatch, adjacent migrations, audit preservation, rollback and
 concurrency boundaries, stable provider identities, display-name independence,
-and adversarial Git change parsing, fingerprinting, persistence, recovery, and
+immutable parsed review history, unreadable-review visibility, exact-stage
+review recovery, schema-9 backfill with a separate review migration audit, and
+adversarial Git change parsing, fingerprinting, persistence, recovery, and
 staging behavior.
 
 Before committing changes, also check the diff:

@@ -5,7 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-CURRENT_RUN_SCHEMA_VERSION = 8
+CURRENT_RUN_SCHEMA_VERSION = 9
 OLDEST_MIGRATABLE_RUN_SCHEMA_VERSION = 1
 
 
@@ -107,6 +107,37 @@ class ReviewResult(BaseModel):
     summary: str
 
 
+ReviewOperation = Literal["specification_review", "implementation_review"]
+ReviewUnreadableReason = Literal[
+    "invalid_review_envelope",
+    "invalid_review_schema",
+    "invalid_review_semantics",
+    "unreadable_legacy_review",
+]
+
+
+class ReviewRecord(BaseModel):
+    """One immutable parsed review, linked to its exact raw physical attempt."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    recorded_at: str
+    operation_id: ReviewOperation
+    result: ReviewResult
+    provider_record_index: int = Field(ge=0)
+
+
+class UnreadableReviewRecord(BaseModel):
+    """One immutable bounded marker for an unreadable legacy review attempt."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    recorded_at: str
+    operation_id: ReviewOperation
+    provider_record_index: int = Field(ge=0)
+    reason_code: ReviewUnreadableReason
+
+
 class RepoState(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -174,6 +205,7 @@ RunStructuralClass = Literal[
     "V6-owner",
     "V6-current",
     "V7",
+    "V8",
 ]
 
 
@@ -200,12 +232,30 @@ class IdentityMigrationAudit(BaseModel):
 
     migration_id: str = Field(min_length=1, max_length=64)
     migrated_at: str
-    source_schema_version: int = Field(ge=1, lt=CURRENT_RUN_SCHEMA_VERSION)
-    target_schema_version: Literal[8] = CURRENT_RUN_SCHEMA_VERSION
+    source_schema_version: int = Field(ge=1, lt=8)
+    target_schema_version: Literal[8] = 8
     source_structural_class: RunStructuralClass
     source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     applied_steps: tuple[str, ...] = Field(min_length=1, strict=False)
     reason_codes: tuple[str, ...] = Field(default_factory=tuple, strict=False)
+    disposition: RunMigrationDisposition
+
+
+class ReviewMigrationAudit(BaseModel):
+    """Immutable provenance for the explicit parsed-review backfill."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    migration_id: str = Field(min_length=1, max_length=64)
+    migrated_at: str
+    source_schema_version: int = Field(ge=1, lt=9)
+    target_schema_version: Literal[9] = 9
+    source_structural_class: RunStructuralClass
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    applied_steps: tuple[str, ...] = Field(min_length=1, strict=False)
+    reason_codes: tuple[str, ...] = Field(default_factory=tuple, strict=False)
+    parsed_count: int = Field(ge=0)
+    unreadable_count: int = Field(ge=0)
     disposition: RunMigrationDisposition
 
 
@@ -347,7 +397,7 @@ class WorkflowRun(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal[8] = CURRENT_RUN_SCHEMA_VERSION
+    schema_version: Literal[9] = CURRENT_RUN_SCHEMA_VERSION
     run_id: str
     created_at: str
     updated_at: str | None = None
@@ -360,6 +410,10 @@ class WorkflowRun(BaseModel):
     correction_cycles: int = Field(default=0, ge=0, le=12)
     spec_review: ReviewResult | None = None
     implementation_review: ReviewResult | None = None
+    review_records: list[ReviewRecord] = Field(default_factory=list)
+    unreadable_review_records: list[UnreadableReviewRecord] = Field(
+        default_factory=list
+    )
     terra_resolution: str | None = None
     sol_guidance: str | None = None
     policy_decisions: list[PolicyDecision] = Field(default_factory=list)
@@ -369,6 +423,7 @@ class WorkflowRun(BaseModel):
     provider_resume_operation_id: ProviderOperation | None = None
     migration_audit: RunMigrationAudit | None = None
     identity_migration_audit: IdentityMigrationAudit | None = None
+    review_migration_audit: ReviewMigrationAudit | None = None
     target_ownership: TargetOwnership | None = None
     active_writer_attempt: WriterAttemptState | None = None
     writer_recovery_decisions: list[WriterRecoveryDecision] = Field(
@@ -387,6 +442,7 @@ class WorkflowRun(BaseModel):
     def validate_provider_identities(self) -> "WorkflowRun":
         legacy_audit = self.migration_audit
         identity_audit = self.identity_migration_audit
+        review_audit = self.review_migration_audit
         if legacy_audit is not None and identity_audit is None:
             raise ValueError("schema-8 migration audit lacks identity audit")
         if identity_audit is not None:
@@ -416,6 +472,45 @@ class WorkflowRun(BaseModel):
             ):
                 raise ValueError("migration audit disposition is incoherent")
 
+        if review_audit is not None:
+            if not review_audit.applied_steps or (
+                review_audit.applied_steps[-1] != "8_to_9"
+            ):
+                raise ValueError("review migration steps are incoherent")
+            if identity_audit is None:
+                if (
+                    review_audit.source_schema_version < 8
+                    or review_audit.applied_steps != ("8_to_9",)
+                ):
+                    raise ValueError("review migration lineage is incoherent")
+            else:
+                if review_audit.source_schema_version <= 7:
+                    if (
+                        identity_audit.migration_id != review_audit.migration_id
+                        or identity_audit.migrated_at != review_audit.migrated_at
+                        or identity_audit.source_schema_version
+                        != review_audit.source_schema_version
+                        or identity_audit.source_structural_class
+                        != review_audit.source_structural_class
+                        or identity_audit.source_sha256
+                        != review_audit.source_sha256
+                        or identity_audit.applied_steps
+                        != review_audit.applied_steps[:-1]
+                    ):
+                        raise ValueError("review migration lineage is incoherent")
+                if identity_audit.disposition != review_audit.disposition:
+                    raise ValueError(
+                        "review migration audit disposition is incoherent"
+                    )
+            if review_audit.parsed_count != len(self.review_records):
+                raise ValueError("review migration audit parsed count is incoherent")
+            if review_audit.unreadable_count != len(
+                self.unreadable_review_records
+            ):
+                raise ValueError(
+                    "review migration audit unreadable count is incoherent"
+                )
+
         pending = (
             self.provider_resume_stage,
             self.provider_resume_prompt,
@@ -430,6 +525,7 @@ class WorkflowRun(BaseModel):
         migrated = (
             self.migration_audit is not None
             or self.identity_migration_audit is not None
+            or self.review_migration_audit is not None
         )
         for record in self.provider_runs:
             expected_role = OPERATION_ROLES[record.operation_id]
@@ -521,6 +617,53 @@ class WorkflowRun(BaseModel):
                 or record.failure_kind is not None
             ):
                 raise ValueError("policy source record link is incoherent")
+
+        index_owners: dict[int, str] = {}
+        for review in [*self.review_records, *self.unreadable_review_records]:
+            index = review.provider_record_index
+            if index in index_owners:
+                raise ValueError("review provider record index is duplicated")
+            index_owners[index] = review.operation_id
+            if index >= len(self.provider_runs):
+                raise ValueError("review provider record index is out of range")
+            record = self.provider_runs[index]
+            if (
+                record.identity.role_id != "adversarial_review"
+                or record.operation_id != review.operation_id
+                or record.returncode != 0
+                or record.failure_kind is not None
+            ):
+                raise ValueError("review provider record link is incoherent")
+
+        for field, operation_id in (
+            (self.spec_review, "specification_review"),
+            (self.implementation_review, "implementation_review"),
+        ):
+            parsed = [
+                review.result
+                for review in self.review_records
+                if review.operation_id == operation_id
+            ]
+            expected = parsed[-1] if parsed else None
+            if field == expected:
+                continue
+            if not migrated:
+                raise ValueError("review current field contradicts parsed history")
+            reasons = (
+                set(review_audit.reason_codes)
+                if review_audit is not None
+                else set()
+            )
+            if field is None and expected is not None:
+                allowed = {"resume_review_field_absent"}
+            elif field is not None and expected is None:
+                allowed = {"current_review_unreadable"}
+            else:
+                allowed = {"current_review_unreadable", "resume_review_field_absent"}
+            if not (reasons & allowed):
+                raise ValueError(
+                    "review current field contradicts migrated history"
+                )
         return self
 
 

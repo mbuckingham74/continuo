@@ -9,19 +9,24 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from models import (
     ADVERSARIAL_REVIEW_ROUTE,
     CURRENT_RUN_SCHEMA_VERSION,
     ESCALATION_EXECUTIVE_ROUTE,
     GitRecord,
+    IdentityMigrationAudit,
     IMPLEMENTATION_ROUTE,
     OLDEST_MIGRATABLE_RUN_SCHEMA_VERSION,
     POLICY_AUTHORITY_ROUTE,
+    PolicyDecision,
     ProviderCapability,
     ProviderFailureKind,
     ProviderFailureSource,
+    ProviderOperation,
+    ProviderRecord,
+    ProviderRouteIdentity,
     RepoState,
     ReviewCategory,
     ReviewStatus,
@@ -31,6 +36,10 @@ from models import (
     WorkflowRun,
     WriterAttemptState,
     WriterRecoveryDecision,
+)
+from providers import (
+    ProviderExecution,
+    parse_sonnet_review,
 )
 
 
@@ -199,6 +208,23 @@ class _RunV7(_RunV6):
     migration_audit: _RunMigrationAuditV7 | None = None
 
 
+class _RunV8(_RunV7):
+    """The exact historical schema-8 shape before parsed-review backfill."""
+
+    schema_version: Literal[8] = 8
+    provider_runs: list[ProviderRecord] = Field(default_factory=list)
+    policy_decisions: list[PolicyDecision] = Field(default_factory=list)
+    provider_resume_identity: ProviderRouteIdentity | None = None
+    provider_resume_operation_id: ProviderOperation | None = None
+    identity_migration_audit: IdentityMigrationAudit | None = None
+
+    @model_validator(mode="after")
+    def validate_identity_audit_presence(self) -> "_RunV8":
+        if self.migration_audit is not None and self.identity_migration_audit is None:
+            raise ValueError("schema-8 migration audit lacks identity audit")
+        return self
+
+
 _HISTORICAL_MODELS: dict[int, type[BaseModel]] = {
     1: _RunV1,
     2: _RunV2,
@@ -207,6 +233,7 @@ _HISTORICAL_MODELS: dict[int, type[BaseModel]] = {
     5: _RunV5,
     6: _RunV6,
     7: _RunV7,
+    8: _RunV8,
 }
 
 
@@ -526,6 +553,14 @@ def _migration_disposition(
             "inspection_only",
         }:
             return audit["disposition"]
+    if schema_version == 8:
+        audit = payload.get("identity_migration_audit")
+        if isinstance(audit, dict) and audit.get("disposition") in {
+            "resume_eligibility_deferred",
+            "resume_blocked",
+            "inspection_only",
+        }:
+            return audit["disposition"]
     if schema_version < 6:
         return "resume_eligibility_deferred"
     blocked_stages = {
@@ -619,14 +654,18 @@ def classify_run_bytes(source: bytes) -> RecordClassification:
                 reason_code="archive_only",
                 field_path=_bounded_field_path(exc),
             )
-        if run.identity_migration_audit is not None:
+        if run.review_migration_audit is not None:
             state: RecordState = "RESUME_BLOCKED"
+            disposition = run.review_migration_audit.disposition
+            structural_class = run.review_migration_audit.source_structural_class
+        elif run.identity_migration_audit is not None:
+            state = "RESUME_BLOCKED"
             disposition = run.identity_migration_audit.disposition
             structural_class = (
                 run.identity_migration_audit.source_structural_class
             )
         elif run.migration_audit is not None:
-            # Unreachable for schema 8: WorkflowRun validation requires the
+            # Unreachable for schema 9: WorkflowRun validation requires the
             # identity audit whenever a legacy audit is present. Kept as an
             # explicit total branch so a migrated record can never be
             # classified as current.
@@ -706,7 +745,9 @@ def classify_run_bytes(source: bytes) -> RecordClassification:
                 payload=payload,
             )
 
-    identity_reason = _legacy_identity_reason(payload)
+    identity_reason = (
+        None if version >= 8 else _legacy_identity_reason(payload)
+    )
     if identity_reason is not None:
         reason, field_path = identity_reason
         return RecordClassification(
@@ -919,16 +960,128 @@ def _step_7_to_8(
         result["provider_resume_operation_id"] = operation_id
         reasons.append("legacy_provider_resume_identity_mapped")
 
-    result["schema_version"] = CURRENT_RUN_SCHEMA_VERSION
+    result["schema_version"] = 8
     result["identity_migration_audit"] = {
         "migration_id": context.migration_id,
         "migrated_at": context.migrated_at,
         "source_schema_version": context.source_schema_version,
-        "target_schema_version": CURRENT_RUN_SCHEMA_VERSION,
+        "target_schema_version": 8,
         "source_structural_class": context.source_structural_class,
         "source_sha256": context.source_sha256,
         "applied_steps": list(context.applied_steps),
         "reason_codes": sorted(set((*context.reason_codes, *reasons))),
+        "disposition": context.disposition,
+    }
+    return result, reasons
+
+
+_REVIEW_OPERATION_IDS = ("specification_review", "implementation_review")
+
+
+def _review_operation_for(record: dict[str, Any]) -> str | None:
+    identity = record.get("identity")
+    operation = record.get("operation_id")
+    if not isinstance(identity, dict) or identity.get("role_id") != "adversarial_review":
+        return None
+    if operation not in _REVIEW_OPERATION_IDS:
+        return None
+    return operation
+
+
+def _unreadable_review_reason(exc: Exception) -> str:
+    if isinstance(exc, json.JSONDecodeError):
+        return "invalid_review_envelope"
+    if isinstance(exc, ValidationError):
+        return "invalid_review_schema"
+    if isinstance(exc, RuntimeError):
+        return "unreadable_legacy_review"
+    message = str(exc)
+    if any(
+        marker in message
+        for marker in ("envelope", "structured_output", "must be an object")
+    ):
+        return "invalid_review_envelope"
+    return "invalid_review_semantics"
+
+
+def _step_8_to_9(
+    payload: dict[str, Any], context: MigrationContext
+) -> tuple[dict[str, Any], list[str]]:
+    result = copy.deepcopy(payload)
+    reasons: list[str] = []
+    review_records: list[dict[str, Any]] = []
+    unreadable_records: list[dict[str, Any]] = []
+
+    providers = result.get("provider_runs", [])
+    for index, record in enumerate(providers):
+        if not isinstance(record, dict):
+            raise MigrationError("migration_step_failed", "provider_runs")
+        operation = _review_operation_for(record)
+        if operation is None:
+            continue
+        if record.get("returncode") != 0 or record.get("failure_kind") is not None:
+            continue
+        execution = ProviderExecution(
+            command=record.get("command", []),
+            returncode=0,
+            stdout=record.get("stdout", ""),
+            stderr=record.get("stderr", ""),
+        )
+        try:
+            parsed = parse_sonnet_review(execution)
+        except Exception as exc:
+            unreadable_records.append(
+                {
+                    "recorded_at": context.migrated_at,
+                    "operation_id": operation,
+                    "provider_record_index": index,
+                    "reason_code": _unreadable_review_reason(exc),
+                }
+            )
+        else:
+            review_records.append(
+                {
+                    "recorded_at": context.migrated_at,
+                    "operation_id": operation,
+                    "result": parsed.model_dump(mode="json"),
+                    "provider_record_index": index,
+                }
+            )
+
+    for key, operation in (
+        ("spec_review", "specification_review"),
+        ("implementation_review", "implementation_review"),
+    ):
+        preserved = result.get(key)
+        last_parsed = next(
+            (
+                item["result"]
+                for item in reversed(review_records)
+                if item["operation_id"] == operation
+            ),
+            None,
+        )
+        if preserved is None and last_parsed is not None:
+            reasons.append("resume_review_field_absent")
+        elif preserved is not None and (
+            last_parsed is None or preserved != last_parsed
+        ):
+            reasons.append("current_review_unreadable")
+
+    result["schema_version"] = 9
+    result["review_records"] = review_records
+    result["unreadable_review_records"] = unreadable_records
+    result["review_migration_audit"] = {
+        "migration_id": context.migration_id,
+        "migrated_at": context.migrated_at,
+        "source_schema_version": context.source_schema_version,
+        "target_schema_version": 9,
+        "source_structural_class": context.source_structural_class,
+        "source_sha256": context.source_sha256,
+        "applied_steps": list(context.applied_steps),
+        "reason_codes": sorted(set((*context.reason_codes, *reasons))),
+        "parsed_count": len(review_records),
+        "unreadable_count": len(unreadable_records),
         "disposition": context.disposition,
     }
     return result, reasons
@@ -946,6 +1099,7 @@ MIGRATION_REGISTRY: dict[tuple[int, int], MigrationStep] = {
     (5, 6): _step_5_to_6,
     (6, 7): _step_6_to_7,
     (7, 8): _step_7_to_8,
+    (8, 9): _step_8_to_9,
 }
 
 
@@ -1034,7 +1188,7 @@ def migrate_classification(
         )
         payload, reasons = step(payload, context)
         version += 1
-        if version <= 7:
+        if version <= 8:
             _validate_historical(payload, version)
         reason_codes.extend(reasons)
         applied_steps.append(next_step)
@@ -1049,17 +1203,33 @@ def migrate_classification(
             _bounded_field_path(exc),
         ) from exc
     identity_audit = run.identity_migration_audit
+    if source_version < 8:
+        if (
+            identity_audit is None
+            or identity_audit.source_schema_version != source_version
+            or identity_audit.target_schema_version != 8
+            or identity_audit.source_structural_class
+            != classification.structural_class
+            or identity_audit.source_sha256 != classification.source_sha256
+            or identity_audit.applied_steps != tuple(applied_steps[:-1])
+            or identity_audit.disposition != classification.disposition
+        ):
+            raise MigrationError("identity_migration_audit_invalid")
+
+    review_audit = run.review_migration_audit
     if (
-        identity_audit is None
-        or identity_audit.source_schema_version != source_version
-        or identity_audit.target_schema_version != CURRENT_RUN_SCHEMA_VERSION
-        or identity_audit.source_structural_class
+        review_audit is None
+        or review_audit.source_schema_version != source_version
+        or review_audit.target_schema_version != 9
+        or review_audit.source_structural_class
         != classification.structural_class
-        or identity_audit.source_sha256 != classification.source_sha256
-        or identity_audit.applied_steps != tuple(applied_steps)
-        or identity_audit.disposition != classification.disposition
+        or review_audit.source_sha256 != classification.source_sha256
+        or review_audit.applied_steps != tuple(applied_steps)
+        or review_audit.disposition != classification.disposition
+        or review_audit.parsed_count != len(run.review_records)
+        or review_audit.unreadable_count != len(run.unreadable_review_records)
     ):
-        raise MigrationError("identity_migration_audit_invalid")
+        raise MigrationError("review_migration_audit_invalid")
 
     if source_version <= 6:
         audit = run.migration_audit
@@ -1069,11 +1239,11 @@ def migrate_classification(
             or audit.target_schema_version != 7
             or audit.source_structural_class != classification.structural_class
             or audit.source_sha256 != classification.source_sha256
-            or audit.applied_steps != tuple(applied_steps[:-1])
+            or audit.applied_steps != tuple(applied_steps[:-2])
             or audit.disposition != classification.disposition
         ):
             raise MigrationError("migration_audit_invalid")
-    else:
+    elif source_version == 7:
         original_audit = classification.payload.get("migration_audit")
         migrated_audit = (
             run.migration_audit.model_dump(mode="json")
@@ -1082,6 +1252,20 @@ def migrate_classification(
         )
         if migrated_audit != original_audit:
             raise MigrationError("migration_audit_invalid")
+    elif source_version == 8:
+        for key in ("migration_audit", "identity_migration_audit"):
+            original = classification.payload.get(key)
+            migrated_value = (
+                getattr(run, key).model_dump(mode="json")
+                if getattr(run, key) is not None
+                else None
+            )
+            if migrated_value != original:
+                raise MigrationError(
+                    "identity_migration_audit_invalid"
+                    if key == "identity_migration_audit"
+                    else "migration_audit_invalid"
+                )
     return MigrationResult(
         run=run,
         source_sha256=classification.source_sha256,
