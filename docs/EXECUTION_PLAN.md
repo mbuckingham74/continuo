@@ -191,8 +191,9 @@ them. Design may begin during Gate 2, but implementation waits for Gate 2 exit.
   fingerprints, changes, diffs, allowed paths, branch/remote rules, commit-message
   policy, and approval-gated publication.
   - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.4-repository-project-adapter.md`](contracts/gate-3/gate-3.4-repository-project-adapter.md).
-- [ ] Define the provider adapter and route-profile contracts using the
+- [~] Define the provider adapter and route-profile contracts using the
   provider-attempt lifecycle established in M0.2–M0.4.
+  - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.5-provider-adapter-route-profile.md`](contracts/gate-3/gate-3.5-provider-adapter-route-profile.md).
 - [ ] Define machine-checkable capability profiles and permission ceilings for
   every orchestration role.
 - [ ] Define deterministic verification result/finding contracts and their
