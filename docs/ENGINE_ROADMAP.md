@@ -285,7 +285,8 @@ Hash chaining detects modification only when hashes are anchored or signed outsi
 |---|---|---:|---|
 | `--json` CLI contracts | Accept | P1 | Stable machine output for `status`, `report`, and non-interactive transition results. Version the schema. |
 | Rich live view | Accept | P2 | Extend existing start/finish/heartbeat output after event/state contracts stabilize. |
-| Textual TUI | Defer | P3 | Build only if terminal workflow remains primary after async gates. |
+| Rust configuration TUI | Accept | P1 | Deliver a local setup workbench before the first project pilot. It must use the controller-owned versioned configuration commands and must not write trusted configuration, credentials, or run state directly. |
+| Full operational TUI | Defer | P3 | Reassess run monitoring and asynchronous approvals after command/event boundaries stabilize. |
 | Local web UI | Defer | P3 | Justified mainly by remote/phone approvals; requires authentication, CSRF protection, binding policy, and a safe writer API. |
 
 ### E-3 — Asynchronous approval gates
@@ -358,7 +359,7 @@ Recommended order:
 1. stable role/provider/route IDs and schema migration;
 2. versioned resolved policy/config persisted per run;
 3. provider adapter interface and normalized result/error types;
-4. provider/model catalogs and explicit role-route selection;
+4. provider/model/effort catalogs, stable provider-account profiles, and explicit role-route/account selection;
 5. provider capability profiles with startup enforcement;
 6. repository/project and task-spec adapters;
 7. compatibility renames and deprecated aliases.
@@ -391,7 +392,11 @@ Keep these concepts separate:
 - **route profile:** provider, model, sandbox/tool policy, effort, timeout, and structured-output settings for one role; and
 - **display name:** human-readable text with no control-flow meaning.
 
-Selection should be available through versioned configuration and a CLI command. An interactive picker can make configuration easier, but it must write/validate the same configuration contract used by non-interactive automation. A future UI may consume that contract rather than introduce another routing mechanism.
+Selection should be available through versioned configuration and controller-owned
+CLI commands. A Rust TUI must consume those same versioned command contracts and
+must not introduce another routing, configuration-writing, credential, or policy
+mechanism. The initial TUI is a local configuration workbench; operational run
+monitoring and remote approvals remain later work.
 
 Required behavior:
 
@@ -404,23 +409,44 @@ Required behavior:
 7. Make `doctor` detect missing adapters, unavailable models, expired authentication, and incomplete role assignments before provider work begins.
 8. Preserve deprecated provider/model aliases only in the configuration-migration layer, never in workflow policy.
 
+Before implementing the picker, amend the route and resolved-configuration
+contracts to make effort and provider-account identity explicit. Effort is a
+provider/model-specific, closed route-profile field and is persisted in the
+route hash; unsupported routes expose no synthetic effort value. A resolved
+role binding identifies a stable non-secret provider-account profile in addition
+to its complete registered route so resume cannot silently change account,
+organization, endpoint, or quota scope.
+
+Provider-account management is part of the pre-pilot setup surface. Account
+metadata and secret material remain separate. API keys are accepted only through
+a non-echoing controller command channel and stored in an OS credential store,
+initially macOS Keychain; there is no plaintext fallback. CLI-managed login may
+be referenced and inspected without copying its credential. Configuration,
+resolved run state, route catalogs, logs, prompts, process arguments, and machine
+output contain only stable account/profile references and bounded redacted
+status. Offline inspection remains the default; an authentication/connectivity
+probe is a separate explicit network action and must disclose whether it can
+incur provider work or cost.
+
 Provider/model selection does not authorize automatic fallback. If a selected model disappears during a run, the run blocks with a configuration/provider-availability reason. A human may update future defaults or approve an audited route migration; the controller must not silently substitute another model.
 
 Initial configuration shape, for design discussion only:
 
 ```toml
 [routes.implementation]
-provider = "codex_cli"
-model = "provider-model-id"
-profile = "workspace_writer"
+route_id = "builtin.implementation.high.v1"
+provider_account_id = "provider-account:codex:primary"
 
 [routes.adversarial_review]
-provider = "claude_cli"
-model = "provider-model-id"
-profile = "read_only_structured_reviewer"
+route_id = "builtin.adversarial-review.standard.v1"
+provider_account_id = "provider-account:claude:primary"
 ```
 
-The route profile should own capability and invocation policy. The workflow should refer only to the abstract role and resolved route ID.
+The complete registered route profile owns provider adapter, model, supported
+effort, capability, and invocation policy. The non-secret account profile owns
+the provider account/endpoint identity while credential material remains in the
+adapter-managed credential store. The workflow refers only to the abstract role
+and its resolved route/account binding.
 
 ## 8. Recommended milestone roadmap
 
@@ -464,22 +490,26 @@ Exit criteria:
 
 1. Define and validate a versioned configuration file.
 2. Add provider adapters and normalized invocation results.
-3. Add provider/model catalogs and the configuration-backed CLI picker (E-11).
-4. Add machine-checkable capability profiles and least-authority validation.
-5. Persist the resolved role-routing table and configuration hash with each run.
-6. Extract the current Git behavior behind a repository/project adapter.
-7. Extract local Markdown behind a task-spec adapter and normalized task envelope.
-8. Add acceptance-criteria representation.
-9. Consolidate the package under `src/orchestration_engine/`.
-10. Introduce `orchestration-engine` and `ORCHESTRATION_TARGET_REPO` with compatibility aliases.
+3. Add provider/model/effort catalogs and the configuration-backed CLI picker (E-11).
+4. Add stable provider-account profiles and controller-owned credential-store integration without persisting secrets.
+5. Add machine-checkable capability profiles and least-authority validation.
+6. Persist the resolved role-routing and provider-account bindings plus the configuration hash with each run.
+7. Extract the current Git behavior behind a repository/project adapter.
+8. Extract local Markdown behind a task-spec adapter and normalized task envelope.
+9. Add acceptance-criteria representation.
+10. Consolidate the package under `src/orchestration_engine/`.
+11. Introduce `orchestration-engine` and `ORCHESTRATION_TARGET_REPO` with compatibility aliases.
+12. Deliver the Rust configuration TUI over the versioned controller command boundary and prove CLI/TUI configuration equivalence before a project pilot.
 
 Exit criteria:
 
 - changing a model or provider route requires configuration, not controller-policy edits;
 - every required role has an explicit, capability-valid route selected before a run starts;
+- every selected role is bound to an available non-secret provider-account identity and an adapter-supported effort value or explicit unsupported state;
 - run resume uses the exact persisted routing table rather than newly changed defaults;
 - a non-Jobs project can supply a task and repository policy through adapters;
 - config is validated, hashed, persisted, and protected from writer modification; and
+- the Rust TUI and non-interactive CLI resolve identical canonical configuration and neither exposes or directly persists credential material; and
 - role capability violations fail at startup.
 
 ### Milestone 3 — Deterministic quality and isolated writers
@@ -520,8 +550,8 @@ Exit criteria:
 1. Capture normalized usage/cost telemetry per provider adapter.
 2. Add cost ceilings and role-based cross-run reports.
 3. Improve the Rich live view.
-4. Reassess TUI versus authenticated local web UI using actual operator needs.
-5. Build a UI only on versioned read/command APIs.
+4. Reassess a full operational TUI versus authenticated local web UI using actual operator needs and experience from the configuration TUI.
+5. Build operational UI features only on versioned read/command APIs.
 
 ### Milestone 6 — Advanced leverage
 

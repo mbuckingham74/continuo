@@ -224,11 +224,20 @@ This prerequisite status does not itself begin Gate 4 implementation.
 **Goal:** preserve behavior while moving project and provider assumptions behind
 the approved contracts.
 
-- [ ] Add validated, versioned configuration and persist its resolved form and
-  hash at run creation.
+- [ ] Approve additive amendments to the Gate 3.1, 3.5, and 3.6 contracts before
+  implementing routing: make provider/model-specific effort a closed,
+  capability-validated route-profile field; add stable non-secret
+  provider-account identity to resolved role bindings; and define rotation,
+  deletion, resume, migration, redaction, and failure behavior without storing
+  credential material in configuration or run state.
+- [ ] Add validated, versioned configuration and persist its resolved form,
+  provider-account bindings, complete selected routes, and hash at run creation.
 - [ ] Extract current provider commands into provider adapters without changing
   no-fallback policy or permission ceilings.
-- [ ] Add provider/model catalogs and configuration-backed route selection.
+- [ ] Add provider/model/effort catalogs and configuration-backed route
+  selection. Every selectable combination must resolve to one complete
+  registered route; neither CLI nor UI may splice arbitrary models, effort
+  values, builders, tools, or permissions into a route.
 - [ ] Enforce capability compatibility before provider work begins.
 - [ ] Extract the existing Git behavior as the first repository adapter.
 - [ ] Extract `tasks/<ref>-*.md` as `LocalMarkdownTaskSpecAdapter`, preserving the
@@ -243,15 +252,101 @@ the approved contracts.
 - [ ] Update documentation from “Jobs-specific implementation” to an accurate
   description of the generic core and compatibility profile.
 
-**Exit criteria:** provider/model selection is configuration-only, a run resumes
-with its persisted routes and configuration, existing Jobs-compatible commands
-still work, and project-specific behavior no longer appears in workflow-control
-branches.
+**Exit criteria:** provider/model/effort and stable provider-account selection are
+configuration-only; a run resumes with its persisted routes, account bindings,
+and configuration; credential rotation cannot silently change account identity;
+existing Jobs-compatible commands still work; and project-specific behavior no
+longer appears in workflow-control branches.
+
+## Gate 4.5 — Build the operator setup surface
+
+**Goal:** make the generic engine safely configurable by a local operator before
+using a real project, without introducing a second configuration authority or a
+general operational UI.
+
+This gate delivers a Rust terminal user interface as a focused configuration
+workbench. The Python controller remains the sole writer and validator of
+trusted configuration, provider-account metadata, credential references, and
+resolved policy. The TUI consumes versioned controller commands and machine
+responses; it never edits YAML, run records, the credential store, catalogs, or
+project files directly. A daemon, browser UI, remote access, asynchronous
+approval, run dashboard, and direct provider fallback remain out of scope.
+
+- [ ] Define and approve the versioned configuration command contract used by
+  both automation and the Rust TUI. Cover list, inspect, validate, plan, install,
+  replace, and disable operations for user defaults, exact-checkout project
+  profiles, role routes, and provider accounts; mutations require explicit
+  controller-owned confirmation and return canonical hashes and bounded reason
+  codes.
+- [ ] Implement one controller-owned configuration service and CLI command set as
+  the only mutation boundary. Prove atomic private writes, exact target binding,
+  compare-before-replace behavior, interruption recovery, concurrent-writer
+  exclusion, source-change invalidation, and byte-for-byte canonical resolution
+  independent of whether input came from flags, structured stdin, or the TUI.
+- [ ] Add provider-account profiles with stable opaque IDs, adapter ID,
+  authentication method, and bounded non-secret account/endpoint metadata.
+  Resolved runs persist the account-profile identity but never an API key,
+  token, cookie, credential-store locator, environment value, or secret hash.
+- [ ] Add controller-owned secret-store integration, initially macOS Keychain,
+  for adapter-declared API-key authentication. Secret entry and rotation use a
+  non-echoing pipe/stdin channel, never command arguments or environment
+  variables; plaintext files and silent fallback are prohibited. CLI-managed
+  authentication remains adapter-owned and is referenced without copying its
+  credential into Continuo.
+- [ ] Implement provider-account lifecycle operations: add, inspect status,
+  rename display metadata, rotate credentials, disable, and remove when no
+  safety or retention rule forbids it. Define deterministic behavior for missing
+  keychain entries, unavailable keychain service, duplicate identities, deleted
+  accounts referenced by saved runs, partial rotation, and provider-account
+  changes between run creation and resume.
+- [ ] Keep `doctor` and ordinary setup validation local, non-mutating, and
+  network-free. Add a separately explicit provider connectivity/authentication
+  test with clear network and possible-cost disclosure; persist only bounded
+  redacted outcome metadata and never treat the test as run authorization.
+- [ ] Create the Rust TUI as a thin client over the versioned command contract.
+  Its setup flow must cover provider accounts, available adapters and approved
+  models, model-supported effort values, role-to-route assignment, global user
+  defaults, exact-checkout project defaults/permitted routes, explicit run
+  overrides, and a final resolved-configuration review before installation.
+- [ ] In every role view, show the role, provider account, model, effort or
+  explicit `not_supported`, effective read/write capability, configuration
+  precedence source, validation status, and complete route ID. Filter invalid
+  choices early and still require controller validation; no display label is a
+  control identity and no UI choice can widen a permission ceiling.
+- [ ] Add a non-interactive equivalent for every TUI mutation and golden
+  cross-language contract fixtures. Given identical selections, CLI and TUI must
+  produce the same canonical configuration, route/account bindings, hashes,
+  validation failures, and redacted machine output.
+- [ ] Add adversarial Rust/Python boundary tests for unsupported protocol
+  versions, malformed or oversized messages, terminal escape/control text,
+  interrupted subprocesses, stale reads, concurrent updates, malicious display
+  metadata, secret-looking values, keychain failure, and attempts to inject
+  paths, commands, models, effort values, permissions, or raw configuration.
+- [ ] Add a single setup-readiness result combining trusted project binding,
+  complete role assignment, route/capability validation, provider-account
+  availability, local adapter readiness, private storage, and credential
+  presence. It must distinguish offline readiness from an explicitly performed
+  live connectivity test.
+- [ ] Document installation, first-run setup, keyboard-only operation, secret
+  handling, account rotation/removal, configuration precedence, redacted export,
+  recovery from failed setup, and the boundary between this workbench and later
+  operational interfaces.
+
+**Exit criteria:** a fresh local operator can use the Rust TUI to configure all
+required roles, providers/accounts, approved models, and supported effort values
+for an exact disposable checkout; the controller produces the same canonical
+result through non-interactive commands; secrets never appear in configuration,
+arguments, environment, machine output, logs, fixtures, or run state; invalid or
+over-capable routes fail before external work; offline setup readiness passes;
+and no live provider, target mutation, or Git action occurs. Gate 5 cannot begin
+until this gate is completed and reviewed.
 
 ## Gate 5 — Pilot with Jobs
 
 **Goal:** prove compatibility without making Jobs the engine's owner.
 
+- [ ] Confirm Gate 4.5 setup readiness using the Rust TUI and independently
+  compare its canonical configuration/hash with the non-interactive CLI result.
 - [ ] Obtain explicit approval to inspect or modify the Jobs checkout and confirm
   that its in-flight work is in a safe state.
 - [ ] Define the Jobs project profile using the generic contracts; avoid custom
