@@ -15,6 +15,8 @@ under `gate-<number>/` and must be linked from the corresponding tracker item.
   - [`gate-2.7-q7-q8-metric-semantics.md`](gate-2/gate-2.7-q7-q8-metric-semantics.md) is the published provider-metric semantics contract.
   - [`gate-2.8-machine-cli-doctor-dry-run.md`](gate-2/gate-2.8-machine-cli-doctor-dry-run.md) is the published versioned machine-CLI, diagnostic, and read-only planning contract.
   - [`gate-2.9-event-state-architecture-adr.md`](gate-2/gate-2.9-event-state-architecture-adr.md) is the accepted event/state architecture decision record.
+- [`gate-3/`](gate-3/) contains proposed Generic Engine Core contracts.
+  - [`gate-3.1-versioned-resolved-configuration.md`](gate-3/gate-3.1-versioned-resolved-configuration.md) defines the proposed versioned configuration-resolution contract.
 
 Do not put a new full contract, matrix, or implementation transcript back in
 the execution tracker. Keep the tracker to status, a concise result, and a
