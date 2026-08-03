@@ -461,6 +461,51 @@ class MigrationContractTests(unittest.TestCase):
         classified = run_migrations.classify_run_bytes(encoded(identity))
         self.assertEqual((classified.treatment, classified.reason_code), ("archive", "ownership_evidence_incoherent"))
 
+    def test_v8g_writer_and_ownership_incoherence_archives_before_migration(self) -> None:
+        base = schema8_object()
+        classification = run_migrations.classify_run_bytes(encoded(base))
+        self.assertEqual(classification.structural_class, "V8")
+        self.assertEqual(classification.treatment, "migrate")
+
+        invalids = []
+        missing = copy.deepcopy(base)
+        missing["active_writer_attempt"] = None
+        invalids.append(("active_writer_attempt", missing))
+        out_of_range = copy.deepcopy(base)
+        out_of_range["active_writer_attempt"]["provider_record_index"] = 99
+        invalids.append(("provider_record_index", out_of_range))
+        wrong_operation = copy.deepcopy(base)
+        wrong_operation["provider_runs"][1]["operation_id"] = "correction_write"
+        invalids.append(("provider_record_index", wrong_operation))
+        wrong_role = copy.deepcopy(base)
+        wrong_role["provider_runs"][1]["identity"]["role_id"] = "adversarial_review"
+        invalids.append(("provider_record_index", wrong_role))
+        wrong_route = copy.deepcopy(base)
+        wrong_route["provider_runs"][1]["identity"]["route_id"] = "builtin.other.v1"
+        invalids.append(("provider_record_index", wrong_route))
+        wrong_capability = copy.deepcopy(base)
+        wrong_capability["provider_runs"][1]["capability"] = "read_only"
+        invalids.append(("provider_record_index", wrong_capability))
+        fingerprint = copy.deepcopy(base)
+        fingerprint["provider_runs"][1]["repository_fingerprint_after"] = "f" * 64
+        invalids.append(("repository_fingerprint_after", fingerprint))
+
+        for field, payload in invalids:
+            classified = run_migrations.classify_run_bytes(encoded(payload))
+            with self.subTest(field=field):
+                self.assertEqual(classified.treatment, "archive")
+                self.assertEqual(classified.record_state, "ARCHIVE_ONLY")
+                self.assertEqual(classified.reason_code, "writer_evidence_incoherent")
+                self.assertEqual(classified.field_path, field)
+
+        owner_mismatch = copy.deepcopy(base)
+        owner_mismatch["target_ownership"]["canonical_repo"] = "/fixture/other"
+        classified = run_migrations.classify_run_bytes(encoded(owner_mismatch))
+        self.assertEqual(
+            (classified.treatment, classified.reason_code),
+            ("archive", "ownership_evidence_incoherent"),
+        )
+
     def test_identity_m2_all_six_legacy_pairs_map_exactly(self) -> None:
         payload = schema7_object()
         payload["stage"] = "created"

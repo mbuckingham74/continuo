@@ -447,6 +447,56 @@ def _v6_coherence_reason(run: _RunV6) -> tuple[str, str | None] | None:
     return None
 
 
+def _v8_coherence_reason(run: _RunV8) -> tuple[str, str | None] | None:
+    """Same ownership/writer coherence contract as _v6_coherence_reason,
+    adapted to the stable-identity ProviderRecord shape schema 8 carries."""
+
+    ownership = run.target_ownership
+    if ownership is not None:
+        if ownership.canonical_repo != run.repo.repo:
+            return "ownership_evidence_incoherent", "target_ownership.canonical_repo"
+    writer_stages = {
+        "implementing",
+        "correcting",
+        "blocked_writer_retry_required",
+        "blocked_writer_partial_changes",
+        "blocked_writer_state_unknown",
+    }
+    active = run.active_writer_attempt
+    if run.stage in writer_stages and active is None:
+        return "writer_evidence_incoherent", "active_writer_attempt"
+    if active is None:
+        return None
+    if run.stage in {"implementing", "correcting"} and active.stage != run.stage:
+        return "writer_evidence_incoherent", "active_writer_attempt.stage"
+    index = active.provider_record_index
+    if index is None:
+        if active.post_fingerprint is not None:
+            return "writer_evidence_incoherent", "provider_record_index"
+        return None
+    if index >= len(run.provider_runs):
+        return "writer_evidence_incoherent", "provider_record_index"
+    record = run.provider_runs[index]
+    expected_operation: ProviderOperation = (
+        "correction_write" if active.purpose == "correction" else "implementation_write"
+    )
+    if (
+        record.identity.role_id != "implementation"
+        or record.identity.route_id != IMPLEMENTATION_ROUTE.route_id
+        or record.operation_id != expected_operation
+        or record.capability != "workspace_write"
+    ):
+        return "writer_evidence_incoherent", "provider_record_index"
+    if record.repository_fingerprint_before != active.pre_fingerprint:
+        return "writer_evidence_incoherent", "repository_fingerprint_before"
+    if (
+        active.post_fingerprint is not None
+        and record.repository_fingerprint_after != active.post_fingerprint
+    ):
+        return "writer_evidence_incoherent", "repository_fingerprint_after"
+    return None
+
+
 _LEGACY_PROVIDER_IDENTITIES = {
     ("Luna High", "implementation"): (
         IMPLEMENTATION_ROUTE,
@@ -726,8 +776,12 @@ def classify_run_bytes(source: bytes) -> RecordClassification:
     structural_class: RunStructuralClass = (
         _v6_structural_class(payload) if version == 6 else f"V{version}"  # type: ignore[assignment]
     )
-    if version in {6, 7}:
-        coherence = _v6_coherence_reason(historical)  # type: ignore[arg-type]
+    if version in {6, 7, 8}:
+        coherence = (
+            _v6_coherence_reason(historical)  # type: ignore[arg-type]
+            if version in {6, 7}
+            else _v8_coherence_reason(historical)  # type: ignore[arg-type]
+        )
         if coherence is not None:
             reason, field_path = coherence
             return RecordClassification(
