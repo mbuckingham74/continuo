@@ -197,8 +197,9 @@ them. Design may begin during Gate 2, but implementation waits for Gate 2 exit.
 - [~] Define machine-checkable capability profiles and permission ceilings for
   every orchestration role.
   - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.6-capability-profiles-permission-ceilings.md`](contracts/gate-3/gate-3.6-capability-profiles-permission-ceilings.md).
-- [ ] Define deterministic verification result/finding contracts and their
+- [~] Define deterministic verification result/finding contracts and their
   correction-budget semantics.
+  - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.7-deterministic-verification-findings.md`](contracts/gate-3/gate-3.7-deterministic-verification-findings.md).
 - [ ] Write the compatibility matrix for old and new CLI, environment, package,
   import, configuration, and persisted-state identifiers.
 

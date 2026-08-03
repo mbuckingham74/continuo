@@ -22,6 +22,7 @@ under `gate-<number>/` and must be linked from the corresponding tracker item.
   - [`gate-3.4-repository-project-adapter.md`](gate-3/gate-3.4-repository-project-adapter.md) defines the proposed repository/project adapter boundary.
   - [`gate-3.5-provider-adapter-route-profile.md`](gate-3/gate-3.5-provider-adapter-route-profile.md) defines the proposed provider-adapter and route-profile boundary.
   - [`gate-3.6-capability-profiles-permission-ceilings.md`](gate-3/gate-3.6-capability-profiles-permission-ceilings.md) defines the proposed machine-checkable capability-profile and role permission-ceiling boundary.
+  - [`gate-3.7-deterministic-verification-findings.md`](gate-3/gate-3.7-deterministic-verification-findings.md) defines the proposed deterministic verification-result, finding, and correction-budget boundary.
 
 Do not put a new full contract, matrix, or implementation transcript back in
 the execution tracker. Keep the tracker to status, a concise result, and a
