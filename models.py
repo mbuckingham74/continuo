@@ -1,5 +1,7 @@
 """Persistent data models used by the orchestration controller."""
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -67,24 +69,30 @@ POLICY_AUTHORITY_ROUTE = ProviderRouteIdentity(
     display_name="Terra High",
 )
 
-ROUTE_IDENTITIES: dict[OrchestrationRole, ProviderRouteIdentity] = {
-    route.role_id: route
-    for route in (
-        IMPLEMENTATION_ROUTE,
-        ADVERSARIAL_REVIEW_ROUTE,
-        ESCALATION_EXECUTIVE_ROUTE,
-        POLICY_AUTHORITY_ROUTE,
+ROUTE_IDENTITIES: Mapping[OrchestrationRole, ProviderRouteIdentity] = (
+    MappingProxyType(
+        {
+            route.role_id: route
+            for route in (
+                IMPLEMENTATION_ROUTE,
+                ADVERSARIAL_REVIEW_ROUTE,
+                ESCALATION_EXECUTIVE_ROUTE,
+                POLICY_AUTHORITY_ROUTE,
+            )
+        }
     )
-}
+)
 
-OPERATION_ROLES: dict[ProviderOperation, OrchestrationRole] = {
-    "implementation_write": "implementation",
-    "correction_write": "implementation",
-    "specification_review": "adversarial_review",
-    "implementation_review": "adversarial_review",
-    "escalation_guidance": "escalation_executive",
-    "policy_clarification": "policy_authority",
-}
+OPERATION_ROLES: Mapping[ProviderOperation, OrchestrationRole] = MappingProxyType(
+    {
+        "implementation_write": "implementation",
+        "correction_write": "implementation",
+        "specification_review": "adversarial_review",
+        "implementation_review": "adversarial_review",
+        "escalation_guidance": "escalation_executive",
+        "policy_clarification": "policy_authority",
+    }
+)
 
 
 ReviewStatus = Literal["PASS", "FAIL"]
@@ -99,7 +107,7 @@ ReviewCategory = Literal[
 class ReviewResult(BaseModel):
     """The small, deliberately closed result vocabulary used by Sonnet."""
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     status: ReviewStatus
     category: ReviewCategory

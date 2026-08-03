@@ -50,7 +50,7 @@ tasks/<task-ref>-*.md
 
 For example, task `009` must resolve to exactly one file such as `tasks/009-example.md`. The controller persists the specification and its SHA-256, coordinates the run, and stores local run state under `runs/`.
 
-The controller and its safety behavior are implemented and covered by 174 unit tests. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
+The controller and its safety behavior are implemented and covered by a deterministic unit-test suite. The largest remaining gap is project-specific verification: current deterministic verification checks repository identity, changed files, and `git diff --check`, but it does not yet run a target project's tests, linter, type checker, or build.
 
 ## How it works
 
@@ -210,7 +210,7 @@ The target repository must contain exactly one matching task specification, be c
 | `recover-writer <run-id>` | Explicitly retry an exactly restored writer state or adopt trustworthy current changes, with an audited note |
 | `release-target <run-id>` | Deliberately release a clean blocked or declined target, with an audited operator note |
 | `approve-policy <run-id>` | Record an explicit human policy decision and resume |
-| `migrate-run <run-id>` | Classify and, after default-no confirmation, atomically migrate one recognized historical record to schema 7 |
+| `migrate-run <run-id>` | Classify and, after default-no confirmation, atomically migrate one recognized historical record to the current schema |
 | `report <run-id>` | Show provider timing, failures, retries, corrections, decisions, review, and Git status |
 | `status` | List the ten most recently updated local records with schema and record state |
 | `status <run-id>` | Print complete JSON for a valid ordinary current run; otherwise print a bounded classification |
@@ -309,7 +309,7 @@ Using uv's supported `UV_NO_EDITABLE=1` mode avoids that platform failure. The
 compatibility package resolves the local checkout from installed direct-URL
 metadata, so `uv run jobs-orchestrator` remains the same command in that mode.
 
-The 174 tests exercise temporary repositories, committed synthetic historical
+The test suite exercises temporary repositories, committed synthetic historical
 run fixtures, recorded sanitized provider fixtures, fake
 providers, and real local child/grandchild processes. They cover preflight
 safety, task resolution, correction budgets, repeat-finding escalation, policy

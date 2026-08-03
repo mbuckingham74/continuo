@@ -3226,6 +3226,26 @@ class StableProviderIdentityTests(unittest.TestCase):
         self.assertNotIn("provider", dumped["provider_runs"][0])
         self.assertNotIn("purpose", dumped["provider_runs"][0])
 
+    def test_catalog_and_operation_authority_are_runtime_immutable(self) -> None:
+        with self.assertRaises(TypeError):
+            orchestrator.ROUTE_IDENTITIES["implementation"] = (
+                ADVERSARIAL_REVIEW_ROUTE
+            )
+        with self.assertRaises(TypeError):
+            del orchestrator.ROUTE_IDENTITIES["implementation"]
+        with self.assertRaises(TypeError):
+            orchestrator.OPERATION_ROLES["implementation_write"] = (
+                "adversarial_review"
+            )
+        self.assertIs(
+            orchestrator.ROUTE_IDENTITIES["implementation"],
+            IMPLEMENTATION_ROUTE,
+        )
+        self.assertEqual(
+            orchestrator.OPERATION_ROLES["implementation_write"],
+            "implementation",
+        )
+
     def test_display_is_presentation_only_but_control_identity_is_closed(self) -> None:
         renamed_review = ADVERSARIAL_REVIEW_ROUTE.model_copy(
             update={"display_name": "Luna High"}
@@ -4056,6 +4076,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
         self.assertEqual(orchestrator.CURRENT_RUN_SCHEMA_VERSION, 9)
         self.assertEqual(self.run_fixture().schema_version, 9)
         for model in (
+            orchestrator.ReviewResult,
             orchestrator.ReviewRecord,
             orchestrator.UnreadableReviewRecord,
             ReviewMigrationAudit,
@@ -4083,6 +4104,21 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
             .count("parse_sonnet_review("),
             1,
         )
+
+    def test_review_record_result_is_deeply_immutable(self) -> None:
+        result = self.review_result(
+            "IMPLEMENTATION_DEFECT",
+            "immutable parsed result",
+        )
+        record = self.review_record(0, result)
+
+        with self.assertRaises(ValueError):
+            record.result.summary = "retroactively changed"
+        with self.assertRaises(ValueError):
+            result.finding_key = "changed-finding"
+
+        self.assertEqual(record.result.summary, "immutable parsed result")
+        self.assertEqual(record.result.finding_key, "fixture-finding")
 
     def test_i2_raw_stdout_is_audit_only_and_never_a_control_oracle(self) -> None:
         result = self.review_result("IMPLEMENTATION_DEFECT", "fixture defect")
