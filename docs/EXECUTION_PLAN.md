@@ -161,11 +161,12 @@ renaming control identities.
   - Detailed contract, implementation evidence, and matrix: [`gate-2/gate-2.6-q3-approval-records.md`](contracts/gate-2/gate-2.6-q3-approval-records.md).
 - [x] Correct logical-call/physical-attempt and verification metric semantics.
   - Published contract, implementation evidence, and matrix: [`gate-2/gate-2.7-q7-q8-metric-semantics.md`](contracts/gate-2/gate-2.7-q7-q8-metric-semantics.md).
-- [~] Add versioned machine-readable CLI output, `doctor`, and a genuinely
+- [x] Add versioned machine-readable CLI output, `doctor`, and a genuinely
   read-only dry-run contract.
   - Contract, adversarial matrix, and implementation evidence: [`gate-2/gate-2.8-machine-cli-doctor-dry-run.md`](contracts/gate-2/gate-2.8-machine-cli-doctor-dry-run.md).
-- [ ] Write the event/state architecture ADR without implicitly beginning an
+- [~] Write the event/state architecture ADR without implicitly beginning an
   event-sourced rewrite.
+  - Accepted ADR and adversarial decision matrix: [`gate-2/gate-2.9-event-state-architecture-adr.md`](contracts/gate-2/gate-2.9-event-state-architecture-adr.md).
 
 **Exit criteria:** route display changes cannot alter policy; resume uses the
 saved policy and schema; migrations have success and failure-path tests; and all
