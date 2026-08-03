@@ -11,6 +11,10 @@ The engine is designed around a simple principle: **models do the probabilistic 
 
 For the complete behavioral reference and generalization roadmap, read [docs/ORCHESTRATION_ENGINE.md](docs/ORCHESTRATION_ENGINE.md).
 
+Planning status lives in [docs/EXECUTION_PLAN.md](docs/EXECUTION_PLAN.md).
+Detailed, per-item implementation contracts and adversarial matrices are indexed
+in [docs/contracts/](docs/contracts/README.md).
+
 ## Why Continuo?
 
 In musical performance, the continuo provides a persistent structural foundation while players realize their parts within the notation. That is the intended relationship between this controller and its model roles:
