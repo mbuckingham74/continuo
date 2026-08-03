@@ -224,12 +224,19 @@ This prerequisite status does not itself begin Gate 4 implementation.
 **Goal:** preserve behavior while moving project and provider assumptions behind
 the approved contracts.
 
-- [ ] Approve additive amendments to the Gate 3.1, 3.5, and 3.6 contracts before
-  implementing routing: make provider/model-specific effort a closed,
+- [x] Approve additive amendments to the Gate 3.1, 3.2, 3.5, and 3.6 contracts
+  before implementing routing: make provider/model-specific effort a closed,
   capability-validated route-profile field; add stable non-secret
   provider-account identity to resolved role bindings; and define rotation,
   deletion, resume, migration, redaction, and failure behavior without storing
   credential material in configuration or run state.
+  - Owner-approved bounded contract and adversarial matrix:
+    [`gate-4/gate-4.1-effort-provider-account-amendment.md`](contracts/gate-4/gate-4.1-effort-provider-account-amendment.md).
+  - Evidence (2026-08-03): the repository owner approved the effort,
+    route/account, credential-boundary, trusted-source, migration, and
+    capability decisions plus all 38 adversarial cases. No runtime code,
+    credential, provider, target, Jobs, or Git side effect was authorized or
+    performed.
 - [ ] Add validated, versioned configuration and persist its resolved form,
   provider-account bindings, complete selected routes, and hash at run creation.
 - [ ] Extract current provider commands into provider adapters without changing

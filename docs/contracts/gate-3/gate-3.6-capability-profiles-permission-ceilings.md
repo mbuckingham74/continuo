@@ -2,6 +2,11 @@
 
 **Status:** owner-approved and published; documentation-only Gate 3 deliverable; implementation is Gate 4 work.
 
+**Owner-approved additive amendment (2026-08-03):**
+[`Gate 4.1`](../gate-4/gate-4.1-effort-provider-account-amendment.md) constrains
+account-bound credential access to adapter-managed transport and confirms that
+effort/account selection grants no additional capability.
+
 ## Decision
 
 Continuo will make least authority a startup and arming invariant. Every

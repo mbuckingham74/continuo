@@ -2,6 +2,11 @@
 
 **Status:** owner-approved and published; documentation-only Gate 3 deliverable; implementation is Gate 4 work.
 
+**Owner-approved additive amendment (2026-08-03):**
+[`Gate 4.1`](../gate-4/gate-4.1-effort-provider-account-amendment.md) extends
+the private trusted-source boundary to immutable provider-account profiles and
+their exact source hashes.
+
 ## Decision
 
 Trusted project configuration is an operator-controlled private controller

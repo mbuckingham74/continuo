@@ -24,6 +24,9 @@ under `gate-<number>/` and must be linked from the corresponding tracker item.
   - [`gate-3.6-capability-profiles-permission-ceilings.md`](gate-3/gate-3.6-capability-profiles-permission-ceilings.md) defines the proposed machine-checkable capability-profile and role permission-ceiling boundary.
   - [`gate-3.7-deterministic-verification-findings.md`](gate-3/gate-3.7-deterministic-verification-findings.md) defines the proposed deterministic verification-result, finding, and correction-budget boundary.
   - [`gate-3.8-generic-engine-compatibility-matrix.md`](gate-3/gate-3.8-generic-engine-compatibility-matrix.md) defines the proposed generic-engine identifier and migration compatibility matrix.
+- [`gate-4/`](gate-4/) contains bounded Generic Engine Core implementation
+  prerequisites and implementation evidence.
+  - [`gate-4.1-effort-provider-account-amendment.md`](gate-4/gate-4.1-effort-provider-account-amendment.md) is the owner-approved additive effort and provider-account binding amendment required before generic routing implementation.
 
 Do not put a new full contract, matrix, or implementation transcript back in
 the execution tracker. Keep the tracker to status, a concise result, and a
