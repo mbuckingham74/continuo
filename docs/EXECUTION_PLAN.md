@@ -194,8 +194,9 @@ them. Design may begin during Gate 2, but implementation waits for Gate 2 exit.
 - [~] Define the provider adapter and route-profile contracts using the
   provider-attempt lifecycle established in M0.2–M0.4.
   - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.5-provider-adapter-route-profile.md`](contracts/gate-3/gate-3.5-provider-adapter-route-profile.md).
-- [ ] Define machine-checkable capability profiles and permission ceilings for
+- [~] Define machine-checkable capability profiles and permission ceilings for
   every orchestration role.
+  - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.6-capability-profiles-permission-ceilings.md`](contracts/gate-3/gate-3.6-capability-profiles-permission-ceilings.md).
 - [ ] Define deterministic verification result/finding contracts and their
   correction-budget semantics.
 - [ ] Write the compatibility matrix for old and new CLI, environment, package,
