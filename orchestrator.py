@@ -804,7 +804,9 @@ def migrate_run_record(
             detail = f"{detail}:{exc.field_path}"
         raise ControllerError(f"run migration {detail}") from exc
     audit = (
-        result.run.policy_migration_audit
+        result.run.provider_invocation_migration_audit
+        or result.run.approval_migration_audit
+        or result.run.policy_migration_audit
         or result.run.review_migration_audit
         or result.run.identity_migration_audit
     )
@@ -1248,6 +1250,7 @@ def _record_provider(
     capability: ProviderCapability,
     repository_fingerprint_before: str | None = None,
     repository_fingerprint_after: str | None = None,
+    logical_invocation_id: str | None = None,
 ) -> ProviderExecution:
     _validate_route_operation(identity, operation_id, capability)
     if execution.capability not in {None, capability}:
@@ -1275,12 +1278,29 @@ def _record_provider(
         if identity.provider_adapter_id == "claude_cli"
         else normalize_provider_execution(execution)
     )
+    invocation_id = logical_invocation_id or (
+        f"provider-invocation-{uuid.uuid4().hex[:20]}"
+    )
     if execution.attempts:
-        for attempt in execution.attempts:
+        for index, attempt in enumerate(execution.attempts):
+            is_final = index == len(execution.attempts) - 1
+            if attempt.retry_scheduled == is_final:
+                raise ControllerError(
+                    "provider execution attempt retry sequence is incoherent"
+                )
+            if attempt.retry_scheduled and (
+                attempt.capability != "read_only"
+                or attempt.failure_kind != "unavailable"
+            ):
+                raise ControllerError(
+                    "provider execution retry authority is incoherent"
+                )
             run.provider_runs.append(
                 ProviderRecord(
                     identity=identity,
                     operation_id=operation_id,
+                    logical_invocation_id=invocation_id,
+                    physical_attempt_ordinal=index + 1,
                     command=attempt.command,
                     returncode=attempt.returncode,
                     stdout=attempt.stdout,
@@ -1305,6 +1325,8 @@ def _record_provider(
         ProviderRecord(
             identity=identity,
             operation_id=operation_id,
+            logical_invocation_id=invocation_id,
+            physical_attempt_ordinal=1,
             command=execution.command,
             returncode=execution.returncode,
             stdout=execution.stdout,
@@ -1358,22 +1380,47 @@ def _report_review_history(run: WorkflowRun) -> list[ReviewResult]:
     ]
 
 
+def _provider_invocation_groups(
+    run: WorkflowRun,
+) -> list[list[ProviderRecord]]:
+    groups: list[list[ProviderRecord]] = []
+    for record in run.provider_runs:
+        invocation_id = record.logical_invocation_id
+        if invocation_id is None or record.physical_attempt_ordinal is None:
+            raise ControllerError(
+                "provider metrics unavailable: invocation identity is absent"
+            )
+        if not groups or groups[-1][0].logical_invocation_id != invocation_id:
+            groups.append([record])
+        else:
+            groups[-1].append(record)
+    return groups
+
+
 def _run_report(run: WorkflowRun) -> dict[str, object]:
-    role_counts = Counter(record.identity.role_id for record in run.provider_runs)
-    role_seconds: Counter[str] = Counter()
-    untimed_counts: Counter[str] = Counter()
+    invocation_groups = _provider_invocation_groups(run)
+    logical_role_counts = Counter(
+        records[0].identity.role_id for records in invocation_groups
+    )
+    physical_role_counts = Counter(
+        record.identity.role_id for record in run.provider_runs
+    )
+    physical_role_seconds: Counter[str] = Counter()
+    untimed_physical_counts: Counter[str] = Counter()
     failure_counts: Counter[str] = Counter()
-    retry_attempts = 0
+    retry_transitions = 0
 
     for record in run.provider_runs:
         if record.duration_seconds is None:
-            untimed_counts[record.identity.role_id] += 1
+            untimed_physical_counts[record.identity.role_id] += 1
         else:
-            role_seconds[record.identity.role_id] += record.duration_seconds
+            physical_role_seconds[record.identity.role_id] += (
+                record.duration_seconds
+            )
         if record.failure_kind:
             failure_counts[record.failure_kind] += 1
         if record.retry_scheduled:
-            retry_attempts += 1
+            retry_transitions += 1
 
     reviews = _report_review_history(run)
     defect_keys = {
@@ -1390,13 +1437,14 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
         for record in run.unreadable_review_records
     ]
 
-    verification_runs = sum(
+    successful_writer_invocations = sum(
         1
-        for record in run.provider_runs
-        if record.identity.role_id == "implementation"
-        and record.operation_id in {"implementation_write", "correction_write"}
-        and record.returncode == 0
-        and record.failure_kind is None
+        for records in invocation_groups
+        if records[0].identity.role_id == "implementation"
+        and records[0].operation_id
+        in {"implementation_write", "correction_write"}
+        and records[-1].returncode == 0
+        and records[-1].failure_kind is None
     )
 
     wall_seconds: float | None = None
@@ -1414,13 +1462,17 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
     )
 
     return {
-        "role_counts": dict(role_counts),
-        "role_seconds": dict(role_seconds),
-        "untimed_counts": dict(untimed_counts),
-        "provider_seconds_total": sum(role_seconds.values()),
-        "provider_calls_total": len(run.provider_runs),
-        "provider_failure_counts": dict(failure_counts),
-        "provider_retry_attempts": retry_attempts,
+        "provider_logical_invocations_total": len(invocation_groups),
+        "provider_physical_attempts_total": len(run.provider_runs),
+        "role_logical_invocation_counts": dict(logical_role_counts),
+        "role_physical_attempt_counts": dict(physical_role_counts),
+        "role_physical_attempt_seconds": dict(physical_role_seconds),
+        "untimed_physical_attempt_counts": dict(untimed_physical_counts),
+        "provider_physical_attempt_seconds_total": sum(
+            physical_role_seconds.values()
+        ),
+        "provider_physical_attempt_failure_counts": dict(failure_counts),
+        "provider_retry_transitions_total": retry_transitions,
         "wall_seconds": wall_seconds,
         "corrections": run.correction_cycles,
         "resolved_correction_policy": (
@@ -1431,7 +1483,10 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
         "distinct_defects": len(defect_keys),
         "unreadable_review_count": len(unreadable_review_records),
         "unreadable_review_records": unreadable_review_records,
-        "sol_escalations": role_counts.get("escalation_executive", 0),
+        "sol_escalations": logical_role_counts.get(
+            "escalation_executive",
+            0,
+        ),
         "policy_decisions": len(run.policy_decisions),
         "approval_requests": len(run.approval_requests),
         "approval_approved": sum(
@@ -1458,7 +1513,7 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
         "pending_writer_state": (
             run.stage if run.stage.startswith("blocked_writer_") else None
         ),
-        "verification_runs": verification_runs,
+        "successful_writer_invocations": successful_writer_invocations,
         "final_review": (
             run.implementation_review.status
             if run.implementation_review is not None
@@ -1479,12 +1534,15 @@ def _print_run_report(run: WorkflowRun) -> None:
         + _format_duration(report["wall_seconds"])
     )
 
-    total_calls = int(report["provider_calls_total"])
-    console.print(f"Provider calls: {total_calls}")
+    logical_total = int(report["provider_logical_invocations_total"])
+    physical_total = int(report["provider_physical_attempts_total"])
+    console.print(f"Provider logical invocations: {logical_total}")
+    console.print(f"Provider physical attempts: {physical_total}")
 
-    counts = report["role_counts"]
-    seconds = report["role_seconds"]
-    untimed = report["untimed_counts"]
+    logical_counts = report["role_logical_invocation_counts"]
+    physical_counts = report["role_physical_attempt_counts"]
+    seconds = report["role_physical_attempt_seconds"]
+    untimed = report["untimed_physical_attempt_counts"]
     preferred = (
         "implementation",
         "adversarial_review",
@@ -1492,36 +1550,50 @@ def _print_run_report(run: WorkflowRun) -> None:
         "policy_authority",
     )
     roles = list(preferred)
-    roles.extend(role for role in counts if role not in roles)
+    roles.extend(role for role in logical_counts if role not in roles)
 
     for role in roles:
-        count = counts.get(role, 0)
-        if not count:
+        logical_count = logical_counts.get(role, 0)
+        physical_count = physical_counts.get(role, 0)
+        if not logical_count:
             continue
         timed = seconds.get(role, 0.0)
         legacy = untimed.get(role, 0)
         timing = _format_duration(timed) if timed else "no recorded timing"
-        suffix = f"; {legacy} untimed legacy" if legacy else ""
+        suffix = (
+            f"; {legacy} untimed physical attempt(s)"
+            if legacy
+            else ""
+        )
         route = ROUTE_IDENTITIES[role]
         console.print(
             f"  {role} ({route.display_name}; {route.model_id}): "
-            f"{count} call(s), {timing}{suffix}"
+            f"{logical_count} logical invocation(s), "
+            f"{physical_count} physical attempt(s), {timing}{suffix}"
         )
 
-    total_timed = float(report["provider_seconds_total"])
+    total_timed = float(report["provider_physical_attempt_seconds_total"])
     total_untimed = sum(untimed.values())
     provider_time = _format_duration(total_timed) if total_timed else "no recorded timing"
-    legacy_suffix = f" ({total_untimed} untimed legacy call(s))" if total_untimed else ""
-    console.print(f"Provider time: {provider_time}{legacy_suffix}")
-
-    failures = report["provider_failure_counts"]
+    legacy_suffix = (
+        f" ({total_untimed} untimed physical attempt(s))"
+        if total_untimed
+        else ""
+    )
     console.print(
-        f"Infrastructure/provider failures: {sum(failures.values())}"
+        f"Provider physical-attempt time: {provider_time}{legacy_suffix}"
+    )
+
+    failures = report["provider_physical_attempt_failure_counts"]
+    console.print(
+        "Physical-attempt infrastructure/provider failures: "
+        f"{sum(failures.values())}"
     )
     for kind, count in sorted(failures.items()):
         console.print(f"  {kind}: {count}")
     console.print(
-        f"Same-provider retries: {report['provider_retry_attempts']}"
+        "Same-provider retry transitions: "
+        f"{report['provider_retry_transitions_total']}"
     )
 
     console.print(f"Corrections: {report['corrections']}")
@@ -1548,7 +1620,10 @@ def _print_run_report(run: WorkflowRun) -> None:
                 f"{item['reason_code']}"
             )
     console.print(f"Sol escalations: {report['sol_escalations']}")
-    console.print(f"Verification runs: {report['verification_runs']}")
+    console.print(
+        "Successful writer invocations (not verification executions): "
+        f"{report['successful_writer_invocations']}"
+    )
 
     console.print(f"Policy decisions: {report['policy_decisions']}")
     for decision in run.policy_decisions:
@@ -2012,6 +2087,11 @@ class Controller:
 
     @staticmethod
     def _require_executable(run: WorkflowRun) -> None:
+        if run.provider_invocation_migration_audit is not None:
+            raise ControllerError(
+                "run execution refused: migrated record disposition is "
+                f"{run.provider_invocation_migration_audit.disposition}"
+            )
         if run.approval_migration_audit is not None:
             raise ControllerError(
                 "run execution refused: migrated record disposition is "

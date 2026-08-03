@@ -135,6 +135,26 @@ def schema10_bytes() -> bytes:
     return encoded(payload)
 
 
+def schema11_bytes() -> bytes:
+    source = schema10_bytes()
+    classification = run_migrations.classify_run_bytes(source)
+    context = run_migrations.MigrationContext(
+        migration_id="historical-v11-fixture",
+        migrated_at="2026-08-02T12:45:00+00:00",
+        source_schema_version=classification.schema_version,
+        source_structural_class=classification.structural_class,
+        source_sha256=classification.source_sha256,
+        disposition=classification.disposition,
+        applied_steps=("10_to_11",),
+        reason_codes=(),
+    )
+    payload, _ = run_migrations.MIGRATION_REGISTRY[(10, 11)](
+        json.loads(source),
+        context,
+    )
+    return encoded(payload)
+
+
 def schema7_object() -> dict[str, object]:
     return json.loads(schema7_bytes())
 
@@ -148,6 +168,8 @@ def migration_source(version: int) -> bytes:
         return schema9_bytes()
     if version == 10:
         return schema10_bytes()
+    if version == 11:
+        return schema11_bytes()
     if version == 6:
         return fixture_bytes("6_base")
     return fixture_bytes(version)
@@ -298,7 +320,7 @@ class MigrationContractTests(unittest.TestCase):
             ),
             resolved_correction_policy=resolve_correction_policy(),
         )
-        self.assertEqual(current.schema_version, 11)
+        self.assertEqual(current.schema_version, 12)
         self.assertIsNone(current.migration_audit)
         self.assertIsNone(current.identity_migration_audit)
         self.assertIsNone(current.review_migration_audit)
@@ -306,7 +328,7 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(current.review_records, [])
         self.assertEqual(current.unreadable_review_records, [])
 
-        for value in (1, 6, 7, 8, 9, 10, 12, True, "11", 11.0):
+        for value in (1, 6, 7, 8, 9, 10, 11, 13, True, "12", 12.0):
             candidate = current.model_copy(deep=True)
             candidate.__dict__["schema_version"] = value
             with self.subTest(value=value):
@@ -329,15 +351,15 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(candidate.updated_at, unchanged_update)
 
     def test_c3_registry_is_exact_adjacent_closed_and_ordered(self) -> None:
-        expected = [(version, version + 1) for version in range(1, 11)]
+        expected = [(version, version + 1) for version in range(1, 12)]
         self.assertEqual(sorted(run_migrations.MIGRATION_REGISTRY), expected)
         self.assertTrue(all(callable(step) for step in run_migrations.MIGRATION_REGISTRY.values()))
-        for version in range(1, 11):
+        for version in range(1, 12):
             self.assertEqual(
                 run_migrations.migration_steps(version),
-                tuple(f"{item}_to_{item + 1}" for item in range(version, 11)),
+                tuple(f"{item}_to_{item + 1}" for item in range(version, 12)),
             )
-        for invalid in (0, 11, 12):
+        for invalid in (0, 12, 13):
             self.assertEqual(run_migrations.migration_steps(invalid), ())
 
     def test_h1_h2_all_committed_fixtures_classify_and_preserve_exact_values(self) -> None:
@@ -882,7 +904,7 @@ class MigrationContractTests(unittest.TestCase):
         missing = copy.deepcopy(base)
         missing.pop("schema_version")
         self.assertEqual(run_migrations.classify_run_bytes(encoded(missing)).reason_code, "invalid_schema_version")
-        for version in (12, 99):
+        for version in (13, 99):
             payload = copy.deepcopy(base)
             payload["schema_version"] = version
             classified = run_migrations.classify_run_bytes(encoded(payload))
@@ -955,7 +977,7 @@ class MigrationContractTests(unittest.TestCase):
 
         def observe_replace(source_path: Path, target_path: Path) -> None:
             candidate = json.loads(Path(source_path).read_text())
-            self.assertEqual(candidate["schema_version"], 11)
+            self.assertEqual(candidate["schema_version"], 12)
             replacements.append((Path(source_path), Path(target_path)))
             real_replace(source_path, target_path)
 
@@ -965,7 +987,7 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(len(replacements), 1)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         persisted = json.loads(path.read_text())
-        self.assertEqual(persisted["schema_version"], 11)
+        self.assertEqual(persisted["schema_version"], 12)
         self.assertEqual(persisted["migration_audit"]["source_sha256"], hashlib.sha256(source).hexdigest())
 
         stable = path.stat()
@@ -1121,7 +1143,7 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(sum(item.endswith(":success") for item in results), 1)
         self.assertEqual(sum("source_changed" in item for item in results), 1)
         persisted = json.loads(path.read_text())
-        self.assertEqual(persisted["schema_version"], 11)
+        self.assertEqual(persisted["schema_version"], 12)
         self.assertEqual(persisted["migration_audit"]["migration_id"], "migration-test-01")
 
     def test_a5_a6_crash_boundaries_leave_one_retryable_or_complete_record(self) -> None:
@@ -1133,7 +1155,7 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), source)
         self.assertEqual(list(self.runs.glob(".run-*.tmp")), [])
         self.approve(run_id)
-        self.assertEqual(json.loads(path.read_text())["schema_version"], 11)
+        self.assertEqual(json.loads(path.read_text())["schema_version"], 12)
 
         second_source = fixture_bytes(4)
         second_id, second_path = self.write_run(second_source)
@@ -1148,7 +1170,7 @@ class MigrationContractTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.approve(second_id)
         complete = second_path.read_bytes()
-        self.assertEqual(json.loads(complete)["schema_version"], 11)
+        self.assertEqual(json.loads(complete)["schema_version"], 12)
         self.approve(second_id)
         self.assertEqual(second_path.read_bytes(), complete)
 
@@ -1178,7 +1200,7 @@ class MigrationContractTests(unittest.TestCase):
         self.write_run(encoded(archive), "archive")
         future = copy.deepcopy(historical)
         future["run_id"] = "future"
-        future["schema_version"] = 11
+        future["schema_version"] = 13
         self.write_run(encoded(future), "future")
         self.write_run(b"CORRUPT-SECRET", "corrupt")
 
@@ -1232,7 +1254,7 @@ class MigrationContractTests(unittest.TestCase):
                 with self.subTest(action=action):
                     with self.assertRaisesRegex(orchestrator.ControllerError, "migrated record disposition"):
                         action()
-        self.assertEqual(json.loads(path.read_text())["schema_version"], 11)
+        self.assertEqual(json.loads(path.read_text())["schema_version"], 12)
 
     def test_p1_p2_p3_storage_safety_redaction_and_text_independence(self) -> None:
         source = fixture_object(5)
@@ -1286,6 +1308,7 @@ class MigrationContractTests(unittest.TestCase):
                 (8, 9),
                 (9, 10),
                 (10, 11),
+                (11, 12),
             ],
         )
         command_names = {
@@ -1302,10 +1325,13 @@ class PersistedCorrectionPolicyMigrationTests(unittest.TestCase):
         self.assertEqual(classification.schema_version, 9)
         self.assertEqual(classification.structural_class, "V9")
         self.assertEqual(classification.treatment, "migrate")
-        self.assertEqual(run_migrations.migration_steps(9), ("9_to_10", "10_to_11"))
+        self.assertEqual(
+            run_migrations.migration_steps(9),
+            ("9_to_10", "10_to_11", "11_to_12"),
+        )
 
         run = migrated(source)
-        self.assertEqual(run.schema_version, 11)
+        self.assertEqual(run.schema_version, 12)
         self.assertIsNone(run.resolved_correction_policy)
         audit = run.policy_migration_audit
         self.assertIsNotNone(audit)
@@ -1346,9 +1372,12 @@ class ApprovalRecordMigrationTests(unittest.TestCase):
             (classification.schema_version, classification.structural_class),
             (10, "V10"),
         )
-        self.assertEqual(run_migrations.migration_steps(10), ("10_to_11",))
+        self.assertEqual(
+            run_migrations.migration_steps(10),
+            ("10_to_11", "11_to_12"),
+        )
         run = migrated(source)
-        self.assertEqual(run.schema_version, 11)
+        self.assertEqual(run.schema_version, 12)
         self.assertEqual(run.approval_requests, [])
         self.assertEqual(run.approval_decisions, [])
         audit = run.approval_migration_audit
@@ -1401,6 +1430,117 @@ class ApprovalRecordMigrationTests(unittest.TestCase):
             WorkflowRun.model_validate(broken)
 
 
+class ProviderInvocationMigrationTests(unittest.TestCase):
+    def test_g27_m1_m2_v11_attempts_remain_unattributed(self) -> None:
+        source = schema11_bytes()
+        source_payload = json.loads(source)
+        classification = run_migrations.classify_run_bytes(source)
+        self.assertEqual(
+            (classification.schema_version, classification.structural_class),
+            (11, "V11"),
+        )
+        self.assertEqual(run_migrations.migration_steps(11), ("11_to_12",))
+
+        run = migrated(source)
+        self.assertEqual(run.schema_version, 12)
+        self.assertEqual(len(run.provider_runs), len(source_payload["provider_runs"]))
+        audit = run.provider_invocation_migration_audit
+        self.assertIsNotNone(audit)
+        assert audit is not None
+        self.assertEqual(audit.applied_steps, ("11_to_12",))
+        self.assertEqual(
+            audit.reason_codes,
+            ("missing_provider_invocation_identity",),
+        )
+        self.assertEqual(
+            audit.unattributed_physical_attempt_count,
+            len(source_payload["provider_runs"]),
+        )
+        for before, after in zip(
+            source_payload["provider_runs"],
+            run.provider_runs,
+            strict=True,
+        ):
+            migrated_record = after.model_dump(mode="json")
+            self.assertIsNone(migrated_record.pop("logical_invocation_id"))
+            self.assertIsNone(migrated_record.pop("physical_attempt_ordinal"))
+            self.assertEqual(migrated_record, before)
+        with self.assertRaisesRegex(
+            orchestrator.ControllerError,
+            "invocation identity is absent",
+        ):
+            orchestrator._run_report(run)
+        self.assertEqual(
+            run_migrations.classify_run_bytes(
+                run.model_dump_json().encode()
+            ).record_state,
+            "RESUME_BLOCKED",
+        )
+
+    def test_g27_m3_earlier_lineage_ends_without_grouping_inference(self) -> None:
+        for version in range(1, 12):
+            source = migration_source(version)
+            with self.subTest(version=version):
+                run = migrated(source)
+                audit = run.provider_invocation_migration_audit
+                self.assertIsNotNone(audit)
+                assert audit is not None
+                self.assertEqual(audit.source_schema_version, version)
+                self.assertEqual(audit.applied_steps[-1], "11_to_12")
+                self.assertTrue(
+                    all(
+                        record.logical_invocation_id is None
+                        and record.physical_attempt_ordinal is None
+                        for record in run.provider_runs
+                    )
+                )
+
+    def test_g27_m4_m5_groupable_or_extra_v11_data_is_never_inferred(self) -> None:
+        payload = json.loads(schema11_bytes())
+        first = copy.deepcopy(payload["provider_runs"][0])
+        first.update(
+            returncode=1,
+            stdout="",
+            stderr="unavailable",
+            failure_kind="unavailable",
+            failure_source="stderr",
+            retry_scheduled=True,
+        )
+        second = copy.deepcopy(first)
+        second.update(
+            returncode=0,
+            stdout="success",
+            stderr="",
+            failure_kind=None,
+            failure_source=None,
+            retry_scheduled=False,
+        )
+        payload["provider_runs"] = [first, second]
+        payload["spec_review"] = None
+        payload["implementation_review"] = None
+        payload["review_records"] = []
+        payload["unreadable_review_records"] = []
+        payload["review_migration_audit"] = None
+        payload["policy_decisions"] = []
+        payload["stage"] = "created"
+        payload["active_writer_attempt"] = None
+        payload["provider_resume_stage"] = None
+        payload["provider_resume_prompt"] = None
+        payload["provider_resume_identity"] = None
+        payload["provider_resume_operation_id"] = None
+        run = migrated(encoded(payload))
+        self.assertTrue(
+            all(record.logical_invocation_id is None for record in run.provider_runs)
+        )
+
+        payload["provider_runs"][0]["logical_invocation_id"] = "invented"
+        classified = run_migrations.classify_run_bytes(encoded(payload))
+        self.assertEqual(
+            (classified.treatment, classified.record_state),
+            ("archive", "ARCHIVE_ONLY"),
+        )
+
+
 class ReviewBackfillMigrationTests(unittest.TestCase):
     """Gate 2.4 M-matrix: exact V8 model, one adjacent 8_to_9 step, audit."""
 
@@ -1443,7 +1583,7 @@ class ReviewBackfillMigrationTests(unittest.TestCase):
                 "CURRENT_RUN_SCHEMA_VERSION",
                 registry_source[start:following],
             )
-        self.assertEqual(len(run_migrations._HISTORICAL_MODELS), 10)
+        self.assertEqual(len(run_migrations._HISTORICAL_MODELS), 11)
         self.assertEqual(run_migrations._HISTORICAL_MODELS[8].__name__, "_RunV8")
 
         historical = run_migrations._HISTORICAL_MODELS[8]
@@ -1510,7 +1650,7 @@ class ReviewBackfillMigrationTests(unittest.TestCase):
         self.assertIsNotNone(run)
         self.assertEqual(path.read_bytes() == before, False)
 
-        self.assertEqual(run.schema_version, 11)
+        self.assertEqual(run.schema_version, 12)
         self.assertIsNone(run.identity_migration_audit)
         self.assertIsNone(run.migration_audit)
         audit = run.review_migration_audit
@@ -1550,7 +1690,7 @@ class ReviewBackfillMigrationTests(unittest.TestCase):
             source = migration_source(version)
             run = migrated(source)
             with self.subTest(version=version):
-                self.assertEqual(run.schema_version, 11)
+                self.assertEqual(run.schema_version, 12)
                 self.assertIsNotNone(run.migration_audit)
                 self.assertIsNotNone(run.identity_migration_audit)
                 audit = run.review_migration_audit

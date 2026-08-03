@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-CURRENT_RUN_SCHEMA_VERSION = 11
+CURRENT_RUN_SCHEMA_VERSION = 12
 OLDEST_MIGRATABLE_RUN_SCHEMA_VERSION = 1
 
 
@@ -216,6 +216,7 @@ RunStructuralClass = Literal[
     "V8",
     "V9",
     "V10",
+    "V11",
 ]
 
 
@@ -383,6 +384,23 @@ class ApprovalMigrationAudit(BaseModel):
     disposition: RunMigrationDisposition
 
 
+class ProviderInvocationMigrationAudit(BaseModel):
+    """Proof that historical physical attempts cannot be grouped safely."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    migration_id: str = Field(min_length=1, max_length=64)
+    migrated_at: str
+    source_schema_version: int = Field(ge=1, lt=12)
+    target_schema_version: Literal[12] = 12
+    source_structural_class: RunStructuralClass
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    applied_steps: tuple[str, ...] = Field(min_length=1, strict=False)
+    reason_codes: tuple[str, ...] = Field(default_factory=tuple, strict=False)
+    unattributed_physical_attempt_count: int = Field(ge=0)
+    disposition: RunMigrationDisposition
+
+
 class TargetOwnership(BaseModel):
     """Durable audit of one run's ownership of a target checkout."""
 
@@ -456,6 +474,12 @@ class ProviderRecord(BaseModel):
 
     identity: ProviderRouteIdentity
     operation_id: ProviderOperation
+    logical_invocation_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+    )
+    physical_attempt_ordinal: int | None = Field(default=None, ge=1)
     command: list[str]
     returncode: int
     stdout: str = ""
@@ -521,7 +545,7 @@ class WorkflowRun(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal[11] = CURRENT_RUN_SCHEMA_VERSION
+    schema_version: Literal[12] = CURRENT_RUN_SCHEMA_VERSION
     run_id: str
     created_at: str
     updated_at: str | None = None
@@ -553,6 +577,9 @@ class WorkflowRun(BaseModel):
     review_migration_audit: ReviewMigrationAudit | None = None
     policy_migration_audit: PolicyMigrationAudit | None = None
     approval_migration_audit: ApprovalMigrationAudit | None = None
+    provider_invocation_migration_audit: (
+        ProviderInvocationMigrationAudit | None
+    ) = None
     target_ownership: TargetOwnership | None = None
     active_writer_attempt: WriterAttemptState | None = None
     writer_recovery_decisions: list[WriterRecoveryDecision] = Field(
@@ -574,6 +601,7 @@ class WorkflowRun(BaseModel):
         review_audit = self.review_migration_audit
         policy_audit = self.policy_migration_audit
         approval_audit = self.approval_migration_audit
+        invocation_audit = self.provider_invocation_migration_audit
         if legacy_audit is not None and identity_audit is None:
             raise ValueError("schema-8 migration audit lacks identity audit")
         if identity_audit is not None:
@@ -696,6 +724,40 @@ class WorkflowRun(BaseModel):
             ):
                 raise ValueError("approval migration lineage is incoherent")
 
+        if invocation_audit is not None:
+            if (
+                not invocation_audit.applied_steps
+                or invocation_audit.applied_steps[-1] != "11_to_12"
+                or "missing_provider_invocation_identity"
+                not in invocation_audit.reason_codes
+                or invocation_audit.unattributed_physical_attempt_count
+                != len(self.provider_runs)
+            ):
+                raise ValueError(
+                    "provider invocation migration audit is incoherent"
+                )
+            if invocation_audit.source_schema_version == 11:
+                if invocation_audit.applied_steps != ("11_to_12",):
+                    raise ValueError(
+                        "provider invocation migration lineage is incoherent"
+                    )
+            elif approval_audit is None or (
+                approval_audit.migration_id != invocation_audit.migration_id
+                or approval_audit.migrated_at != invocation_audit.migrated_at
+                or approval_audit.source_schema_version
+                != invocation_audit.source_schema_version
+                or approval_audit.source_structural_class
+                != invocation_audit.source_structural_class
+                or approval_audit.source_sha256
+                != invocation_audit.source_sha256
+                or approval_audit.applied_steps
+                != invocation_audit.applied_steps[:-1]
+                or approval_audit.disposition != invocation_audit.disposition
+            ):
+                raise ValueError(
+                    "provider invocation migration lineage is incoherent"
+                )
+
         if (
             self.resolved_correction_policy is not None
             and self.correction_cycles
@@ -720,7 +782,18 @@ class WorkflowRun(BaseModel):
             or self.review_migration_audit is not None
             or self.policy_migration_audit is not None
             or self.approval_migration_audit is not None
+            or self.provider_invocation_migration_audit is not None
         )
+        seen_invocation_ids: set[str] = set()
+        current_invocation_id: str | None = None
+        current_identity_key: tuple[str, str, str, str] | None = None
+        current_operation: ProviderOperation | None = None
+        current_capability: ProviderCapability | None = None
+        current_command: list[str] | None = None
+        current_before: str | None = None
+        current_after: str | None = None
+        expected_ordinal = 1
+        previous_record: ProviderRecord | None = None
         for record in self.provider_runs:
             expected_role = OPERATION_ROLES[record.operation_id]
             if record.identity.role_id != expected_role:
@@ -743,6 +816,69 @@ class WorkflowRun(BaseModel):
                     raise ValueError("ordinary provider record lacks capability")
             elif record.capability != expected_capability:
                 raise ValueError("provider capability does not match role")
+
+            invocation_id = record.logical_invocation_id
+            ordinal = record.physical_attempt_ordinal
+            if invocation_audit is not None:
+                if invocation_id is not None or ordinal is not None:
+                    raise ValueError(
+                        "migrated provider record has invented invocation identity"
+                    )
+                continue
+            if invocation_id is None or ordinal is None:
+                raise ValueError(
+                    "ordinary provider record lacks invocation identity"
+                )
+            identity_key = (
+                record.identity.role_id,
+                record.identity.provider_adapter_id,
+                record.identity.route_id,
+                record.identity.model_id,
+            )
+            if invocation_id != current_invocation_id:
+                if previous_record is not None and previous_record.retry_scheduled:
+                    raise ValueError(
+                        "provider invocation final attempt schedules a retry"
+                    )
+                if invocation_id in seen_invocation_ids:
+                    raise ValueError("provider invocation id is not contiguous")
+                if ordinal != 1:
+                    raise ValueError("provider attempt ordinals are incoherent")
+                seen_invocation_ids.add(invocation_id)
+                current_invocation_id = invocation_id
+                current_identity_key = identity_key
+                current_operation = record.operation_id
+                current_capability = record.capability
+                current_command = record.command
+                current_before = record.repository_fingerprint_before
+                current_after = record.repository_fingerprint_after
+                expected_ordinal = 1
+            else:
+                if previous_record is None or not previous_record.retry_scheduled:
+                    raise ValueError(
+                        "provider invocation retry transition is missing"
+                    )
+                expected_ordinal += 1
+                if (
+                    identity_key != current_identity_key
+                    or record.operation_id != current_operation
+                    or record.capability != current_capability
+                    or record.command != current_command
+                    or record.repository_fingerprint_before != current_before
+                    or record.repository_fingerprint_after != current_after
+                ):
+                    raise ValueError("provider invocation attempts are incoherent")
+            if ordinal != expected_ordinal:
+                raise ValueError("provider attempt ordinals are incoherent")
+            if record.retry_scheduled and (
+                record.capability != "read_only"
+                or record.failure_kind != "unavailable"
+            ):
+                raise ValueError("provider retry authority is incoherent")
+            previous_record = record
+
+        if previous_record is not None and previous_record.retry_scheduled:
+            raise ValueError("provider invocation final attempt schedules a retry")
 
         if self.provider_resume_identity is not None:
             operation = self.provider_resume_operation_id

@@ -1,4 +1,4 @@
-# Gate 2.6 / Q-3 immutable approval-record contract (draft)
+# Gate 2.6 / Q-3 immutable approval-record contract (published)
 
 **Authority.** [ENGINE_ROADMAP.md](../../ENGINE_ROADMAP.md) remains authoritative. This document contains the bounded contract, adversarial matrix, and implementation evidence for its tracker entry.
 
@@ -106,7 +106,7 @@ Tests use only synthetic V1--V10 records, temporary private run directories/repo
 | G26-B2 | Authority inspection | Providers cannot approve; controller/human Git and policy authority remains unchanged. |
 | G26-B3 | Full deterministic and installed validation | Fakes/fixtures only; tests, compilation, help/import, `UV_NO_EDITABLE=1`, links/IDs, and diff check pass. |
 
-## Implementation evidence (2026-08-02, uncommitted)
+## Implementation evidence (2026-08-02, published)
 
 Schema 11 adds the strict frozen `ApprovalRequest`, `ApprovalDecision`, and
 `ApprovalMigrationAudit` values; current runs append requests and answers for
@@ -126,12 +126,13 @@ links, mismatch refusal, migration, decline/retry history, and commit/push
 fingerprint separation. All 186 deterministic tests pass using fixtures, fakes,
 and temporary repositories only; bytecode compilation, root CLI help, and
 `UV_NO_EDITABLE=1` installed-package help/import pass. No Jobs access, live
-provider, external target, or repository publication occurred; Git actions in
-the deterministic suite use temporary repositories only. Owner review remains
-required before publication.
+provider, or external target occurred; Git actions in the deterministic suite
+use temporary repositories only. The owner approved the implementation and it
+was published on `main` in commit
+`6b29413dae558b4464408e4477adc161c377574a`.
 
 ## Explicit exclusions and owner decision requested
 
-No asynchronous approval, authentication beyond the local effective-UID principal, remote approval, expiry, revocation, UI/API, direct writes, notifications, queue, event sourcing, generic config/adapters, route selection, metric corrections, versioned JSON, `doctor`, dry-run, verification plugins, worktrees, Jobs access, live provider, commit, or push is authorized by this draft.
+No asynchronous approval, authentication beyond the local effective-UID principal, remote approval, expiry, revocation, UI/API, direct writes, notifications, queue, event sourcing, generic config/adapters, route selection, metric corrections, versioned JSON, `doctor`, dry-run, verification plugins, worktrees, Jobs access, or live provider was authorized by this gate.
 
-The repository owner approved this contract on 2026-08-02. The uncommitted implementation raises the current schema to 11; adds strict immutable request, decision, and V10-migration-audit models; records policy, commit, and push requests before input and decisions before continuation/Git; binds the records to a canonical repository snapshot and local effective-UID actor; preserves the existing synchronous target-ownership and Git gates; adds exact V10 classification and `10_to_11`; and adds deterministic migration/controller coverage. Owner review of the complete implementation diff remains required. No commit or push occurs without separate explicit approval.
+The repository owner approved this contract and its implementation on 2026-08-02. The published implementation raises the current schema to 11; adds strict immutable request, decision, and V10-migration-audit models; records policy, commit, and push requests before input and decisions before continuation/Git; binds the records to a canonical repository snapshot and local effective-UID actor; preserves the existing synchronous target-ownership and Git gates; adds exact V10 classification and `10_to_11`; and adds deterministic migration/controller coverage. Publication evidence is commit `6b29413dae558b4464408e4477adc161c377574a` on `main`.

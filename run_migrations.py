@@ -13,7 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from models import (
     ADVERSARIAL_REVIEW_ROUTE,
+    ApprovalDecision,
     ApprovalMigrationAudit,
+    ApprovalRequest,
     CURRENT_RUN_SCHEMA_VERSION,
     ESCALATION_EXECUTIVE_ROUTE,
     GitRecord,
@@ -27,7 +29,6 @@ from models import (
     ProviderFailureKind,
     ProviderFailureSource,
     ProviderOperation,
-    ProviderRecord,
     ProviderRouteIdentity,
     ReviewMigrationAudit,
     ReviewRecord,
@@ -97,6 +98,33 @@ class _ProviderV5(_ProviderV1):
 
 
 class _ProviderV6(_ProviderV5):
+    failure_kind: ProviderFailureKind | None = None
+    failure_source: ProviderFailureSource | None = None
+    failure_code: str | None = Field(default=None, max_length=120)
+    capability: ProviderCapability | None = None
+    repository_fingerprint_before: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+    )
+    repository_fingerprint_after: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+    )
+    retry_scheduled: bool = False
+
+
+class _ProviderRecordV11(_ClosedModel):
+    """The exact stable-identity physical-attempt shape through schema 11."""
+
+    identity: ProviderRouteIdentity
+    operation_id: ProviderOperation
+    command: list[str]
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+    duration_seconds: float | None = Field(default=None, ge=0)
     failure_kind: ProviderFailureKind | None = None
     failure_source: ProviderFailureSource | None = None
     failure_code: str | None = Field(default=None, max_length=120)
@@ -218,7 +246,7 @@ class _RunV8(_RunV7):
     """The exact historical schema-8 shape before parsed-review backfill."""
 
     schema_version: Literal[8] = 8
-    provider_runs: list[ProviderRecord] = Field(default_factory=list)
+    provider_runs: list[_ProviderRecordV11] = Field(default_factory=list)
     policy_decisions: list[PolicyDecision] = Field(default_factory=list)
     provider_resume_identity: ProviderRouteIdentity | None = None
     provider_resume_operation_id: ProviderOperation | None = None
@@ -291,6 +319,87 @@ class _RunV10(_RunV9):
         return self
 
 
+class _RunV11(_RunV10):
+    """The exact schema-11 shape before provider invocation identities."""
+
+    schema_version: Literal[11] = 11
+    approval_requests: list[ApprovalRequest] = Field(default_factory=list)
+    approval_decisions: list[ApprovalDecision] = Field(default_factory=list)
+    approval_migration_audit: ApprovalMigrationAudit | None = None
+
+    @model_validator(mode="after")
+    def validate_approval_history(self) -> "_RunV11":
+        audit = self.approval_migration_audit
+        if audit is not None:
+            if (
+                not audit.applied_steps
+                or audit.applied_steps[-1] != "10_to_11"
+                or "missing_approval_audit_history" not in audit.reason_codes
+                or self.approval_requests
+                or self.approval_decisions
+            ):
+                raise ValueError("approval migration audit is incoherent")
+            if audit.source_schema_version == 10:
+                if audit.applied_steps != ("10_to_11",):
+                    raise ValueError("approval migration lineage is incoherent")
+            else:
+                policy_audit = self.policy_migration_audit
+                if policy_audit is None or (
+                    policy_audit.migration_id != audit.migration_id
+                    or policy_audit.migrated_at != audit.migrated_at
+                    or policy_audit.source_schema_version
+                    != audit.source_schema_version
+                    or policy_audit.source_structural_class
+                    != audit.source_structural_class
+                    or policy_audit.source_sha256 != audit.source_sha256
+                    or policy_audit.applied_steps != audit.applied_steps[:-1]
+                    or policy_audit.disposition != audit.disposition
+                ):
+                    raise ValueError("approval migration lineage is incoherent")
+            return self
+
+        requests = {request.request_id: request for request in self.approval_requests}
+        if len(requests) != len(self.approval_requests):
+            raise ValueError("approval request id is duplicated")
+        decision_ids: set[str] = set()
+        decided_requests: set[str] = set()
+        policy_decisions = {
+            decision.decision_id: decision for decision in self.policy_decisions
+        }
+        for decision in self.approval_decisions:
+            if decision.decision_id in decision_ids:
+                raise ValueError("approval decision id is duplicated")
+            decision_ids.add(decision.decision_id)
+            request = requests.get(decision.request_id)
+            if request is None or request.gate != decision.gate:
+                raise ValueError("approval decision does not match request")
+            if decision.request_id in decided_requests:
+                raise ValueError("approval request has multiple decisions")
+            decided_requests.add(decision.request_id)
+            if decision.decided_fingerprint != request.requested_fingerprint:
+                raise ValueError("approval fingerprints do not match")
+            if decision.gate == "policy":
+                policy = policy_decisions.get(decision.policy_decision_id or "")
+                if decision.decision == "approved":
+                    if policy is None or policy.approved_text != decision.decision_text:
+                        raise ValueError(
+                            "policy approval decision link is incoherent"
+                        )
+                elif decision.policy_decision_id is not None:
+                    raise ValueError("declined policy decision has policy link")
+            elif decision.policy_decision_id is not None:
+                raise ValueError("non-policy approval has policy link")
+        unanswered: set[str] = set()
+        for request in self.approval_requests:
+            if request.request_id not in decided_requests:
+                if request.gate in unanswered:
+                    raise ValueError(
+                        "approval gate has multiple unanswered requests"
+                    )
+                unanswered.add(request.gate)
+        return self
+
+
 _HISTORICAL_MODELS: dict[int, type[BaseModel]] = {
     1: _RunV1,
     2: _RunV2,
@@ -302,6 +411,7 @@ _HISTORICAL_MODELS: dict[int, type[BaseModel]] = {
     8: _RunV8,
     9: _RunV9,
     10: _RunV10,
+    11: _RunV11,
 }
 
 
@@ -573,6 +683,10 @@ def _v10_coherence_reason(run: _RunV10) -> tuple[str, str | None] | None:
     return _v9_coherence_reason(run)
 
 
+def _v11_coherence_reason(run: _RunV11) -> tuple[str, str | None] | None:
+    return _v10_coherence_reason(run)
+
+
 _LEGACY_PROVIDER_IDENTITIES = {
     ("Luna High", "implementation"): (
         IMPLEMENTATION_ROUTE,
@@ -695,6 +809,22 @@ def _migration_disposition(
             "inspection_only",
         }:
             return audit["disposition"]
+    if schema_version == 10:
+        audit = payload.get("policy_migration_audit")
+        if isinstance(audit, dict) and audit.get("disposition") in {
+            "resume_eligibility_deferred",
+            "resume_blocked",
+            "inspection_only",
+        }:
+            return audit["disposition"]
+    if schema_version == 11:
+        audit = payload.get("approval_migration_audit")
+        if isinstance(audit, dict) and audit.get("disposition") in {
+            "resume_eligibility_deferred",
+            "resume_blocked",
+            "inspection_only",
+        }:
+            return audit["disposition"]
     if schema_version < 6:
         return "resume_eligibility_deferred"
     blocked_stages = {
@@ -788,7 +918,13 @@ def classify_run_bytes(source: bytes) -> RecordClassification:
                 reason_code="archive_only",
                 field_path=_bounded_field_path(exc),
             )
-        if run.approval_migration_audit is not None:
+        if run.provider_invocation_migration_audit is not None:
+            state: RecordState = "RESUME_BLOCKED"
+            disposition = run.provider_invocation_migration_audit.disposition
+            structural_class = (
+                run.provider_invocation_migration_audit.source_structural_class
+            )
+        elif run.approval_migration_audit is not None:
             state: RecordState = "RESUME_BLOCKED"
             disposition = run.approval_migration_audit.disposition
             structural_class = run.approval_migration_audit.source_structural_class
@@ -868,7 +1004,7 @@ def classify_run_bytes(source: bytes) -> RecordClassification:
     structural_class: RunStructuralClass = (
         _v6_structural_class(payload) if version == 6 else f"V{version}"  # type: ignore[assignment]
     )
-    if version in {6, 7, 8, 9, 10}:
+    if version in {6, 7, 8, 9, 10, 11}:
         coherence = (
             _v6_coherence_reason(historical)  # type: ignore[arg-type]
             if version in {6, 7}
@@ -878,7 +1014,11 @@ def classify_run_bytes(source: bytes) -> RecordClassification:
                 else (
                     _v9_coherence_reason(historical)  # type: ignore[arg-type]
                     if version == 9
-                    else _v10_coherence_reason(historical)  # type: ignore[arg-type]
+                    else (
+                        _v10_coherence_reason(historical)  # type: ignore[arg-type]
+                        if version == 10
+                        else _v11_coherence_reason(historical)  # type: ignore[arg-type]
+                    )
                 )
             )
         )
@@ -1284,6 +1424,31 @@ def _step_10_to_11(
     return result, reasons
 
 
+def _step_11_to_12(
+    payload: dict[str, Any], context: MigrationContext
+) -> tuple[dict[str, Any], list[str]]:
+    result = copy.deepcopy(payload)
+    reasons = ["missing_provider_invocation_identity"]
+    result["schema_version"] = 12
+    provider_runs = result.get("provider_runs", [])
+    for record in provider_runs:
+        record["logical_invocation_id"] = None
+        record["physical_attempt_ordinal"] = None
+    result["provider_invocation_migration_audit"] = {
+        "migration_id": context.migration_id,
+        "migrated_at": context.migrated_at,
+        "source_schema_version": context.source_schema_version,
+        "target_schema_version": 12,
+        "source_structural_class": context.source_structural_class,
+        "source_sha256": context.source_sha256,
+        "applied_steps": list(context.applied_steps),
+        "reason_codes": sorted(set((*context.reason_codes, *reasons))),
+        "unattributed_physical_attempt_count": len(provider_runs),
+        "disposition": context.disposition,
+    }
+    return result, reasons
+
+
 MigrationStep = Callable[
     [dict[str, Any], MigrationContext],
     tuple[dict[str, Any], list[str]],
@@ -1299,6 +1464,7 @@ MIGRATION_REGISTRY: dict[tuple[int, int], MigrationStep] = {
     (8, 9): _step_8_to_9,
     (9, 10): _step_9_to_10,
     (10, 11): _step_10_to_11,
+    (11, 12): _step_11_to_12,
 }
 
 
@@ -1387,7 +1553,7 @@ def migrate_classification(
         )
         payload, reasons = step(payload, context)
         version += 1
-        if version <= 10:
+        if version <= 11:
             _validate_historical(payload, version)
         reason_codes.extend(reasons)
         applied_steps.append(next_step)
@@ -1410,7 +1576,7 @@ def migrate_classification(
             or identity_audit.source_structural_class
             != classification.structural_class
             or identity_audit.source_sha256 != classification.source_sha256
-            or identity_audit.applied_steps != tuple(applied_steps[:-3])
+            or identity_audit.applied_steps != tuple(applied_steps[:-4])
             or identity_audit.disposition != classification.disposition
         ):
             raise MigrationError("identity_migration_audit_invalid")
@@ -1423,7 +1589,7 @@ def migrate_classification(
         or review_audit.source_structural_class
         != classification.structural_class
         or review_audit.source_sha256 != classification.source_sha256
-        or review_audit.applied_steps != tuple(applied_steps[:-2])
+        or review_audit.applied_steps != tuple(applied_steps[:-3])
         or review_audit.disposition != classification.disposition
         or review_audit.parsed_count != len(run.review_records)
         or review_audit.unreadable_count != len(run.unreadable_review_records)
@@ -1439,14 +1605,14 @@ def migrate_classification(
         or policy_audit.source_structural_class
         != classification.structural_class
         or policy_audit.source_sha256 != classification.source_sha256
-        or policy_audit.applied_steps != tuple(applied_steps[:-1])
+        or policy_audit.applied_steps != tuple(applied_steps[:-2])
         or policy_audit.disposition != classification.disposition
         or "missing_resolved_correction_policy" not in policy_audit.reason_codes
     ):
         raise MigrationError("policy_migration_audit_invalid")
 
     approval_audit = run.approval_migration_audit
-    if (
+    if source_version < 11 and (
         approval_audit is None
         or run.approval_requests
         or run.approval_decisions
@@ -1454,11 +1620,33 @@ def migrate_classification(
         or approval_audit.target_schema_version != 11
         or approval_audit.source_structural_class != classification.structural_class
         or approval_audit.source_sha256 != classification.source_sha256
-        or approval_audit.applied_steps != tuple(applied_steps)
+        or approval_audit.applied_steps != tuple(applied_steps[:-1])
         or approval_audit.disposition != classification.disposition
         or "missing_approval_audit_history" not in approval_audit.reason_codes
     ):
         raise MigrationError("approval_migration_audit_invalid")
+
+    invocation_audit = run.provider_invocation_migration_audit
+    if (
+        invocation_audit is None
+        or invocation_audit.source_schema_version != source_version
+        or invocation_audit.target_schema_version != 12
+        or invocation_audit.source_structural_class
+        != classification.structural_class
+        or invocation_audit.source_sha256 != classification.source_sha256
+        or invocation_audit.applied_steps != tuple(applied_steps)
+        or invocation_audit.disposition != classification.disposition
+        or "missing_provider_invocation_identity"
+        not in invocation_audit.reason_codes
+        or invocation_audit.unattributed_physical_attempt_count
+        != len(run.provider_runs)
+        or any(
+            record.logical_invocation_id is not None
+            or record.physical_attempt_ordinal is not None
+            for record in run.provider_runs
+        )
+    ):
+        raise MigrationError("provider_invocation_migration_audit_invalid")
 
     if source_version <= 6:
         audit = run.migration_audit
@@ -1468,7 +1656,7 @@ def migrate_classification(
             or audit.target_schema_version != 7
             or audit.source_structural_class != classification.structural_class
             or audit.source_sha256 != classification.source_sha256
-            or audit.applied_steps != tuple(applied_steps[:-4])
+            or audit.applied_steps != tuple(applied_steps[:-5])
             or audit.disposition != classification.disposition
         ):
             raise MigrationError("migration_audit_invalid")
@@ -1524,6 +1712,29 @@ def migrate_classification(
             )
             if migrated_value != original:
                 raise MigrationError("policy_migration_audit_invalid")
+    elif source_version == 11:
+        for key in (
+            "migration_audit",
+            "identity_migration_audit",
+            "review_migration_audit",
+            "policy_migration_audit",
+            "approval_migration_audit",
+        ):
+            original = classification.payload.get(key)
+            migrated_value = (
+                getattr(run, key).model_dump(mode="json")
+                if getattr(run, key) is not None
+                else None
+            )
+            if migrated_value != original:
+                raise MigrationError("approval_migration_audit_invalid")
+        if (
+            [item.model_dump(mode="json") for item in run.approval_requests]
+            != classification.payload.get("approval_requests", [])
+            or [item.model_dump(mode="json") for item in run.approval_decisions]
+            != classification.payload.get("approval_decisions", [])
+        ):
+            raise MigrationError("approval_migration_audit_invalid")
     return MigrationResult(
         run=run,
         source_sha256=classification.source_sha256,

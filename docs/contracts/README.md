@@ -11,7 +11,8 @@ under `gate-<number>/` and must be linked from the corresponding tracker item.
 
 - [`gate-1/`](gate-1/) contains Milestone 0 engine-stabilization contracts.
 - [`gate-2/`](gate-2/) contains Milestone 1 persisted-contract work.
-  - [`gate-2.6-q3-approval-records.md`](gate-2/gate-2.6-q3-approval-records.md) is the draft approval-record contract awaiting owner approval.
+  - [`gate-2.6-q3-approval-records.md`](gate-2/gate-2.6-q3-approval-records.md) is the published approval-record contract.
+  - [`gate-2.7-q7-q8-metric-semantics.md`](gate-2/gate-2.7-q7-q8-metric-semantics.md) is the published provider-metric semantics contract.
 
 Do not put a new full contract, matrix, or implementation transcript back in
 the execution tracker. Keep the tracker to status, a concise result, and a

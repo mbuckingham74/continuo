@@ -1,5 +1,6 @@
 import _thread
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -46,6 +47,7 @@ from providers import (
 
 
 CLAUDE_FIXTURES = Path(__file__).parent / "test_fixtures/claude"
+_TEST_PROVIDER_INVOCATIONS = itertools.count(1)
 
 
 def git(repo: Path, *args: str) -> str:
@@ -109,6 +111,11 @@ def provider_record(
             if identity.role_id == "implementation"
             else "read_only"
         )
+    kwargs.setdefault(
+        "logical_invocation_id",
+        f"test-invocation-{next(_TEST_PROVIDER_INVOCATIONS)}",
+    )
+    kwargs.setdefault("physical_attempt_ordinal", 1)
     return orchestrator.ProviderRecord(
         identity=identity,
         operation_id=operation_id,
@@ -1045,18 +1052,238 @@ class ControllerTests(unittest.TestCase):
 
         report = orchestrator._run_report(run)
 
-        self.assertEqual(report["provider_calls_total"], 2)
-        self.assertEqual(report["role_counts"]["implementation"], 1)
-        self.assertEqual(report["role_counts"]["adversarial_review"], 1)
-        self.assertAlmostEqual(report["role_seconds"]["implementation"], 12.5)
-        self.assertEqual(report["untimed_counts"]["adversarial_review"], 1)
-        self.assertEqual(report["verification_runs"], 1)
+        self.assertEqual(report["provider_logical_invocations_total"], 2)
+        self.assertEqual(report["provider_physical_attempts_total"], 2)
+        self.assertEqual(
+            report["role_logical_invocation_counts"]["implementation"],
+            1,
+        )
+        self.assertEqual(
+            report["role_logical_invocation_counts"]["adversarial_review"],
+            1,
+        )
+        self.assertAlmostEqual(
+            report["role_physical_attempt_seconds"]["implementation"],
+            12.5,
+        )
+        self.assertEqual(
+            report["untimed_physical_attempt_counts"]["adversarial_review"],
+            1,
+        )
+        self.assertEqual(report["successful_writer_invocations"], 1)
         self.assertEqual(report["wall_seconds"], 90.0)
 
         self.assertEqual(
             run.provider_runs[0].duration_seconds,
             12.5,
         )
+
+    def test_g27_logical_invocations_and_physical_attempts_are_distinct(self) -> None:
+        run = self.controller(
+            self.passing_sonnet,
+            approval=lambda prompt: False,
+        ).new_run("009")
+        run.provider_runs = []
+        attempts = (
+            ProviderAttempt(
+                command=["claude", "same"],
+                returncode=1,
+                stdout="",
+                stderr="unavailable",
+                duration_seconds=1.0,
+                failure_kind="unavailable",
+                failure_source="stderr",
+                failure_code="503",
+                capability="read_only",
+                retry_scheduled=True,
+            ),
+            ProviderAttempt(
+                command=["claude", "same"],
+                returncode=1,
+                stdout="",
+                stderr="unavailable",
+                duration_seconds=2.0,
+                failure_kind="unavailable",
+                failure_source="stderr",
+                failure_code="503",
+                capability="read_only",
+                retry_scheduled=True,
+            ),
+            ProviderAttempt(
+                command=["claude", "same"],
+                returncode=0,
+                stdout="ok",
+                stderr="",
+                duration_seconds=3.0,
+                capability="read_only",
+                retry_scheduled=False,
+            ),
+        )
+        execution = ProviderExecution(
+            command=["claude", "same"],
+            returncode=0,
+            stdout="ok",
+            stderr="",
+            duration_seconds=6.0,
+            capability="read_only",
+            attempts=attempts,
+        )
+        orchestrator._record_provider(
+            run,
+            "implementation_review",
+            ADVERSARIAL_REVIEW_ROUTE,
+            execution,
+            capability="read_only",
+            logical_invocation_id="logical-review-01",
+        )
+
+        report = orchestrator._run_report(run)
+        self.assertEqual(report["provider_logical_invocations_total"], 1)
+        self.assertEqual(report["provider_physical_attempts_total"], 3)
+        self.assertEqual(report["provider_retry_transitions_total"], 2)
+        self.assertEqual(
+            report["provider_physical_attempt_failure_counts"],
+            {"unavailable": 2},
+        )
+        self.assertEqual(
+            report["provider_physical_attempt_seconds_total"],
+            6.0,
+        )
+        self.assertEqual(
+            [record.logical_invocation_id for record in run.provider_runs],
+            ["logical-review-01"] * 3,
+        )
+        self.assertEqual(
+            [record.physical_attempt_ordinal for record in run.provider_runs],
+            [1, 2, 3],
+        )
+        for obsolete in (
+            "provider_calls_total",
+            "role_counts",
+            "provider_failure_counts",
+            "provider_retry_attempts",
+            "verification_runs",
+        ):
+            self.assertNotIn(obsolete, report)
+
+        orchestrator._record_provider(
+            run,
+            "implementation_review",
+            ADVERSARIAL_REVIEW_ROUTE,
+            ProviderExecution(["claude", "same"], 0, "ok", ""),
+            capability="read_only",
+            logical_invocation_id="logical-review-02",
+        )
+        self.assertEqual(
+            orchestrator._run_report(run)["provider_logical_invocations_total"],
+            2,
+        )
+
+        with orchestrator.console.capture() as capture:
+            orchestrator._print_run_report(run)
+        rendered = capture.get()
+        self.assertIn("Provider logical invocations: 2", rendered)
+        self.assertIn("Provider physical attempts: 4", rendered)
+        self.assertIn(
+            "Successful writer invocations (not verification executions): 0",
+            rendered,
+        )
+        self.assertNotIn("Provider calls:", rendered)
+        self.assertNotIn("Verification runs:", rendered)
+
+    def test_g27_invocation_group_validation_fails_closed(self) -> None:
+        invocation_id = "logical-review-validation"
+        valid = WorkflowRun(
+            run_id="g27-validation",
+            created_at="2026-08-02T00:00:00+00:00",
+            task_ref="009",
+            task_file="tasks/009-example.md",
+            task_sha256="0" * 64,
+            specification="Validate provider invocation grouping.",
+            resolved_correction_policy=resolve_correction_policy(),
+            repo=orchestrator.repo_state(self.repo),
+            provider_runs=[
+                provider_record(
+                    ADVERSARIAL_REVIEW_ROUTE,
+                    "implementation_review",
+                    logical_invocation_id=invocation_id,
+                    physical_attempt_ordinal=1,
+                    command=["claude"],
+                    returncode=1,
+                    failure_kind="unavailable",
+                    failure_source="stderr",
+                    retry_scheduled=True,
+                ),
+                provider_record(
+                    ADVERSARIAL_REVIEW_ROUTE,
+                    "implementation_review",
+                    logical_invocation_id=invocation_id,
+                    physical_attempt_ordinal=2,
+                    command=["claude"],
+                    returncode=0,
+                ),
+            ],
+        )
+        payload = valid.model_dump(mode="json")
+
+        cases = {
+            "lacks invocation identity": lambda value: value["provider_runs"][0].update(
+                logical_invocation_id=None
+            ),
+            "attempt ordinals": lambda value: value["provider_runs"][1].update(
+                physical_attempt_ordinal=3
+            ),
+            "retry transition": lambda value: value["provider_runs"][0].update(
+                retry_scheduled=False
+            ),
+            "attempts are incoherent": lambda value: value["provider_runs"][1].update(
+                command=["different"]
+            ),
+        }
+        for message, mutate in cases.items():
+            candidate = json.loads(json.dumps(payload))
+            mutate(candidate)
+            with self.subTest(message=message), self.assertRaisesRegex(
+                ValueError,
+                message,
+            ):
+                WorkflowRun.model_validate(candidate)
+
+        candidate = json.loads(json.dumps(payload))
+        middle = json.loads(json.dumps(candidate["provider_runs"][1]))
+        middle.update(
+            logical_invocation_id="logical-review-other",
+            physical_attempt_ordinal=1,
+        )
+        repeated = json.loads(json.dumps(candidate["provider_runs"][1]))
+        repeated["physical_attempt_ordinal"] = 3
+        candidate["provider_runs"].extend([middle, repeated])
+        with self.assertRaisesRegex(ValueError, "not contiguous"):
+            WorkflowRun.model_validate(candidate)
+
+        candidate = json.loads(json.dumps(payload))
+        candidate["provider_runs"][1].update(
+            returncode=1,
+            failure_kind="unavailable",
+            failure_source="stderr",
+            retry_scheduled=True,
+        )
+        with self.assertRaisesRegex(ValueError, "final attempt"):
+            WorkflowRun.model_validate(candidate)
+
+        candidate = json.loads(json.dumps(payload))
+        candidate["provider_runs"][0].update(
+            capability="workspace_write",
+            identity=IMPLEMENTATION_ROUTE.model_dump(mode="json"),
+            operation_id="implementation_write",
+        )
+        candidate["provider_runs"][1].update(
+            capability="workspace_write",
+            identity=IMPLEMENTATION_ROUTE.model_dump(mode="json"),
+            operation_id="implementation_write",
+        )
+        with self.assertRaisesRegex(ValueError, "retry authority"):
+            WorkflowRun.model_validate(candidate)
 
 
     def test_quota_stop_is_global_and_resume_retries_only_interrupted_stage(self) -> None:
@@ -1119,6 +1346,13 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(luna_calls, 1)
         self.assertIsNone(resumed.provider_resume_stage)
         self.assertIsNone(resumed.provider_resume_prompt)
+        review_invocations = [
+            record.logical_invocation_id
+            for record in resumed.provider_runs
+            if record.operation_id == "implementation_review"
+        ]
+        self.assertEqual(len(review_invocations), 2)
+        self.assertEqual(len(set(review_invocations)), 2)
 
 
     def test_provider_unavailability_retries_only_same_provider(self) -> None:
@@ -1577,6 +1811,13 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(calls, 3)
         self.assertEqual(run.spec_review.status, "PASS")
         self.assertEqual(run.implementation_review.status, "PASS")
+        specification_invocations = [
+            record.logical_invocation_id
+            for record in run.provider_runs
+            if record.operation_id == "specification_review"
+        ]
+        self.assertEqual(len(specification_invocations), 2)
+        self.assertEqual(len(set(specification_invocations)), 2)
 
     def test_native_failure_crash_recovery_uses_saved_evidence(self) -> None:
         provider_calls = 0
@@ -2093,7 +2334,10 @@ class ControllerTests(unittest.TestCase):
         )
         report = orchestrator._run_report(recovered)
         self.assertEqual(report["writer_recovery_decisions"], 1)
-        self.assertEqual(report["provider_calls_total"], provider_count + 1)
+        self.assertEqual(
+            report["provider_physical_attempts_total"],
+            provider_count + 1,
+        )
 
     def test_adopt_current_refuses_noop_unknown_and_identity_mismatch(self) -> None:
         def unchanged_failure(prompt, repo):
@@ -2578,8 +2822,11 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(loaded.model_dump(), run.model_dump())
 
         report = orchestrator._run_report(loaded)
-        self.assertEqual(report["provider_calls_total"], 2)
-        self.assertEqual(report["provider_failure_counts"], {"unavailable": 1})
+        self.assertEqual(report["provider_physical_attempts_total"], 2)
+        self.assertEqual(
+            report["provider_physical_attempt_failure_counts"],
+            {"unavailable": 1},
+        )
         self.assertEqual(report["writer_recovery_decisions"], 2)
         self.assertEqual(
             report["pending_writer_state"],
@@ -3290,7 +3537,7 @@ class StableProviderIdentityTests(unittest.TestCase):
         )
         run = self.run_fixture(provider_runs=[record])
         dumped = run.model_dump(mode="json")
-        self.assertEqual(dumped["schema_version"], 11)
+        self.assertEqual(dumped["schema_version"], 12)
         self.assertIsNone(dumped["migration_audit"])
         self.assertIsNone(dumped["identity_migration_audit"])
         self.assertNotIn("provider", dumped["provider_runs"][0])
@@ -3354,7 +3601,7 @@ class StableProviderIdentityTests(unittest.TestCase):
             "FAIL",
         )
         self.assertEqual(
-            orchestrator._run_report(run)["role_counts"],
+            orchestrator._run_report(run)["role_logical_invocation_counts"],
             {"adversarial_review": 1},
         )
 
@@ -4011,7 +4258,7 @@ orchestrator.persist(run, runs)
         self.assertNotIn("os.umask", source)
         self.assertNotIn("os.chown", source)
         self.assertNotIn("force-unlock", source)
-        self.assertEqual(self.run_fixture().schema_version, 11)
+        self.assertEqual(self.run_fixture().schema_version, 12)
         command_names = {
             command.name or command.callback.__name__.replace("_", "-")
             for command in orchestrator.app.registered_commands
@@ -4147,8 +4394,8 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
         return run
 
     def test_i1_model_shapes_schema_and_no_raw_reparse_in_control(self) -> None:
-        self.assertEqual(orchestrator.CURRENT_RUN_SCHEMA_VERSION, 11)
-        self.assertEqual(self.run_fixture().schema_version, 11)
+        self.assertEqual(orchestrator.CURRENT_RUN_SCHEMA_VERSION, 12)
+        self.assertEqual(self.run_fixture().schema_version, 12)
         for model in (
             orchestrator.ReviewResult,
             orchestrator.ReviewRecord,
@@ -4221,7 +4468,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
             [1, 1, 1],
         )
         self.assertEqual(
-            [report["provider_calls_total"] for report in reports],
+            [report["provider_physical_attempts_total"] for report in reports],
             [1, 1, 1],
         )
 
@@ -4355,7 +4602,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
 
     def test_p1_new_run_has_empty_review_state_and_no_audits(self) -> None:
         run = self.run_fixture()
-        self.assertEqual(run.schema_version, 11)
+        self.assertEqual(run.schema_version, 12)
         self.assertEqual(run.review_records, [])
         self.assertEqual(run.unreadable_review_records, [])
         self.assertIsNone(run.review_migration_audit)
@@ -5066,7 +5313,6 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
             "telemetry",
             "versioned_json",
             "resolved_policy",
-            "approval_request",
             "logical_calls",
         ):
             self.assertNotIn(excluded, combined)
@@ -5537,7 +5783,7 @@ Diff:
                     failure_kind=kind,
                     failure_source=source,
                     failure_code=code,
-                    retry_scheduled=source == "stdout_tail",
+                    retry_scheduled=False,
                 )
             )
         run.provider_runs.extend(

@@ -156,10 +156,11 @@ renaming control identities.
 - [x] Persist the resolved correction and escalation policy with each run.
   - Detailed contract, implementation evidence, and matrix: [`gate-2/gate-2.5-c9-correction-policy.md`](contracts/gate-2/gate-2.5-c9-correction-policy.md).
 
-- [~] Add immutable approval request and decision records with identity,
+- [x] Add immutable approval request and decision records with identity,
   timestamps, decision text, and repository fingerprints.
-  - Uncommitted implementation evidence and approval contract: [`gate-2/gate-2.6-q3-approval-records.md`](contracts/gate-2/gate-2.6-q3-approval-records.md).
-- [ ] Correct logical-call/physical-attempt and verification metric semantics.
+  - Detailed contract, implementation evidence, and matrix: [`gate-2/gate-2.6-q3-approval-records.md`](contracts/gate-2/gate-2.6-q3-approval-records.md).
+- [x] Correct logical-call/physical-attempt and verification metric semantics.
+  - Published contract, implementation evidence, and matrix: [`gate-2/gate-2.7-q7-q8-metric-semantics.md`](contracts/gate-2/gate-2.7-q7-q8-metric-semantics.md).
 - [ ] Add versioned machine-readable CLI output, `doctor`, and a genuinely
   read-only dry-run contract.
 - [ ] Write the event/state architecture ADR without implicitly beginning an
