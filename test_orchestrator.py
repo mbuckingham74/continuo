@@ -157,6 +157,7 @@ class ControllerTests(unittest.TestCase):
         sol=None,
         luna=None,
         approval=None,
+        approval_actor=None,
         runs_dir=None,
     ):
         return orchestrator.Controller(
@@ -167,6 +168,7 @@ class ControllerTests(unittest.TestCase):
             sol=sol or (lambda prompt, repo: ProviderExecution(["codex"], 0, "GUIDANCE: inspect the remaining defect", "")),
             luna=luna or self.luna,
             approval=approval,
+            approval_actor=approval_actor,
         )
 
     def luna(self, prompt: str, repo: Path) -> ProviderExecution:
@@ -649,6 +651,51 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(run.stage, "commit_declined")
         self.assertEqual(run.correction_cycles, 0)
         self.assertEqual(run.implementation_review.category, "PASS")
+
+    def test_g26_commit_decline_and_retry_append_immutable_records(self) -> None:
+        first = self.controller(
+            self.passing_sonnet,
+            approval=lambda _: False,
+            approval_actor=lambda: "local-os-uid:4242",
+        ).new_run("009")
+        self.assertEqual(first.stage, "commit_declined")
+        self.assertEqual(len(first.approval_requests), 1)
+        self.assertEqual(len(first.approval_decisions), 1)
+        initial = first.approval_decisions[0]
+        self.assertEqual(initial.decision, "declined")
+        self.assertEqual(initial.decided_by, "local-os-uid:4242")
+        self.assertEqual(
+            initial.decided_fingerprint,
+            first.approval_requests[0].requested_fingerprint,
+        )
+
+        retried = self.controller(
+            self.passing_sonnet,
+            approval=lambda _: False,
+            approval_actor=lambda: "local-os-uid:4242",
+        ).resume(first.run_id)
+        self.assertEqual(retried.stage, "commit_declined")
+        self.assertEqual(len(retried.approval_requests), 2)
+        self.assertEqual(len(retried.approval_decisions), 2)
+        self.assertEqual(retried.approval_decisions[0], initial)
+
+    def test_g26_approved_commit_and_declined_push_are_audited(self) -> None:
+        answers = iter([True, False])
+        run = self.controller(
+            self.passing_sonnet,
+            approval=lambda _: next(answers),
+            approval_actor=lambda: "local-os-uid:4242",
+        ).new_run("009")
+        self.assertEqual(run.stage, "push_declined")
+        self.assertEqual([request.gate for request in run.approval_requests], ["commit", "push"])
+        self.assertEqual(
+            [(decision.gate, decision.decision) for decision in run.approval_decisions],
+            [("commit", "approved"), ("push", "declined")],
+        )
+        self.assertNotEqual(
+            run.approval_requests[0].requested_fingerprint,
+            run.approval_requests[1].requested_fingerprint,
+        )
 
     def test_policy_ambiguity_calls_terra_and_stops(self) -> None:
         terra_calls = []
@@ -3243,7 +3290,7 @@ class StableProviderIdentityTests(unittest.TestCase):
         )
         run = self.run_fixture(provider_runs=[record])
         dumped = run.model_dump(mode="json")
-        self.assertEqual(dumped["schema_version"], 10)
+        self.assertEqual(dumped["schema_version"], 11)
         self.assertIsNone(dumped["migration_audit"])
         self.assertIsNone(dumped["identity_migration_audit"])
         self.assertNotIn("provider", dumped["provider_runs"][0])
@@ -3964,7 +4011,7 @@ orchestrator.persist(run, runs)
         self.assertNotIn("os.umask", source)
         self.assertNotIn("os.chown", source)
         self.assertNotIn("force-unlock", source)
-        self.assertEqual(self.run_fixture().schema_version, 10)
+        self.assertEqual(self.run_fixture().schema_version, 11)
         command_names = {
             command.name or command.callback.__name__.replace("_", "-")
             for command in orchestrator.app.registered_commands
@@ -4100,8 +4147,8 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
         return run
 
     def test_i1_model_shapes_schema_and_no_raw_reparse_in_control(self) -> None:
-        self.assertEqual(orchestrator.CURRENT_RUN_SCHEMA_VERSION, 10)
-        self.assertEqual(self.run_fixture().schema_version, 10)
+        self.assertEqual(orchestrator.CURRENT_RUN_SCHEMA_VERSION, 11)
+        self.assertEqual(self.run_fixture().schema_version, 11)
         for model in (
             orchestrator.ReviewResult,
             orchestrator.ReviewRecord,
@@ -4308,7 +4355,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
 
     def test_p1_new_run_has_empty_review_state_and_no_audits(self) -> None:
         run = self.run_fixture()
-        self.assertEqual(run.schema_version, 10)
+        self.assertEqual(run.schema_version, 11)
         self.assertEqual(run.review_records, [])
         self.assertEqual(run.unreadable_review_records, [])
         self.assertIsNone(run.review_migration_audit)

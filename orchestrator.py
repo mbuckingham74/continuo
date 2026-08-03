@@ -24,6 +24,9 @@ from rich.table import Table
 
 from models import (
     ADVERSARIAL_REVIEW_ROUTE,
+    ApprovalDecision,
+    ApprovalGate,
+    ApprovalRequest,
     CorrectionPolicyAction,
     CURRENT_RUN_SCHEMA_VERSION,
     ESCALATION_EXECUTIVE_ROUTE,
@@ -282,6 +285,22 @@ def working_tree_fingerprint(repo: Path, files: list[str] | None = None) -> str:
         if path.is_file():
             digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def approval_fingerprint(repo: Path) -> str:
+    """Hash the full repository snapshot guarded by one human approval."""
+
+    state = repo_state(repo)
+    parts = (
+        "continuo-approval-fingerprint-v1",
+        state.repo,
+        state.branch,
+        state.head,
+        state.origin,
+        "1" if state.clean else "0",
+        working_tree_fingerprint(repo),
+    )
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()
 
 
 def diff_check(repo: Path) -> tuple[bool, str]:
@@ -1414,6 +1433,13 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
         "unreadable_review_records": unreadable_review_records,
         "sol_escalations": role_counts.get("escalation_executive", 0),
         "policy_decisions": len(run.policy_decisions),
+        "approval_requests": len(run.approval_requests),
+        "approval_approved": sum(
+            decision.decision == "approved" for decision in run.approval_decisions
+        ),
+        "approval_declined": sum(
+            decision.decision == "declined" for decision in run.approval_decisions
+        ),
         "writer_recovery_decisions": len(run.writer_recovery_decisions),
         "target_ownership_state": (
             "legacy"
@@ -1530,6 +1556,20 @@ def _print_run_report(run: WorkflowRun) -> None:
         if len(text) > 110:
             text = text[:107] + "..."
         console.print(f"  {decision.decision_id}: {text}")
+
+    console.print(
+        "Approval audit: "
+        f"{report['approval_requests']} request(s), "
+        f"{report['approval_approved']} approved, "
+        f"{report['approval_declined']} declined"
+    )
+    if run.approval_decisions:
+        latest = run.approval_decisions[-1]
+        console.print(
+            f"  latest {latest.gate}: {latest.decision} by "
+            f"{latest.decided_by} at {latest.decided_at} "
+            f"({latest.decided_fingerprint[:12]})"
+        )
 
     console.print(
         "Writer recovery decisions: "
@@ -1862,6 +1902,7 @@ class Controller:
         sol: Callable[[str, Path], ProviderExecution] = execute_sol_escalation,
         luna: Callable[[str, Path], ProviderExecution] = execute_luna_implementation,
         approval: Callable[[str], bool] | None = None,
+        approval_actor: Callable[[], str] | None = None,
     ) -> None:
         self.repo = repo
         self.runs_dir = runs_dir
@@ -1879,6 +1920,86 @@ class Controller:
             "implementation": self.luna,
         }
         self.approval = approval or (lambda prompt: typer.confirm(prompt, default=False))
+        self.approval_actor = approval_actor or (
+            lambda: f"local-os-uid:{os.geteuid()}"
+        )
+
+    def _approval_request(
+        self,
+        run: WorkflowRun,
+        gate: ApprovalGate,
+    ) -> ApprovalRequest:
+        fingerprint = approval_fingerprint(self.repo)
+        unanswered = [
+            request
+            for request in run.approval_requests
+            if request.gate == gate
+            and not any(
+                decision.request_id == request.request_id
+                for decision in run.approval_decisions
+            )
+        ]
+        if unanswered:
+            request = unanswered[-1]
+            if (
+                request.requested_stage != run.stage
+                or request.requested_fingerprint != fingerprint
+            ):
+                raise ControllerError("approval request no longer matches repository state")
+            return request
+        request = ApprovalRequest(
+            request_id=f"approval-request-{uuid.uuid4().hex[:20]}",
+            gate=gate,
+            requested_at=datetime.now(timezone.utc).isoformat(),
+            requested_stage=run.stage,
+            requested_fingerprint=fingerprint,
+        )
+        run.approval_requests.append(request)
+        return request
+
+    @staticmethod
+    def _approval_decision_for(
+        run: WorkflowRun,
+        request: ApprovalRequest,
+    ) -> ApprovalDecision | None:
+        return next(
+            (
+                decision
+                for decision in run.approval_decisions
+                if decision.request_id == request.request_id
+            ),
+            None,
+        )
+
+    def _record_approval_decision(
+        self,
+        run: WorkflowRun,
+        request: ApprovalRequest,
+        decision: bool,
+        text: str,
+        *,
+        policy_decision_id: str | None = None,
+    ) -> ApprovalDecision:
+        if self._approval_decision_for(run, request) is not None:
+            raise ControllerError("approval request already has a decision")
+        if approval_fingerprint(self.repo) != request.requested_fingerprint:
+            raise ControllerError("approval decision refused: repository state changed")
+        actor = self.approval_actor()
+        if not re.fullmatch(r"local-os-uid:[0-9]+", actor):
+            raise ControllerError("approval actor must be a local effective-UID principal")
+        record = ApprovalDecision(
+            decision_id=f"approval-decision-{uuid.uuid4().hex[:20]}",
+            request_id=request.request_id,
+            gate=request.gate,
+            decided_at=datetime.now(timezone.utc).isoformat(),
+            decided_by=actor,
+            decision="approved" if decision else "declined",
+            decision_text=text.strip(),
+            decided_fingerprint=request.requested_fingerprint,
+            policy_decision_id=policy_decision_id,
+        )
+        run.approval_decisions.append(record)
+        return record
 
     def _provider_for(
         self,
@@ -1891,6 +2012,11 @@ class Controller:
 
     @staticmethod
     def _require_executable(run: WorkflowRun) -> None:
+        if run.approval_migration_audit is not None:
+            raise ControllerError(
+                "run execution refused: migrated record disposition is "
+                f"{run.approval_migration_audit.disposition}"
+            )
         if run.policy_migration_audit is not None:
             raise ControllerError(
                 "run execution refused: migrated record disposition is "
@@ -1951,6 +2077,10 @@ class Controller:
         if not approved_text:
             raise ControllerError("approved policy text cannot be empty")
 
+        request = self._approval_request(run, "policy")
+        if self._approval_decision_for(run, request) is not None:
+            raise ControllerError("policy approval request already has a decision")
+
         trigger_summary = (
             run.sol_guidance
             or (run.implementation_review.summary if run.implementation_review else None)
@@ -1980,17 +2110,23 @@ class Controller:
                 "policy approval lacks a successful policy-authority audit record"
             )
 
-        run.policy_decisions.append(
-            PolicyDecision(
-                decision_id=f"policy-{len(run.policy_decisions) + 1:02d}",
+        policy_decision = PolicyDecision(
+            decision_id=f"policy-{len(run.policy_decisions) + 1:02d}",
                 approved_at=datetime.now(timezone.utc).isoformat(),
                 source_provider_record_index=source_index,
                 trigger_finding_key=trigger_key,
                 trigger_summary=trigger_summary,
                 recommendation=run.terra_resolution or "",
-                approved_text=approved_text,
-            )
+            approved_text=approved_text,
         )
+        self._record_approval_decision(
+            run,
+            request,
+            True,
+            approved_text,
+            policy_decision_id=policy_decision.decision_id,
+        )
+        run.policy_decisions.append(policy_decision)
 
         run.sol_guidance = None
         run.last_error = None
@@ -2012,6 +2148,22 @@ class Controller:
 
         self._save(run)
         return run
+
+    def decline_policy(self, run_id: str, text: str = "Policy decision declined.") -> WorkflowRun:
+        run = load_run(run_id, self.runs_dir)
+        self._require_executable(run)
+        coordinator = TargetCoordinator(self.repo, self.runs_dir)
+        if run.target_ownership is None:
+            self._resume_guard(run)
+            coordinator.claim_legacy(run)
+        with coordinator.execute(run) as connection:
+            self._resume_guard(run)
+            if run.stage != "blocked_policy_ambiguity":
+                raise ControllerError("policy decline requires blocked_policy_ambiguity stage")
+            request = self._approval_request(run, "policy")
+            self._record_approval_decision(run, request, False, text)
+            self._save(run)
+            return self._finish_owned_action(coordinator, connection, run)
 
     def recover_writer(
         self,
@@ -2452,11 +2604,13 @@ class Controller:
 
         self._clear_provider(run)
         run.terra_resolution = execution.stdout or execution.stderr
-        return self._block(
-            run,
-            "blocked_policy_ambiguity",
-            "policy ambiguity requires human approval",
-        )
+        run.stage = "blocked_policy_ambiguity"
+        run.last_error = "policy ambiguity requires human approval"
+        self._approval_request(run, "policy")
+        self._save(run)
+        console.print("[red]BLOCKED:[/red] policy ambiguity requires human approval")
+        _print_run_report(run)
+        return run
 
     def _review(self, run: WorkflowRun, purpose: str) -> ReviewResult | None:
         run.stage = (
@@ -2876,6 +3030,7 @@ class Controller:
             return run
         if result.category == "PASS":
             run.stage = "awaiting_commit_approval"
+            self._approval_request(run, "commit")
             self._save(run)
             return self._approval_gates(run)
         if result.category == "POLICY_AMBIGUITY":
@@ -2909,12 +3064,25 @@ class Controller:
     def _approval_gates(self, run: WorkflowRun) -> WorkflowRun:
         self._resume_guard(run)
         if run.stage in {"awaiting_commit_approval", "commit_declined"}:
+            request = self._approval_request(run, "commit")
+            prior = self._approval_decision_for(run, request)
+            if prior is None:
+                self._save(run)
             _print_run_report(run)
             console.print("\n[cyan]Commit approval gate[/cyan]")
             console.print("Changed files: " + ", ".join(run.changed_files))
             if run.implementation_review:
                 console.print("Review: " + run.implementation_review.summary)
-            if not self.approval("Commit these changes?"):
+            approved = prior.decision == "approved" if prior is not None else self.approval("Commit these changes?")
+            if prior is None:
+                self._record_approval_decision(
+                    run,
+                    request,
+                    approved,
+                    "Commit approved." if approved else "Commit declined.",
+                )
+                self._save(run)
+            if not approved:
                 run.stage = "commit_declined"
                 self._save(run)
                 console.print("Commit not approved; no Git commit was made.")
@@ -2934,10 +3102,24 @@ class Controller:
             run.commit_hash = git_text(self.repo, "rev-parse", "HEAD")
             run.commit_message = message
             run.stage = "awaiting_push_approval"
+            self._approval_request(run, "push")
             self._save(run)
         if run.stage in {"awaiting_push_approval", "push_declined"}:
+            request = self._approval_request(run, "push")
+            prior = self._approval_decision_for(run, request)
+            if prior is None:
+                self._save(run)
             console.print("\n[cyan]Push approval gate[/cyan]")
-            if not self.approval("Push this commit to origin?"):
+            approved = prior.decision == "approved" if prior is not None else self.approval("Push this commit to origin?")
+            if prior is None:
+                self._record_approval_decision(
+                    run,
+                    request,
+                    approved,
+                    "Push approved." if approved else "Push declined.",
+                )
+                self._save(run)
+            if not approved:
                 run.stage = "push_declined"
                 self._save(run)
                 console.print("Push not approved; no Git push was made.")
@@ -3508,6 +3690,10 @@ def approve_policy_command(
             "Approve this policy decision and resume orchestration?",
             default=False,
         ):
+            controller = Controller(
+                configured_repo(repo) if repo else Path(saved.repo.repo)
+            )
+            controller.decline_policy(run_id)
             console.print("Policy decision not approved; run remains blocked.")
             return
 

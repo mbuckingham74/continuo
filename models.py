@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-CURRENT_RUN_SCHEMA_VERSION = 10
+CURRENT_RUN_SCHEMA_VERSION = 11
 OLDEST_MIGRATABLE_RUN_SCHEMA_VERSION = 1
 
 
@@ -215,6 +215,7 @@ RunStructuralClass = Literal[
     "V7",
     "V8",
     "V9",
+    "V10",
 ]
 
 
@@ -327,6 +328,54 @@ class PolicyMigrationAudit(BaseModel):
     migrated_at: str
     source_schema_version: int = Field(ge=1, lt=10)
     target_schema_version: Literal[10] = 10
+    source_structural_class: RunStructuralClass
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    applied_steps: tuple[str, ...] = Field(min_length=1, strict=False)
+    reason_codes: tuple[str, ...] = Field(default_factory=tuple, strict=False)
+    disposition: RunMigrationDisposition
+
+
+ApprovalGate = Literal["policy", "commit", "push"]
+ApprovalDecisionKind = Literal["approved", "declined"]
+
+
+class ApprovalRequest(BaseModel):
+    """Immutable controller-created request for one human gate decision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    request_id: str = Field(min_length=1, max_length=64)
+    gate: ApprovalGate
+    requested_at: str = Field(min_length=1, max_length=64)
+    requested_stage: str = Field(min_length=1, max_length=120)
+    requested_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ApprovalDecision(BaseModel):
+    """Immutable local-operator response to exactly one approval request."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    decision_id: str = Field(min_length=1, max_length=64)
+    request_id: str = Field(min_length=1, max_length=64)
+    gate: ApprovalGate
+    decided_at: str = Field(min_length=1, max_length=64)
+    decided_by: str = Field(pattern=r"^local-os-uid:[0-9]+$", max_length=64)
+    decision: ApprovalDecisionKind
+    decision_text: str = Field(min_length=1, max_length=2000)
+    decided_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    policy_decision_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class ApprovalMigrationAudit(BaseModel):
+    """Immutable proof that a historical record lacked approval audit facts."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    migration_id: str = Field(min_length=1, max_length=64)
+    migrated_at: str
+    source_schema_version: int = Field(ge=1, lt=11)
+    target_schema_version: Literal[11] = 11
     source_structural_class: RunStructuralClass
     source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     applied_steps: tuple[str, ...] = Field(min_length=1, strict=False)
@@ -472,7 +521,7 @@ class WorkflowRun(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal[10] = CURRENT_RUN_SCHEMA_VERSION
+    schema_version: Literal[11] = CURRENT_RUN_SCHEMA_VERSION
     run_id: str
     created_at: str
     updated_at: str | None = None
@@ -493,6 +542,8 @@ class WorkflowRun(BaseModel):
     terra_resolution: str | None = None
     sol_guidance: str | None = None
     policy_decisions: list[PolicyDecision] = Field(default_factory=list)
+    approval_requests: list[ApprovalRequest] = Field(default_factory=list)
+    approval_decisions: list[ApprovalDecision] = Field(default_factory=list)
     provider_resume_stage: str | None = None
     provider_resume_prompt: str | None = None
     provider_resume_identity: ProviderRouteIdentity | None = None
@@ -501,6 +552,7 @@ class WorkflowRun(BaseModel):
     identity_migration_audit: IdentityMigrationAudit | None = None
     review_migration_audit: ReviewMigrationAudit | None = None
     policy_migration_audit: PolicyMigrationAudit | None = None
+    approval_migration_audit: ApprovalMigrationAudit | None = None
     target_ownership: TargetOwnership | None = None
     active_writer_attempt: WriterAttemptState | None = None
     writer_recovery_decisions: list[WriterRecoveryDecision] = Field(
@@ -521,6 +573,7 @@ class WorkflowRun(BaseModel):
         identity_audit = self.identity_migration_audit
         review_audit = self.review_migration_audit
         policy_audit = self.policy_migration_audit
+        approval_audit = self.approval_migration_audit
         if legacy_audit is not None and identity_audit is None:
             raise ValueError("schema-8 migration audit lacks identity audit")
         if identity_audit is not None:
@@ -617,6 +670,32 @@ class WorkflowRun(BaseModel):
         elif self.resolved_correction_policy is None:
             raise ValueError("ordinary run lacks a resolved correction policy")
 
+        if approval_audit is not None:
+            if (
+                not approval_audit.applied_steps
+                or approval_audit.applied_steps[-1] != "10_to_11"
+                or "missing_approval_audit_history"
+                not in approval_audit.reason_codes
+                or self.approval_requests
+                or self.approval_decisions
+            ):
+                raise ValueError("approval migration audit is incoherent")
+            if approval_audit.source_schema_version == 10:
+                if approval_audit.applied_steps != ("10_to_11",):
+                    raise ValueError("approval migration lineage is incoherent")
+            elif policy_audit is None or (
+                policy_audit.migration_id != approval_audit.migration_id
+                or policy_audit.migrated_at != approval_audit.migrated_at
+                or policy_audit.source_schema_version
+                != approval_audit.source_schema_version
+                or policy_audit.source_structural_class
+                != approval_audit.source_structural_class
+                or policy_audit.source_sha256 != approval_audit.source_sha256
+                or policy_audit.applied_steps != approval_audit.applied_steps[:-1]
+                or policy_audit.disposition != approval_audit.disposition
+            ):
+                raise ValueError("approval migration lineage is incoherent")
+
         if (
             self.resolved_correction_policy is not None
             and self.correction_cycles
@@ -640,6 +719,7 @@ class WorkflowRun(BaseModel):
             or self.identity_migration_audit is not None
             or self.review_migration_audit is not None
             or self.policy_migration_audit is not None
+            or self.approval_migration_audit is not None
         )
         for record in self.provider_runs:
             expected_role = OPERATION_ROLES[record.operation_id]
@@ -731,6 +811,44 @@ class WorkflowRun(BaseModel):
                 or record.failure_kind is not None
             ):
                 raise ValueError("policy source record link is incoherent")
+
+        request_ids: set[str] = set()
+        requests_by_id: dict[str, ApprovalRequest] = {}
+        unanswered_by_gate: set[ApprovalGate] = set()
+        for request in self.approval_requests:
+            if request.request_id in request_ids:
+                raise ValueError("approval request id is duplicated")
+            request_ids.add(request.request_id)
+            requests_by_id[request.request_id] = request
+        decision_request_ids: set[str] = set()
+        policy_ids = {decision.decision_id: decision for decision in self.policy_decisions}
+        decision_ids: set[str] = set()
+        for decision in self.approval_decisions:
+            if decision.decision_id in decision_ids:
+                raise ValueError("approval decision id is duplicated")
+            decision_ids.add(decision.decision_id)
+            request = requests_by_id.get(decision.request_id)
+            if request is None or request.gate != decision.gate:
+                raise ValueError("approval decision does not match request")
+            if decision.request_id in decision_request_ids:
+                raise ValueError("approval request has multiple decisions")
+            decision_request_ids.add(decision.request_id)
+            if decision.decided_fingerprint != request.requested_fingerprint:
+                raise ValueError("approval fingerprints do not match")
+            if decision.gate == "policy":
+                policy = policy_ids.get(decision.policy_decision_id or "")
+                if decision.decision == "approved":
+                    if policy is None or policy.approved_text != decision.decision_text:
+                        raise ValueError("policy approval decision link is incoherent")
+                elif decision.policy_decision_id is not None:
+                    raise ValueError("declined policy decision has policy link")
+            elif decision.policy_decision_id is not None:
+                raise ValueError("non-policy approval has policy link")
+        for request in self.approval_requests:
+            if request.request_id not in decision_request_ids:
+                if request.gate in unanswered_by_gate:
+                    raise ValueError("approval gate has multiple unanswered requests")
+                unanswered_by_gate.add(request.gate)
 
         index_owners: dict[int, str] = {}
         for review in [*self.review_records, *self.unreadable_review_records]:

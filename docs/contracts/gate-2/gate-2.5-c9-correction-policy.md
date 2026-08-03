@@ -12,9 +12,10 @@ roadmap](../../ENGINE_ROADMAP.md#c-9--correction-bound-and-schema-migration),
 Milestone 1 item 4 and its exit criteria, the current correction policy in the
 [README](../../../README.md#correction-and-escalation-policy), and the schema-9
 model/controller/migration/report/test paths. The repository owner approved
-implementation after reviewing this contract. The implementation below remains
-an uncommitted owner-review diff; it does not invoke providers, access Jobs,
-commit, or push.
+implementation after reviewing this contract. The bounded implementation is
+published on `origin/main` as `c828ff4fb690c6c100b2efdfbb6cb1df42d7ae41`
+(`Persist resolved correction policy`); it did not invoke providers, access
+Jobs, or alter any later Gate 2 item.
 
 **Invariant and reproduced problem.** A run must make every correction,
 escalation, budget, block, resume, and recovery decision under the immutable
@@ -218,7 +219,7 @@ Later configuration work may add a separately approved versioned policy
 resolver; it must preserve this run-snapshot contract rather than reinterpret
 existing records.
 
-**Implementation evidence (2026-08-02, uncommitted).** Schema 10 now persists
+**Implementation evidence (2026-08-02, published).** Schema 10 now persists
 the frozen v1 policy on `new_run`, and correction evaluation, Sol continuation,
 legacy compatibility resume, reporting, and blocking read that saved snapshot.
 The explicit V9 historical validator and `9_to_10` adjacent transform preserve
@@ -227,8 +228,9 @@ audit, and preserve execution refusal. Focused policy/migration tests and the
 full 182-test deterministic suite passed with fakes/fixtures only; bytecode
 compilation, installed-package imports, and `UV_NO_EDITABLE=1 jobs-orchestrator
 --help` also passed. All local Markdown targets resolve, the 32 `G25-*` matrix
-IDs are unique, and `git diff --check` passes. Owner review remains required
-before this item can be marked completed or published.
+IDs are unique, and `git diff --check` passed before publication. The repository
+owner reviewed the bounded implementation and authorized its direct push to
+`origin/main`.
 
 **Owner decision.** No decision is intentionally deferred: the approved
 contract fixes the current policy exactly as published and makes historical
