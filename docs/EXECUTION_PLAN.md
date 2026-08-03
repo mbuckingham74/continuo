@@ -183,9 +183,10 @@ them. Design may begin during Gate 2, but implementation waits for Gate 2 exit.
 - [~] Decide where trusted project configuration lives, who may modify it, how it
   is protected from writers, and how its hash invalidates resume.
   - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.2-trusted-project-configuration.md`](contracts/gate-3/gate-3.2-trusted-project-configuration.md).
-- [ ] Define a normalized immutable task envelope: source identity, revision,
+- [~] Define a normalized immutable task envelope: source identity, revision,
   canonical text, checksum, provenance, scope, acceptance criteria, and optional
   verification requests.
+  - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.3-normalized-task-envelope.md`](contracts/gate-3/gate-3.3-normalized-task-envelope.md).
 - [ ] Define the repository/project adapter contract: identity, snapshots,
   fingerprints, changes, diffs, allowed paths, branch/remote rules, commit-message
   policy, and approval-gated publication.
