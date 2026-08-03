@@ -180,8 +180,9 @@ them. Design may begin during Gate 2, but implementation waits for Gate 2 exit.
 - [~] Define a versioned resolved-configuration model and precedence order for
   user defaults, project configuration, and explicit run overrides.
   - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.1-versioned-resolved-configuration.md`](contracts/gate-3/gate-3.1-versioned-resolved-configuration.md).
-- [ ] Decide where trusted project configuration lives, who may modify it, how it
+- [~] Decide where trusted project configuration lives, who may modify it, how it
   is protected from writers, and how its hash invalidates resume.
+  - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.2-trusted-project-configuration.md`](contracts/gate-3/gate-3.2-trusted-project-configuration.md).
 - [ ] Define a normalized immutable task envelope: source identity, revision,
   canonical text, checksum, provenance, scope, acceptance criteria, and optional
   verification requests.

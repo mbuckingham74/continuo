@@ -17,6 +17,7 @@ under `gate-<number>/` and must be linked from the corresponding tracker item.
   - [`gate-2.9-event-state-architecture-adr.md`](gate-2/gate-2.9-event-state-architecture-adr.md) is the accepted event/state architecture decision record.
 - [`gate-3/`](gate-3/) contains proposed Generic Engine Core contracts.
   - [`gate-3.1-versioned-resolved-configuration.md`](gate-3/gate-3.1-versioned-resolved-configuration.md) defines the proposed versioned configuration-resolution contract.
+  - [`gate-3.2-trusted-project-configuration.md`](gate-3/gate-3.2-trusted-project-configuration.md) defines the proposed trusted project-configuration boundary.
 
 Do not put a new full contract, matrix, or implementation transcript back in
 the execution tracker. Keep the tracker to status, a concise result, and a
