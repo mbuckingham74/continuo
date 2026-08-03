@@ -1,6 +1,6 @@
 # Gate 3.1 contract — Versioned resolved configuration
 
-**Status:** approved; documentation-only Gate 3 deliverable; awaiting owner implementation review.
+**Status:** owner-approved and published; documentation-only Gate 3 deliverable; implementation is Gate 4 work.
 
 ## Decision
 
@@ -192,6 +192,9 @@ validation, persistence, CLI wiring, run-schema migration, and installed-package
 validation belongs to the explicitly later Gate 4 configuration item. No runtime
 source, test, fixture, run record, provider, target checkout, Git side effect,
 commit, or push changed for this Gate.
+
+Publication evidence: commit `3a1a0f2acd4aa4bd7c048837940feac24c12d5c6`
+(`Define versioned configuration contract`) is on `origin/main`.
 
 Validation on clean synchronized `main` at
 `0790c425aa554d3dccadd86f2c054f5ea7094ea4` confirmed that authoritative local

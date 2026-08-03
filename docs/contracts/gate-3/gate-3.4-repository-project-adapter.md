@@ -1,6 +1,6 @@
 # Gate 3.4 contract — Repository/project adapter
 
-**Status:** approved; documentation-only Gate 3 deliverable; awaiting owner implementation review.
+**Status:** owner-approved and published; documentation-only Gate 3 deliverable; implementation is Gate 4 work.
 
 ## Decision
 
@@ -366,6 +366,9 @@ migration, CLI changes, and installed-package validation belong to the
 explicitly later Gate 4 work. No runtime source, test, fixture, run record,
 provider, target checkout, Git side effect, commit, or push changed for this
 Gate.
+
+Publication evidence: commit `df07d7faf8766e93f63f9219a16b078bb0018090`
+(`Define repository project adapter`) is on `origin/main`.
 
 The approved contract derives from the Gate 3.4 tracker item,
 Milestone 2 repository/project-adapter requirement and exit criteria, current

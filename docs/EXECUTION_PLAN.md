@@ -106,6 +106,9 @@ were demonstrated, not merely that code was written.
 **Goal:** make the current implementation safe enough to serve as the behavioral
 baseline for extraction. No live Jobs pilot occurs in this gate.
 
+**Gate status:** complete. All six bounded items were owner-reviewed and
+published, and their linked evidence demonstrates the Milestone 0 exit criteria.
+
 - [x] **M0.1 / C-1:** parse Git changes using verified NUL-delimited porcelain
   semantics; cover Unicode, spaces, quotes, literal ` -> ` names, and rename/copy
   field ordering.
@@ -163,50 +166,58 @@ renaming control identities.
   - Published contract, implementation evidence, and matrix: [`gate-2/gate-2.7-q7-q8-metric-semantics.md`](contracts/gate-2/gate-2.7-q7-q8-metric-semantics.md).
 - [x] Add versioned machine-readable CLI output, `doctor`, and a genuinely
   read-only dry-run contract.
-  - Contract, adversarial matrix, and implementation evidence: [`gate-2/gate-2.8-machine-cli-doctor-dry-run.md`](contracts/gate-2/gate-2.8-machine-cli-doctor-dry-run.md).
-- [~] Write the event/state architecture ADR without implicitly beginning an
+  - Owner-approved and published contract, adversarial matrix, and implementation evidence: [`gate-2/gate-2.8-machine-cli-doctor-dry-run.md`](contracts/gate-2/gate-2.8-machine-cli-doctor-dry-run.md).
+- [x] Write the event/state architecture ADR without implicitly beginning an
   event-sourced rewrite.
-  - Accepted ADR and adversarial decision matrix: [`gate-2/gate-2.9-event-state-architecture-adr.md`](contracts/gate-2/gate-2.9-event-state-architecture-adr.md).
+  - Owner-approved and published ADR with adversarial decision matrix: [`gate-2/gate-2.9-event-state-architecture-adr.md`](contracts/gate-2/gate-2.9-event-state-architecture-adr.md).
 
 **Exit criteria:** route display changes cannot alter policy; resume uses the
 saved policy and schema; migrations have success and failure-path tests; and all
 control-relevant provider results have durable parsed representations.
+
+**Gate status:** complete. The implementation evidence demonstrates the exit
+criteria, and the repository owner confirmed on 2026-08-03 that every Gate 2
+item is approved.
 
 ## Gate 3 — Define the generic-core contracts
 
 **Goal:** approve the abstractions and trust boundaries before moving code behind
 them. Design may begin during Gate 2, but implementation waits for Gate 2 exit.
 
-- [~] Define a versioned resolved-configuration model and precedence order for
+- [x] Define a versioned resolved-configuration model and precedence order for
   user defaults, project configuration, and explicit run overrides.
-  - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.1-versioned-resolved-configuration.md`](contracts/gate-3/gate-3.1-versioned-resolved-configuration.md).
-- [~] Decide where trusted project configuration lives, who may modify it, how it
+  - Owner-approved and published contract and adversarial matrix; implementation is Gate 4 work: [`gate-3/gate-3.1-versioned-resolved-configuration.md`](contracts/gate-3/gate-3.1-versioned-resolved-configuration.md).
+- [x] Decide where trusted project configuration lives, who may modify it, how it
   is protected from writers, and how its hash invalidates resume.
-  - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.2-trusted-project-configuration.md`](contracts/gate-3/gate-3.2-trusted-project-configuration.md).
-- [~] Define a normalized immutable task envelope: source identity, revision,
+  - Owner-approved and published contract and adversarial matrix; implementation is Gate 4 work: [`gate-3/gate-3.2-trusted-project-configuration.md`](contracts/gate-3/gate-3.2-trusted-project-configuration.md).
+- [x] Define a normalized immutable task envelope: source identity, revision,
   canonical text, checksum, provenance, scope, acceptance criteria, and optional
   verification requests.
-  - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.3-normalized-task-envelope.md`](contracts/gate-3/gate-3.3-normalized-task-envelope.md).
-- [~] Define the repository/project adapter contract: identity, snapshots,
+  - Owner-approved and published contract and adversarial matrix; implementation is Gate 4 work: [`gate-3/gate-3.3-normalized-task-envelope.md`](contracts/gate-3/gate-3.3-normalized-task-envelope.md).
+- [x] Define the repository/project adapter contract: identity, snapshots,
   fingerprints, changes, diffs, allowed paths, branch/remote rules, commit-message
   policy, and approval-gated publication.
-  - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.4-repository-project-adapter.md`](contracts/gate-3/gate-3.4-repository-project-adapter.md).
-- [~] Define the provider adapter and route-profile contracts using the
+  - Owner-approved and published contract and adversarial matrix; implementation is Gate 4 work: [`gate-3/gate-3.4-repository-project-adapter.md`](contracts/gate-3/gate-3.4-repository-project-adapter.md).
+- [x] Define the provider adapter and route-profile contracts using the
   provider-attempt lifecycle established in M0.2–M0.4.
-  - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.5-provider-adapter-route-profile.md`](contracts/gate-3/gate-3.5-provider-adapter-route-profile.md).
-- [~] Define machine-checkable capability profiles and permission ceilings for
+  - Owner-approved and published contract and adversarial matrix; implementation is Gate 4 work: [`gate-3/gate-3.5-provider-adapter-route-profile.md`](contracts/gate-3/gate-3.5-provider-adapter-route-profile.md).
+- [x] Define machine-checkable capability profiles and permission ceilings for
   every orchestration role.
-  - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.6-capability-profiles-permission-ceilings.md`](contracts/gate-3/gate-3.6-capability-profiles-permission-ceilings.md).
-- [~] Define deterministic verification result/finding contracts and their
+  - Owner-approved and published contract and adversarial matrix; implementation is Gate 4 work: [`gate-3/gate-3.6-capability-profiles-permission-ceilings.md`](contracts/gate-3/gate-3.6-capability-profiles-permission-ceilings.md).
+- [x] Define deterministic verification result/finding contracts and their
   correction-budget semantics.
-  - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.7-deterministic-verification-findings.md`](contracts/gate-3/gate-3.7-deterministic-verification-findings.md).
-- [~] Write the compatibility matrix for old and new CLI, environment, package,
+  - Owner-approved and published contract and adversarial matrix; implementation is Gate 4 and Milestone 3 work: [`gate-3/gate-3.7-deterministic-verification-findings.md`](contracts/gate-3/gate-3.7-deterministic-verification-findings.md).
+- [x] Write the compatibility matrix for old and new CLI, environment, package,
   import, configuration, and persisted-state identifiers.
-  - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.8-generic-engine-compatibility-matrix.md`](contracts/gate-3/gate-3.8-generic-engine-compatibility-matrix.md).
+  - Owner-approved and published contract and adversarial matrix; implementation is Gate 4 work: [`gate-3/gate-3.8-generic-engine-compatibility-matrix.md`](contracts/gate-3/gate-3.8-generic-engine-compatibility-matrix.md).
 
 **Exit criteria:** contracts, trust boundaries, migration behavior, and failure
 policies are documented and adversarially reviewed; no interface relies on a
 model or project display name for control flow.
+
+**Gate status:** complete as a documentation-only contract-definition gate.
+All linked Gate 1–3 contracts are owner-approved and their gates are complete.
+This prerequisite status does not itself begin Gate 4 implementation.
 
 ## Gate 4 — Extract the generic engine (roadmap Milestone 2)
 

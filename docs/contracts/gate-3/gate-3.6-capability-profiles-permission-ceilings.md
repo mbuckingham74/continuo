@@ -1,6 +1,6 @@
 # Gate 3.6 contract — Capability profiles and permission ceilings
 
-**Status:** approved; documentation-only Gate 3 deliverable; awaiting owner implementation review.
+**Status:** owner-approved and published; documentation-only Gate 3 deliverable; implementation is Gate 4 work.
 
 ## Decision
 
@@ -259,6 +259,9 @@ persistence, migration, CLI wiring, and installed-package validation (with
 `UV_NO_EDITABLE=1` on macOS) belongs to the explicitly later Gate 4 work. No
 runtime source, test, fixture, run record, provider, target checkout, Git side
 effect, commit, or push changed for this Gate.
+
+Publication evidence: commit `4bb8189a2485ea185dd476060618fa3310105334`
+(`Define capability profiles and permission ceilings`) is on `origin/main`.
 
 Validation on clean synchronized `main` at
 `b10f0b66831143721dcfb48df1661e56a1580dfb` confirmed that authoritative local

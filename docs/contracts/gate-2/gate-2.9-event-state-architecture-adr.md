@@ -1,6 +1,6 @@
 # Gate 2.9 ADR — Transactional state with append-only audit events
 
-**Status:** accepted; awaiting final review and publication.
+**Status:** accepted, owner-approved, and published; documentation-only ADR.
 
 ## Decision summary
 
@@ -225,7 +225,9 @@ no runtime change.
 
 This accepted ADR is a documentation-only decision based on clean synchronized
 `main` at `2b63ac8370d902528c03d183487861ab7e6336ac`. No implementation or test
-count is claimed. The architecture was approved on 2026-08-03.
+count is claimed. The architecture was approved on 2026-08-03 and published on
+`origin/main` as commit `0790c425aa554d3dccadd86f2c054f5ea7094ea4`
+(`Record event state architecture decision`).
 
 - Relative Markdown links validated.
 - All 18 `G29-*` matrix IDs are unique.

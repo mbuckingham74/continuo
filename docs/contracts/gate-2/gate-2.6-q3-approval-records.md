@@ -6,7 +6,7 @@
 
 ## Planning evidence
 
-- Planning evidence (2026-08-02): this draft is derived from roadmap [Q-3](../../ENGINE_ROADMAP.md#q-3--approvals-not-recorded), Milestone 1 item 5 and exit criteria, the later [E-3 approval boundary](../../ENGINE_ROADMAP.md#e-3--asynchronous-approval-gates), and the current `PolicyDecision`, `_policy_stop()`, `approve_policy()`, `_approval_gates()`, `_resume_guard()`, coordination, persistence, migration, CLI, report, and deterministic-test paths. Baseline: clean `main` aligned with `origin/main` at `c828ff4fb690c6c100b2efdfbb6cb1df42d7ae41`.
+- Planning evidence (2026-08-02): this draft is derived from roadmap [Q-3](../../ENGINE_ROADMAP.md#5-quick-hit-triage), Milestone 1 item 5 and exit criteria, the later [E-3 approval boundary](../../ENGINE_ROADMAP.md#e-3--asynchronous-approval-gates), and the current `PolicyDecision`, `_policy_stop()`, `approve_policy()`, `_approval_gates()`, `_resume_guard()`, coordination, persistence, migration, CLI, report, and deterministic-test paths. Baseline: clean `main` aligned with `origin/main` at `c828ff4fb690c6c100b2efdfbb6cb1df42d7ae41`.
 - Documentation-only validation (2026-08-02): all referenced local Markdown file targets resolve, all 34 `G26-*` matrix IDs are unique, and `git diff --check` passes. No runtime source, test, fixture, run record, provider, target checkout, Git side effect, commit, push, or later Gate 2 item changes in this planning diff.
 
 ## Status and boundary

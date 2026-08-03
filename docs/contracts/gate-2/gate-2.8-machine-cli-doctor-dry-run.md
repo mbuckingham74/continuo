@@ -1,6 +1,6 @@
 # Gate 2.8 — Versioned machine CLI output, doctor, and read-only dry-run
 
-**Status:** implemented; awaiting review.
+**Status:** owner-approved, implemented, and published.
 
 ## Purpose and bounded scope
 
@@ -200,3 +200,8 @@ only. No live provider or Jobs checkout was invoked.
   plus `doctor`.
 - Markdown links, unique matrix IDs, and `git diff --check` were revalidated
   after implementation.
+- Publication evidence: commit
+  `2b63ac8370d902528c03d183487861ab7e6336ac` (`Add versioned CLI diagnostics
+  and dry-run`) is on `origin/main`.
+- Owner decision (2026-08-03): the repository owner confirmed Gate 2.8 and all
+  other Gate 2 items are approved. Gate 2.8 and Gate 2 are complete.

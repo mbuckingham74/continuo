@@ -1,6 +1,6 @@
 # Gate 3.2 contract — Trusted project configuration
 
-**Status:** approved; documentation-only Gate 3 deliverable; awaiting owner implementation review.
+**Status:** owner-approved and published; documentation-only Gate 3 deliverable; implementation is Gate 4 work.
 
 ## Decision
 
@@ -196,6 +196,9 @@ resume guard, schema migration, CLI wiring, and installed-package validation
 belong to the explicitly later Gate 4 configuration item. No runtime source,
 test, fixture, run record, provider, target checkout, Git side effect, commit,
 or push changed for this Gate.
+
+Publication evidence: commit `981813befbd30017797336f9ff485fefd95cba94`
+(`Define trusted project configuration`) is on `origin/main`.
 
 The approved contract derives from the Gate 3.2 tracker item,
 Milestone 2 configuration/hash/resume exit criteria, Gate 3.1, current

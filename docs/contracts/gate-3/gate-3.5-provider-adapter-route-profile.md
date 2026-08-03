@@ -1,6 +1,6 @@
 # Gate 3.5 contract — Provider adapters and route profiles
 
-**Status:** approved; documentation-only Gate 3 deliverable; awaiting owner implementation review.
+**Status:** owner-approved and published; documentation-only Gate 3 deliverable; implementation is Gate 4 work.
 
 ## Decision
 
@@ -430,6 +430,9 @@ supervisor changes, schema migration, CLI changes, and installed-package
 validation belong to the explicitly later Gate 4 work. No runtime source, test,
 fixture, run record, provider, target checkout, Git side effect, commit, or push
 changed for this Gate.
+
+Publication evidence: commit `b10f0b66831143721dcfb48df1661e56a1580dfb`
+(`Define provider adapter route profiles`) is on `origin/main`.
 
 The approved contract derives from the Gate 3.5 tracker item,
 Milestone 2 provider-adapter/catalog/routing requirements and exit criteria,

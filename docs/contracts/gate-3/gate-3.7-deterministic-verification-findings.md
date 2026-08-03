@@ -1,6 +1,6 @@
 # Gate 3.7 contract — Deterministic verification results and findings
 
-**Status:** approved; documentation-only Gate 3 deliverable; awaiting owner implementation review.
+**Status:** owner-approved and published; documentation-only Gate 3 deliverable; implementation is later Gate 4 and Milestone 3 work.
 
 ## Decision
 
@@ -293,6 +293,9 @@ installed-package validation (with `UV_NO_EDITABLE=1` on macOS) belongs to the
 explicitly later Gate 4 and Milestone 3 work. No runtime source, test, fixture,
 run record, provider, target checkout, Git side effect, commit, or push changed
 for this Gate.
+
+Publication evidence: commit `a3fc8ed79c1c4769d19b6342f7a7a97c3a21c77f`
+(`Define deterministic verification findings`) is on `origin/main`.
 
 Validation on clean synchronized `main` at
 `4bb8189a2485ea185dd476060618fa3310105334` confirmed that authoritative local

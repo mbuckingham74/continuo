@@ -1,6 +1,6 @@
 # Gate 3.8 contract — Generic-engine compatibility matrix
 
-**Status:** approved; documentation-only Gate 3 deliverable; awaiting owner implementation review.
+**Status:** owner-approved and published; documentation-only Gate 3 deliverable; implementation is Gate 4 work.
 
 ## Decision
 
@@ -243,6 +243,9 @@ and installed-package validation (with `UV_NO_EDITABLE=1` on macOS) belong to
 the explicitly later Gate 4 work. No runtime source, test, fixture, run record,
 provider, target checkout, Git side effect, commit, or push changed for this
 Gate.
+
+Publication evidence: commit `4b0746cb98e1db24c8ebad74edda57e7d97d26d1`
+(`Define generic engine compatibility matrix`) is on `origin/main`.
 
 Validation on clean synchronized `main` at
 `a3fc8ed79c1c4769d19b6342f7a7a97c3a21c77f` confirmed that authoritative local

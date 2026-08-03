@@ -1,6 +1,6 @@
 # Gate 3.3 contract — Immutable normalized task envelope
 
-**Status:** approved; documentation-only Gate 3 deliverable; awaiting owner implementation review.
+**Status:** owner-approved and published; documentation-only Gate 3 deliverable; implementation is Gate 4 work.
 
 ## Decision
 
@@ -280,6 +280,9 @@ prompt wiring, persisted envelope fields, schema migration, CLI/dry-run changes,
 and installed-package validation belong to the explicitly later Gate 4 work.
 No runtime source, test, fixture, run record, provider, target checkout, Git
 side effect, commit, or push changed for this Gate.
+
+Publication evidence: commit `21fbd4fbf1afa4266765c08bc368bf1f509c91d3`
+(`Define normalized task envelope`) is on `origin/main`.
 
 The approved contract derives from the Gate 3.3 tracker item,
 Milestone 2 task-adapter/envelope/acceptance-criteria requirements and exit
