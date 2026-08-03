@@ -200,8 +200,9 @@ them. Design may begin during Gate 2, but implementation waits for Gate 2 exit.
 - [~] Define deterministic verification result/finding contracts and their
   correction-budget semantics.
   - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.7-deterministic-verification-findings.md`](contracts/gate-3/gate-3.7-deterministic-verification-findings.md).
-- [ ] Write the compatibility matrix for old and new CLI, environment, package,
+- [~] Write the compatibility matrix for old and new CLI, environment, package,
   import, configuration, and persisted-state identifiers.
+  - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.8-generic-engine-compatibility-matrix.md`](contracts/gate-3/gate-3.8-generic-engine-compatibility-matrix.md).
 
 **Exit criteria:** contracts, trust boundaries, migration behavior, and failure
 policies are documented and adversarially reviewed; no interface relies on a
