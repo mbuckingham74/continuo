@@ -18,6 +18,7 @@ import orchestrator
 import providers
 import run_migrations
 import typer
+from typer.testing import CliRunner
 from models import (
     ADVERSARIAL_REVIEW_ROUTE,
     IMPLEMENTATION_ROUTE,
@@ -5290,6 +5291,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
             "report",
             "migrate-run",
             "status",
+            "doctor",
         ):
             self.assertIn(expected, command_names)
         shim = Path(__file__).parent / "src" / "jobs_orchestrator" / "__init__.py"
@@ -5304,14 +5306,11 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
         for excluded in (
             "bulk-migrate",
             "--force",
-            "doctor",
-            "dry-run",
             "model_catalog",
             "route_override",
             "capability_discovery",
             "eventsourcing",
             "telemetry",
-            "versioned_json",
             "resolved_policy",
             "logical_calls",
         ):
@@ -6010,6 +6009,157 @@ Diff:
         self.assertEqual(execution.capability, "workspace_write")
         self.assertFalse(execution.attempts[0].retry_scheduled)
         self.assertEqual(sleep_calls, [])
+
+
+class Gate28CliContractTests(unittest.TestCase):
+    """Gate 2.8 matrix: versioned machine output and non-mutating diagnostics."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temp.name) / "jobs"
+        self.repo.mkdir()
+        git(self.repo, "init", "-b", "main")
+        git(self.repo, "config", "user.email", "tests@example.invalid")
+        git(self.repo, "config", "user.name", "Gate 2.8 Tests")
+        git(self.repo, "remote", "add", "origin", "https://example.invalid/jobs.git")
+        (self.repo / "tasks").mkdir()
+        (self.repo / "tasks/009-example.md").write_text("Implement the example task.\n")
+        (self.repo / "README.md").write_text("fixture\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "fixture")
+        self.runs = Path(self.temp.name) / "runs"
+        self.runner = CliRunner()
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def invoke(self, *arguments: str):
+        with patch.object(orchestrator, "RUNS", self.runs):
+            return self.runner.invoke(orchestrator.app, list(arguments))
+
+    @staticmethod
+    def snapshot_tree(root: Path):
+        if not root.exists():
+            return None
+        result = []
+        for path in [root, *sorted(root.rglob("*"))]:
+            state = path.lstat()
+            content = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+            result.append((str(path.relative_to(root)) if path != root else ".", state.st_mode, state.st_mtime_ns, content))
+        return result
+
+    def test_json_envelope_is_single_parseable_public_object(self) -> None:
+        result = self.invoke("run", "009", "--repo", str(self.repo), "--dry-run", "--json")
+        self.assertEqual(result.exit_code, 0, result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["contract_version"], "continuo.cli.v1")
+        self.assertEqual(payload["command"], "run")
+        self.assertTrue(payload["ok"])
+        self.assertIsNone(payload["error"])
+        self.assertEqual(payload["result"]["plan_version"], "continuo.run-plan.v1")
+        self.assertNotIn("specification", payload["result"])
+
+    def test_json_failure_is_not_mixed_with_rich_output(self) -> None:
+        result = self.invoke("run", "missing", "--repo", str(self.repo), "--dry-run", "--json")
+        self.assertEqual(result.exit_code, 1)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIsNone(payload["result"])
+        self.assertEqual(payload["error"]["code"], "not_found")
+
+    def test_unknown_json_contract_version_fails_closed(self) -> None:
+        result = self.invoke(
+            "run",
+            "009",
+            "--repo",
+            str(self.repo),
+            "--dry-run",
+            "--json",
+            "--json-version",
+            "continuo.cli.v99",
+        )
+        self.assertEqual(result.exit_code, 1)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["code"], "invalid_input")
+
+    def test_dry_run_is_deterministic_and_does_not_enter_mutating_helpers(self) -> None:
+        before_repo = self.snapshot_tree(self.repo)
+        before_runs = self.snapshot_tree(self.runs)
+        with patch.object(orchestrator, "persist", side_effect=AssertionError("persist called")), patch.object(
+            orchestrator.TargetCoordinator, "__init__", side_effect=AssertionError("target lock called")
+        ), patch.object(orchestrator, "_prepare_private_storage", side_effect=AssertionError("storage repair called")), patch.object(
+            orchestrator, "execute_sonnet_review", side_effect=AssertionError("provider called")
+        ), patch.object(orchestrator, "execute_terra_resolution", side_effect=AssertionError("provider called")), patch.object(
+            orchestrator, "execute_sol_escalation", side_effect=AssertionError("provider called")), patch.object(
+            orchestrator, "execute_luna_implementation", side_effect=AssertionError("provider called")):
+            first = self.invoke("run", "009", "--repo", str(self.repo), "--dry-run", "--json")
+            second = self.invoke("run", "009", "--repo", str(self.repo), "--dry-run", "--json")
+        self.assertEqual(first.exit_code, 0, first.stdout)
+        self.assertEqual(second.exit_code, 0, second.stdout)
+        self.assertEqual(first.stdout, second.stdout)
+        self.assertEqual(self.snapshot_tree(self.repo), before_repo)
+        self.assertEqual(self.snapshot_tree(self.runs), before_runs)
+
+    def test_dry_run_failure_does_not_create_or_harden_storage(self) -> None:
+        self.runs.mkdir(mode=0o755)
+        before_runs = self.snapshot_tree(self.runs)
+        result = self.invoke("run", "missing", "--repo", str(self.repo), "--dry-run", "--json")
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.snapshot_tree(self.runs), before_runs)
+
+    def test_doctor_is_local_only_and_redacts_authentication_diagnostics(self) -> None:
+        before_repo = self.snapshot_tree(self.repo)
+        before_runs = self.snapshot_tree(self.runs)
+        with patch.object(orchestrator.shutil, "which", return_value="/fixture/bin"), patch.object(
+            orchestrator, "execute_sonnet_review", side_effect=AssertionError("provider called")
+        ), patch.object(orchestrator, "execute_terra_resolution", side_effect=AssertionError("provider called")), patch.object(
+            orchestrator, "execute_sol_escalation", side_effect=AssertionError("provider called")), patch.object(
+            orchestrator, "execute_luna_implementation", side_effect=AssertionError("provider called")):
+            result = self.invoke("doctor", "--repo", str(self.repo), "--json")
+        self.assertEqual(result.exit_code, 0, result.stdout)
+        payload = json.loads(result.stdout)
+        checks = {check["id"]: check for check in payload["result"]["checks"]}
+        self.assertEqual(checks["provider_auth"]["status"], "unknown")
+        self.assertNotIn("SECRET_TOKEN", result.stdout)
+        self.assertEqual(self.snapshot_tree(self.repo), before_repo)
+        self.assertEqual(self.snapshot_tree(self.runs), before_runs)
+
+    def test_doctor_reports_unsafe_storage_without_repairing_it(self) -> None:
+        self.runs.mkdir(mode=0o755)
+        before = self.snapshot_tree(self.runs)
+        with patch.object(orchestrator.shutil, "which", return_value="/fixture/bin"):
+            result = self.invoke("doctor", "--repo", str(self.repo), "--json")
+        self.assertEqual(result.exit_code, 1)
+        payload = json.loads(result.stdout)
+        checks = {check["id"]: check for check in payload["result"]["checks"]}
+        self.assertEqual(checks["run_storage"]["code"], "storage_unsafe")
+        self.assertEqual(self.snapshot_tree(self.runs), before)
+
+    def test_interactive_mutations_fail_closed_in_json_mode(self) -> None:
+        for command in (("approve-policy", "missing", "--json"), ("migrate-run", "missing", "--json")):
+            with self.subTest(command=command[0]):
+                result = self.invoke(*command)
+                self.assertEqual(result.exit_code, 1)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["error"]["code"], "interactive_confirmation_required")
+
+    def test_every_public_command_advertises_json(self) -> None:
+        command_arguments = {
+            "run": (),
+            "resume": (),
+            "recover-writer": (),
+            "release-target": (),
+            "approve-policy": (),
+            "report": (),
+            "migrate-run": (),
+            "status": (),
+            "doctor": (),
+        }
+        for command, arguments in command_arguments.items():
+            with self.subTest(command=command):
+                result = self.invoke(command, *arguments, "--help")
+                self.assertEqual(result.exit_code, 0, result.stdout)
+                self.assertIn("--json", result.stdout)
 
 
 @unittest.skipUnless(os.name == "posix", "real process-group tests require POSIX")

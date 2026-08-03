@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import os
 import re
+import shutil
 import sqlite3
 import stat as stat_module
 import subprocess
@@ -159,6 +161,52 @@ def repo_state(repo: Path) -> RepoState:
     )
 
 
+def _read_only_git_text(repo: Path, *args: str) -> str:
+    """Run a Git query with optional index locks disabled for diagnostic paths."""
+
+    environment = os.environ.copy()
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise ControllerError(f"git {' '.join(args)} failed: {detail}")
+    return result.stdout.strip()
+
+
+def read_only_repo_state(repo: Path) -> RepoState:
+    """Inspect repository state without allowing Git's optional index refresh."""
+
+    if not repo.exists() or not repo.is_dir():
+        raise ControllerError(f"jobs repo does not exist: {repo}")
+    root = Path(_read_only_git_text(repo, "rev-parse", "--show-toplevel")).resolve()
+    if root != repo.resolve():
+        raise ControllerError(f"configured jobs repo is not the Git root: {repo}")
+    branch = _read_only_git_text(repo, "branch", "--show-current")
+    if not branch:
+        raise ControllerError("jobs repo must be on a named branch; detached HEAD is unsafe")
+    origin = _read_only_git_text(repo, "remote", "get-url", "origin")
+    return RepoState(
+        repo=str(repo),
+        branch=branch,
+        head=_read_only_git_text(repo, "rev-parse", "HEAD"),
+        clean=not bool(
+            _read_only_git_text(
+                repo,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            )
+        ),
+        origin=origin,
+    )
+
+
 class TargetIdentity(NamedTuple):
     target_key: str
     canonical_repo: str
@@ -193,6 +241,178 @@ def resolve_task(repo: Path, task_ref: str) -> tuple[str, Path, str]:
     path = matches[0]
     content = path.read_text(encoding="utf-8")
     return str(path.relative_to(repo)), path, content
+
+
+CLI_CONTRACT_VERSION = "continuo.cli.v1"
+RUN_PLAN_VERSION = "continuo.run-plan.v1"
+DOCTOR_VERSION = "continuo.doctor.v1"
+
+_PLANNED_STAGES = (
+    ("created", "controller"),
+    ("spec_reviewing", "provider_read_only"),
+    ("spec_review_passed", "controller"),
+    ("implementing", "provider_workspace_write"),
+    ("implementation_completed", "controller"),
+    ("verifying", "controller"),
+    ("reviewing", "provider_read_only"),
+    ("correction_pending", "controller"),
+    ("awaiting_commit_approval", "human_approval"),
+    ("awaiting_push_approval", "human_approval"),
+)
+
+
+def _read_only_storage_status(runs_dir: Path) -> dict[str, str]:
+    storage = _absolute_path(runs_dir)
+    state = _lstat(storage)
+    if state is None:
+        return {"status": "warn", "code": "storage_missing", "summary": "Run storage does not exist and was not created."}
+    if (
+        stat_module.S_ISDIR(state.st_mode)
+        and state.st_uid == os.geteuid()
+        and stat_module.S_IMODE(state.st_mode) == _PRIVATE_DIRECTORY_MODE
+    ):
+        return {"status": "pass", "code": "storage_private", "summary": "Run storage is private."}
+    return {"status": "fail", "code": "storage_unsafe", "summary": "Run storage is not a private owner-controlled directory."}
+
+
+def build_dry_run_plan(
+    repo: Path,
+    task_ref: str,
+    runs_dir: Path = RUNS,
+) -> dict[str, object]:
+    """Read deterministic pre-provider inputs without creating controller state."""
+
+    state = read_only_repo_state(repo)
+    if not state.clean:
+        raise ControllerError("jobs repo must be clean before starting")
+    storage = _read_only_storage_status(runs_dir)
+    if storage["status"] == "fail":
+        raise ControllerError("private storage is unsafe for a dry-run plan")
+    relative, _, specification = resolve_task(repo, task_ref)
+    return {
+        "plan_version": RUN_PLAN_VERSION,
+        "task": {
+            "ref": task_ref,
+            "path": relative,
+            "sha256": hashlib.sha256(specification.encode()).hexdigest(),
+        },
+        "repository": {
+            "path": state.repo,
+            "branch": state.branch,
+            "head": state.head,
+            "origin": state.origin,
+            "clean": state.clean,
+        },
+        "planned_stages": [
+            {"id": stage, "authority": authority}
+            for stage, authority in _PLANNED_STAGES
+        ],
+        "run_storage": storage,
+    }
+
+
+def _doctor_check(
+    check_id: str,
+    status: str,
+    code: str,
+    summary: str,
+) -> dict[str, str]:
+    return {"id": check_id, "status": status, "code": code, "summary": summary}
+
+
+def doctor_report(repo: Path, runs_dir: Path = RUNS) -> dict[str, object]:
+    """Return local readiness evidence without repairing or invoking providers."""
+
+    checks: list[dict[str, str]] = []
+    git_binary = shutil.which("git")
+    checks.append(
+        _doctor_check(
+            "git_binary",
+            "pass" if git_binary else "fail",
+            "git_available" if git_binary else "git_missing",
+            "Git executable is available." if git_binary else "Git executable is not on PATH.",
+        )
+    )
+    state: RepoState | None = None
+    if git_binary:
+        try:
+            state = read_only_repo_state(repo)
+        except (ControllerError, OSError, subprocess.SubprocessError) as exc:
+            checks.append(
+                _doctor_check(
+                    "target_repository",
+                    "fail",
+                    "target_invalid",
+                    f"Configured target cannot be inspected: {type(exc).__name__}.",
+                )
+            )
+            checks.append(
+                _doctor_check("target_state", "unknown", "target_unavailable", "Target state is unavailable.")
+            )
+        else:
+            checks.append(
+                _doctor_check("target_repository", "pass", "target_valid", "Configured target is a Git root.")
+            )
+            checks.append(
+                _doctor_check(
+                    "target_state",
+                    "pass" if state.clean else "fail",
+                    "target_clean" if state.clean else "target_dirty",
+                    "Target worktree is clean." if state.clean else "Target worktree has changes.",
+                )
+            )
+    else:
+        checks.extend(
+            (
+                _doctor_check("target_repository", "unknown", "git_unavailable", "Target repository was not inspected."),
+                _doctor_check("target_state", "unknown", "git_unavailable", "Target state was not inspected."),
+            )
+        )
+
+    storage = _read_only_storage_status(runs_dir)
+    checks.append(_doctor_check("run_storage", storage["status"], storage["code"], storage["summary"]))
+
+    required_binaries = {
+        "claude": "claude",
+        "codex": "codex",
+    }
+    missing = sorted(name for name, binary in required_binaries.items() if not shutil.which(binary))
+    checks.append(
+        _doctor_check(
+            "provider_binaries",
+            "pass" if not missing else "fail",
+            "provider_binaries_available" if not missing else "provider_binary_missing",
+            "Configured provider binaries are discoverable." if not missing else "Configured provider binary is not on PATH.",
+        )
+    )
+    checks.append(
+        _doctor_check(
+            "provider_auth",
+            "unknown",
+            "auth_probe_unavailable",
+            "No side-effect-free local provider authentication probe is configured.",
+        )
+    )
+    adapter_binaries = {"claude_cli": "claude", "codex_cli": "codex"}
+    route_valid = all(
+        route.provider_adapter_id in adapter_binaries
+        and route.role_id in OPERATION_ROLES.values()
+        and shutil.which(adapter_binaries[route.provider_adapter_id]) is not None
+        for route in ROUTE_IDENTITIES.values()
+    )
+    checks.append(
+        _doctor_check(
+            "route_capabilities",
+            "pass" if route_valid else "fail",
+            "route_capabilities_valid" if route_valid else "route_capabilities_invalid",
+            "Compiled route capabilities are coherent." if route_valid else "Compiled route capabilities are incoherent.",
+        )
+    )
+    return {
+        "doctor_version": DOCTOR_VERSION,
+        "repository": {"path": state.repo} if state is not None else None,
+        "checks": checks,
+    }
 
 
 _PORCELAIN_V1_STATUS_BYTES = frozenset(b" MADRCUT?!X")
@@ -3632,10 +3852,107 @@ class Controller:
         raise ControllerError(f"unsupported recoverable provider stage: {run.stage}")
 
 
-def _handle_error(action: Callable[[], object]) -> None:
+def _run_read_result(run: WorkflowRun) -> dict[str, object]:
+    return {
+        "run_id": run.run_id,
+        "stage": run.stage,
+        "task_ref": run.task_ref,
+        "task_file": run.task_file,
+        "schema_version": run.schema_version,
+    }
+
+
+def _classification_read_result(classification: RecordClassification) -> dict[str, object]:
+    return {
+        "run_id": classification.run_id,
+        "schema_version": classification.schema_version,
+        "record_state": classification.record_state,
+        "reason_code": classification.reason_code,
+        "task_ref": classification.task_ref,
+        "stage": classification.stage,
+    }
+
+
+def _emit_json(
+    command: str,
+    *,
+    result: dict[str, object] | None = None,
+    error: dict[str, str] | None = None,
+) -> None:
+    typer.echo(
+        json.dumps(
+            {
+                "contract_version": CLI_CONTRACT_VERSION,
+                "command": command,
+                "ok": error is None,
+                "result": result,
+                "error": error,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
+def _require_json_version(
+    command: str,
+    json_output: bool,
+    json_version: str | None,
+) -> None:
+    if json_version is None:
+        return
+    if json_output and json_version == CLI_CONTRACT_VERSION:
+        return
+    if json_output:
+        _emit_json(
+            command,
+            error={
+                "code": "invalid_input",
+                "message": "--json-version must be continuo.cli.v1",
+            },
+        )
+    else:
+        console.print("[red]BLOCKED:[/red] --json-version requires --json and continuo.cli.v1")
+    raise typer.Exit(1)
+
+
+def _error_code(exc: Exception) -> str:
+    message = str(exc).lower()
+    if "task-ref" in message or "single safe identifier" in message:
+        return "invalid_input"
+    if "no task specification matches" in message:
+        return "not_found"
+    if "unknown run" in message:
+        return "not_found"
+    if "storage" in message or "private" in message:
+        return "storage_unsafe"
+    if "migration" in message or "run state is invalid" in message:
+        return "record_not_current"
+    if "git" in message:
+        return "git_unavailable"
+    if "repo" in message or "repository" in message or "task" in message:
+        return "target_invalid"
+    return "precondition_failed"
+
+
+def _handle_error(
+    action: Callable[[], object],
+    *,
+    command: str | None = None,
+    json_output: bool = False,
+) -> object | None:
     try:
-        action()
+        if json_output:
+            with console.capture():
+                return action()
+        return action()
     except (ControllerError, OSError, subprocess.SubprocessError) as exc:
+        if json_output and command is not None:
+            _emit_json(
+                command,
+                error={"code": _error_code(exc), "message": str(exc)},
+            )
+            raise typer.Exit(1) from exc
         console.print(f"[red]BLOCKED:[/red] {exc}")
         raise typer.Exit(1) from exc
 
@@ -3644,27 +3961,60 @@ def _handle_error(action: Callable[[], object]) -> None:
 def run_task(
     task_ref: str = typer.Argument(..., help="Task identifier resolved as tasks/<task-ref>-*.md."),
     repo: Path | None = typer.Option(None, "--repo", help="Override the jobs repository path."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Validate and print a read-only execution plan."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the versioned machine-readable response."),
+    json_version: str | None = typer.Option(None, "--json-version", help="Require a supported machine-output contract version."),
 ) -> None:
     """Run orchestration through review, correction, and human approval gates."""
 
-    def action() -> None:
-        result = Controller(configured_repo(repo)).new_run(task_ref)
-        console.print(f"Run {result.run_id}: {result.stage}")
-    _handle_error(action)
+    _require_json_version("run", json_output, json_version)
+    target = configured_repo(repo)
+    if dry_run:
+        result = _handle_error(
+            lambda: build_dry_run_plan(target, task_ref, RUNS),
+            command="run",
+            json_output=json_output,
+        )
+        if result is not None:
+            if json_output:
+                _emit_json("run", result=result)
+            else:
+                console.print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    result = _handle_error(
+        lambda: Controller(target).new_run(task_ref),
+        command="run",
+        json_output=json_output,
+    )
+    if isinstance(result, WorkflowRun):
+        if json_output:
+            _emit_json("run", result=_run_read_result(result))
+        else:
+            console.print(f"Run {result.run_id}: {result.stage}")
 
 
 @app.command()
 def resume(
     run_id: str = typer.Argument(..., help="Saved run id."),
     repo: Path | None = typer.Option(None, "--repo", help="Override the jobs repository path."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the versioned machine-readable response."),
+    json_version: str | None = typer.Option(None, "--json-version", help="Require a supported machine-output contract version."),
 ) -> None:
     """Safely continue a saved run without repeating completed provider stages."""
 
-    def action() -> None:
+    _require_json_version("resume", json_output, json_version)
+
+    def action() -> WorkflowRun:
         saved = load_run(run_id)
-        result = Controller(configured_repo(repo) if repo else Path(saved.repo.repo)).resume(run_id)
-        console.print(f"Run {result.run_id}: {result.stage}")
-    _handle_error(action)
+        return Controller(configured_repo(repo) if repo else Path(saved.repo.repo)).resume(run_id)
+
+    result = _handle_error(action, command="resume", json_output=json_output)
+    if isinstance(result, WorkflowRun):
+        if json_output:
+            _emit_json("resume", result=_run_read_result(result))
+        else:
+            console.print(f"Run {result.run_id}: {result.stage}")
 
 
 @app.command("recover-writer")
@@ -3685,10 +4035,14 @@ def recover_writer_command(
         "--repo",
         help="Override the jobs repository path.",
     ),
+    json_output: bool = typer.Option(False, "--json", help="Emit the versioned machine-readable response."),
+    json_version: str | None = typer.Option(None, "--json-version", help="Require a supported machine-output contract version."),
 ) -> None:
     """Explicitly recover a blocked workspace-writing provider attempt."""
 
-    def recover() -> None:
+    _require_json_version("recover-writer", json_output, json_version)
+
+    def recover() -> WorkflowRun:
         actions: dict[str, WriterRecoveryAction] = {
             "retry-restored": "retry_restored",
             "adopt-current": "adopt_current",
@@ -3701,10 +4055,14 @@ def recover_writer_command(
         controller = Controller(
             configured_repo(repo) if repo else Path(saved.repo.repo)
         )
-        result = controller.recover_writer(run_id, actions[action], note)
-        console.print(f"Run {result.run_id}: {result.stage}")
+        return controller.recover_writer(run_id, actions[action], note)
 
-    _handle_error(recover)
+    result = _handle_error(recover, command="recover-writer", json_output=json_output)
+    if isinstance(result, WorkflowRun):
+        if json_output:
+            _emit_json("recover-writer", result=_run_read_result(result))
+        else:
+            console.print(f"Run {result.run_id}: {result.stage}")
 
 
 @app.command("release-target")
@@ -3720,21 +4078,29 @@ def release_target_command(
         "--repo",
         help="Override the jobs repository path.",
     ),
+    json_output: bool = typer.Option(False, "--json", help="Emit the versioned machine-readable response."),
+    json_version: str | None = typer.Option(None, "--json-version", help="Require a supported machine-output contract version."),
 ) -> None:
     """Release a clean target from a deliberately abandoned run."""
 
-    def release() -> None:
+    _require_json_version("release-target", json_output, json_version)
+
+    def release() -> WorkflowRun:
         saved = load_run(run_id)
         controller = Controller(
             configured_repo(repo) if repo else Path(saved.repo.repo)
         )
-        result = controller.release_target(run_id, note)
-        console.print(
-            f"Run {result.run_id}: target released; workflow remains "
-            f"{result.stage}."
-        )
+        return controller.release_target(run_id, note)
 
-    _handle_error(release)
+    result = _handle_error(release, command="release-target", json_output=json_output)
+    if isinstance(result, WorkflowRun):
+        if json_output:
+            _emit_json("release-target", result=_run_read_result(result))
+        else:
+            console.print(
+                f"Run {result.run_id}: target released; workflow remains "
+                f"{result.stage}."
+            )
 
 
 @app.command("approve-policy")
@@ -3746,8 +4112,21 @@ def approve_policy_command(
         help="Exact approved policy text. If omitted, use Terra's quoted proposal.",
     ),
     repo: Path | None = typer.Option(None, "--repo", help="Override the jobs repository path."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the versioned machine-readable response."),
+    json_version: str | None = typer.Option(None, "--json-version", help="Require a supported machine-output contract version."),
 ) -> None:
     """Record a human-approved Terra clarification without invoking providers."""
+
+    _require_json_version("approve-policy", json_output, json_version)
+    if json_output:
+        _emit_json(
+            "approve-policy",
+            error={
+                "code": "interactive_confirmation_required",
+                "message": "approve-policy requires an interactive human confirmation",
+            },
+        )
+        raise typer.Exit(1)
 
     def action() -> None:
         saved = load_run(run_id)
@@ -3800,48 +4179,80 @@ def approve_policy_command(
 @app.command()
 def report(
     run_id: str = typer.Argument(..., help="Saved run id."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the versioned machine-readable response."),
+    json_version: str | None = typer.Option(None, "--json-version", help="Require a supported machine-output contract version."),
 ) -> None:
     """Show a concise orchestration audit and timing report."""
 
-    def action() -> None:
-        _print_storage_hardening(_prepare_private_storage(RUNS))
+    _require_json_version("report", json_output, json_version)
+
+    def action() -> WorkflowRun:
+        preflight = _prepare_private_storage(RUNS)
+        if not json_output:
+            _print_storage_hardening(preflight)
         path, _, classification = inspect_run_record(run_id, RUNS)
         if (
             classification.record_state != "CURRENT"
             or classification.current_run is None
         ):
             raise _classification_error(classification, path)
-        _print_run_report(classification.current_run)
+        return classification.current_run
 
-    _handle_error(action)
+    result = _handle_error(action, command="report", json_output=json_output)
+    if isinstance(result, WorkflowRun):
+        if json_output:
+            _emit_json("report", result=_run_report(result))
+        else:
+            _print_run_report(result)
 
 
 @app.command("migrate-run")
 def migrate_run_command(
     run_id: str = typer.Argument(..., help="Historical saved run id."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the versioned machine-readable response."),
+    json_version: str | None = typer.Option(None, "--json-version", help="Require a supported machine-output contract version."),
 ) -> None:
     """Explicitly migrate one historical record; defaults to no rewrite."""
 
+    _require_json_version("migrate-run", json_output, json_version)
+    if json_output:
+        _emit_json(
+            "migrate-run",
+            error={
+                "code": "interactive_confirmation_required",
+                "message": "migrate-run requires an interactive human confirmation",
+            },
+        )
+        raise typer.Exit(1)
     _handle_error(lambda: migrate_run_record(run_id, RUNS))
 
 
 @app.command()
 def status(
     run_id: str | None = typer.Argument(None, help="Run id; omit to list recent runs."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the versioned machine-readable response."),
+    json_version: str | None = typer.Option(None, "--json-version", help="Require a supported machine-output contract version."),
 ) -> None:
     """Inspect one saved run or list recent run stages."""
 
-    def action() -> None:
+    _require_json_version("status", json_output, json_version)
+
+    def action() -> dict[str, object] | None:
         preflight = _prepare_private_storage(RUNS)
-        _print_storage_hardening(preflight)
+        if not json_output:
+            _print_storage_hardening(preflight)
         if run_id:
             _, _, classification = inspect_run_record(run_id, RUNS)
             if (
                 classification.record_state == "CURRENT"
                 and classification.current_run is not None
             ):
+                if json_output:
+                    return {"run": _run_read_result(classification.current_run)}
                 console.print(classification.current_run.model_dump_json(indent=2))
-                return
+                return None
+            if json_output:
+                return {"record": _classification_read_result(classification)}
             console.print(f"Run: {classification.run_id or run_id}")
             console.print(
                 f"Schema: {classification.schema_version or 'unsupported'}"
@@ -3855,7 +4266,7 @@ def status(
             if classification.field_path:
                 console.print(f"Field: {classification.field_path}")
             console.print(f"Source SHA-256: {classification.source_sha256}")
-            return
+            return None
         root = preflight.runs_dir
         paths = []
         for entry in os.scandir(root):
@@ -3865,6 +4276,15 @@ def status(
             _secure_regular_file(path)
             paths.append(path)
         paths = sorted(paths, key=lambda p: os.lstat(p).st_mtime, reverse=True)[:10]
+        if json_output:
+            records: list[dict[str, object]] = []
+            for path in paths:
+                classification = classify_run_bytes(_read_private_bytes(path).content)
+                if classification.record_state == "CURRENT" and classification.current_run is not None:
+                    records.append(_run_read_result(classification.current_run))
+                else:
+                    records.append(_classification_read_result(classification))
+            return {"records": records}
         console.print(
             "Record states: CURRENT | MIGRATION_REQUIRED | RESUME_BLOCKED | "
             "ARCHIVE_ONLY | UNSUPPORTED"
@@ -3920,7 +4340,40 @@ def status(
                 "—",
             )
         console.print(table)
-    _handle_error(action)
+        return None
+
+    result = _handle_error(action, command="status", json_output=json_output)
+    if json_output and isinstance(result, dict):
+        _emit_json("status", result=result)
+
+
+@app.command()
+def doctor(
+    repo: Path | None = typer.Option(None, "--repo", help="Override the jobs repository path."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the versioned machine-readable response."),
+    json_version: str | None = typer.Option(None, "--json-version", help="Require a supported machine-output contract version."),
+) -> None:
+    """Inspect local readiness without repairing state or invoking providers."""
+
+    _require_json_version("doctor", json_output, json_version)
+    result = _handle_error(
+        lambda: doctor_report(configured_repo(repo), RUNS),
+        command="doctor",
+        json_output=json_output,
+    )
+    if not isinstance(result, dict):
+        return
+    failed = any(check["status"] == "fail" for check in result["checks"])
+    if json_output:
+        _emit_json("doctor", result=result)
+    else:
+        for check in result["checks"]:
+            console.print(
+                f"{check['id']}: {check['status'].upper()} "
+                f"({check['code']}) — {check['summary']}"
+            )
+    if failed:
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":
