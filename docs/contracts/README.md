@@ -19,6 +19,7 @@ under `gate-<number>/` and must be linked from the corresponding tracker item.
   - [`gate-3.1-versioned-resolved-configuration.md`](gate-3/gate-3.1-versioned-resolved-configuration.md) defines the proposed versioned configuration-resolution contract.
   - [`gate-3.2-trusted-project-configuration.md`](gate-3/gate-3.2-trusted-project-configuration.md) defines the proposed trusted project-configuration boundary.
   - [`gate-3.3-normalized-task-envelope.md`](gate-3/gate-3.3-normalized-task-envelope.md) defines the proposed immutable normalized task contract.
+  - [`gate-3.4-repository-project-adapter.md`](gate-3/gate-3.4-repository-project-adapter.md) defines the proposed repository/project adapter boundary.
 
 Do not put a new full contract, matrix, or implementation transcript back in
 the execution tracker. Keep the tracker to status, a concise result, and a

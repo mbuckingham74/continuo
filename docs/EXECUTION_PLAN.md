@@ -187,9 +187,10 @@ them. Design may begin during Gate 2, but implementation waits for Gate 2 exit.
   canonical text, checksum, provenance, scope, acceptance criteria, and optional
   verification requests.
   - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.3-normalized-task-envelope.md`](contracts/gate-3/gate-3.3-normalized-task-envelope.md).
-- [ ] Define the repository/project adapter contract: identity, snapshots,
+- [~] Define the repository/project adapter contract: identity, snapshots,
   fingerprints, changes, diffs, allowed paths, branch/remote rules, commit-message
   policy, and approval-gated publication.
+  - Approved contract and adversarial matrix; awaiting owner implementation review: [`gate-3/gate-3.4-repository-project-adapter.md`](contracts/gate-3/gate-3.4-repository-project-adapter.md).
 - [ ] Define the provider adapter and route-profile contracts using the
   provider-attempt lifecycle established in M0.2–M0.4.
 - [ ] Define machine-checkable capability profiles and permission ceilings for
