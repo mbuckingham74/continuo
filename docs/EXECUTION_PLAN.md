@@ -153,8 +153,8 @@ renaming control identities.
   unreadable legacy history visible and non-silent.
   - Detailed contract, implementation evidence, and matrix: [`gate-2/gate-2.4-c6-parsed-review-history.md`](contracts/gate-2/gate-2.4-c6-parsed-review-history.md).
 
-- [ ] Persist the resolved correction and escalation policy with each run.
-  - Approved implementation contract: [`gate-2/gate-2.5-c9-correction-policy.md`](contracts/gate-2/gate-2.5-c9-correction-policy.md).
+- [~] Persist the resolved correction and escalation policy with each run.
+  - Uncommitted implementation evidence and approval contract: [`gate-2/gate-2.5-c9-correction-policy.md`](contracts/gate-2/gate-2.5-c9-correction-policy.md).
 
 - [ ] Add immutable approval request and decision records with identity,
   timestamps, decision text, and repository fingerprints.

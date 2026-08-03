@@ -22,16 +22,19 @@ from models import (
     IMPLEMENTATION_ROUTE,
     IdentityMigrationAudit,
     POLICY_AUTHORITY_ROUTE,
+    PolicyMigrationAudit,
     ProviderRouteIdentity,
     RepoState,
     ReviewMigrationAudit,
     ReviewRecord,
     ReviewResult,
+    ResolvedCorrectionPolicy,
     TargetOwnership,
     UnreadableReviewRecord,
     WorkflowRun,
     WriterAttemptState,
     WriterRecoveryDecision,
+    resolve_correction_policy,
 )
 from providers import (
     ProviderAttempt,
@@ -500,6 +503,7 @@ class ControllerTests(unittest.TestCase):
             task_file="tasks/009-example.md",
             task_sha256="0" * 64,
             specification="Delete the fixture.",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=snapshot,
             stage="awaiting_commit_approval",
             changed_files=[deleted.name],
@@ -827,10 +831,15 @@ class ControllerTests(unittest.TestCase):
         run.last_error = "implementation review still fails after one correction"
         orchestrator.persist(run, self.runs)
 
-        resumed = self.controller(
-            self.passing_sonnet,
-            approval=lambda prompt: False,
-        ).resume(run.run_id)
+        with patch.object(
+            orchestrator,
+            "resolve_correction_policy",
+            side_effect=AssertionError("resume must use the saved policy"),
+        ):
+            resumed = self.controller(
+                self.passing_sonnet,
+                approval=lambda prompt: False,
+            ).resume(run.run_id)
 
         self.assertEqual(resumed.stage, "commit_declined")
         self.assertEqual(resumed.correction_cycles, 2)
@@ -1408,6 +1417,7 @@ class ControllerTests(unittest.TestCase):
             task_file="tasks/009-example.md",
             task_sha256="0" * 64,
             specification="Test timeout recovery.",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=orchestrator.repo_state(self.repo),
             stage="spec_reviewing",
             provider_resume_stage="spec_reviewing",
@@ -1537,6 +1547,7 @@ class ControllerTests(unittest.TestCase):
             task_file="tasks/009-example.md",
             task_sha256="0" * 64,
             specification="Test native failure recovery.",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=orchestrator.repo_state(self.repo),
             stage="spec_reviewing",
             provider_resume_stage="spec_reviewing",
@@ -1571,6 +1582,7 @@ class ControllerTests(unittest.TestCase):
             task_file="tasks/009-example.md",
             task_sha256="0" * 64,
             specification="Test malformed content recovery.",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=orchestrator.repo_state(self.repo),
             stage="spec_reviewing",
             provider_resume_stage="spec_reviewing",
@@ -1609,6 +1621,7 @@ class ControllerTests(unittest.TestCase):
             task_file="tasks/009-example.md",
             task_sha256="0" * 64,
             specification="Test successful content recovery.",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=orchestrator.repo_state(self.repo),
             stage="spec_reviewing",
             provider_resume_stage="spec_reviewing",
@@ -1651,6 +1664,7 @@ class ControllerTests(unittest.TestCase):
             task_file="tasks/009-example.md",
             task_sha256="0" * 64,
             specification="Test conservative legacy recovery.",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=orchestrator.repo_state(self.repo),
             stage="implementing",
             provider_resume_stage="implementing",
@@ -2092,6 +2106,7 @@ class ControllerTests(unittest.TestCase):
                 task_file="tasks/009-example.md",
                 task_sha256="0" * 64,
                 specification="Crash recovery fixture.",
+                resolved_correction_policy=resolve_correction_policy(),
                 repo=orchestrator.repo_state(self.repo),
                 stage="implementing",
                 provider_resume_stage="implementing",
@@ -2219,6 +2234,7 @@ class ControllerTests(unittest.TestCase):
             task_file="tasks/009-example.md",
             task_sha256="0" * 64,
             specification="Retry decision crash fixture.",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=orchestrator.repo_state(self.repo),
             stage="implementing",
             provider_resume_stage="implementing",
@@ -2269,6 +2285,7 @@ class ControllerTests(unittest.TestCase):
             task_file="tasks/009-example.md",
             task_sha256="0" * 64,
             specification="Adopt decision crash fixture.",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=orchestrator.repo_state(self.repo),
             stage="implementation_completed",
             writer_recovery_decisions=[
@@ -2439,6 +2456,7 @@ class ControllerTests(unittest.TestCase):
             task_file="tasks/009-example.md",
             task_sha256="0" * 64,
             specification="Writer audit fixture.",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=orchestrator.repo_state(self.repo),
             stage="blocked_writer_partial_changes",
             provider_resume_stage="implementing",
@@ -2959,6 +2977,7 @@ class ControllerTests(unittest.TestCase):
             task_file="tasks/009-example.md",
             task_sha256="0" * 64,
             specification="Claim rollback fixture.",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=orchestrator.repo_state(self.repo),
         )
         coordinator = orchestrator.TargetCoordinator(self.repo, orphan_runs)
@@ -3000,6 +3019,7 @@ class ControllerTests(unittest.TestCase):
             task_file="tasks/009-example.md",
             task_sha256="0" * 64,
             specification="Committed claim fixture.",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=orchestrator.repo_state(self.repo),
         )
         orchestrator.persist(created, committed_runs)
@@ -3040,6 +3060,7 @@ class ControllerTests(unittest.TestCase):
             task_file="tasks/009-example.md",
             task_sha256="0" * 64,
             specification="Writer ownership fixture.",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=orchestrator.repo_state(self.repo),
             stage="blocked_writer_retry_required",
         )
@@ -3067,6 +3088,7 @@ class ControllerTests(unittest.TestCase):
             task_file="tasks/009-example.md",
             task_sha256="0" * 64,
             specification="Legacy schema-six fixture.",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=orchestrator.repo_state(self.repo),
             stage="blocked_provider_failure",
         )
@@ -3183,6 +3205,7 @@ class StableProviderIdentityTests(unittest.TestCase):
             "task_file": "tasks/identity.md",
             "task_sha256": "0" * 64,
             "specification": "Stable identity fixture.",
+            "resolved_correction_policy": resolve_correction_policy(),
             "repo": RepoState(
                 repo="/fixture/repo",
                 branch="main",
@@ -3220,7 +3243,7 @@ class StableProviderIdentityTests(unittest.TestCase):
         )
         run = self.run_fixture(provider_runs=[record])
         dumped = run.model_dump(mode="json")
-        self.assertEqual(dumped["schema_version"], 9)
+        self.assertEqual(dumped["schema_version"], 10)
         self.assertIsNone(dumped["migration_audit"])
         self.assertIsNone(dumped["identity_migration_audit"])
         self.assertNotIn("provider", dumped["provider_runs"][0])
@@ -3528,6 +3551,7 @@ class PrivateStorageTests(unittest.TestCase):
             task_file="tasks/009-private.md",
             task_sha256="0" * 64,
             specification="sensitive specification fixture",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=RepoState(
                 repo=str(self.repo),
                 branch="main",
@@ -3783,7 +3807,7 @@ class PrivateStorageTests(unittest.TestCase):
 import os
 from pathlib import Path
 import orchestrator
-from models import RepoState, WorkflowRun
+from models import RepoState, WorkflowRun, resolve_correction_policy
 runs = Path(os.environ['CONTINUO_TEST_RUNS'])
 run = WorkflowRun(
     run_id='crash',
@@ -3792,6 +3816,7 @@ run = WorkflowRun(
     task_file='tasks/009.md',
     task_sha256='0' * 64,
     specification='crash replacement',
+    resolved_correction_policy=resolve_correction_policy(),
     repo=RepoState(
         repo=os.environ['CONTINUO_TEST_REPO'],
         branch='main',
@@ -3939,7 +3964,7 @@ orchestrator.persist(run, runs)
         self.assertNotIn("os.umask", source)
         self.assertNotIn("os.chown", source)
         self.assertNotIn("force-unlock", source)
-        self.assertEqual(self.run_fixture().schema_version, 9)
+        self.assertEqual(self.run_fixture().schema_version, 10)
         command_names = {
             command.name or command.callback.__name__.replace("_", "-")
             for command in orchestrator.app.registered_commands
@@ -3998,6 +4023,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
             "task_file": "tasks/009-example.md",
             "task_sha256": "0" * 64,
             "specification": "Review history fixture.",
+            "resolved_correction_policy": resolve_correction_policy(),
             "repo": RepoState(
                 repo="/fixture/repo",
                 branch="main",
@@ -4057,6 +4083,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
             task_file="tasks/009-example.md",
             task_sha256="0" * 64,
             specification="Recovery fixture.",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=orchestrator.repo_state(self.repo),
             stage=stage,
             provider_resume_stage=stage,
@@ -4073,8 +4100,8 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
         return run
 
     def test_i1_model_shapes_schema_and_no_raw_reparse_in_control(self) -> None:
-        self.assertEqual(orchestrator.CURRENT_RUN_SCHEMA_VERSION, 9)
-        self.assertEqual(self.run_fixture().schema_version, 9)
+        self.assertEqual(orchestrator.CURRENT_RUN_SCHEMA_VERSION, 10)
+        self.assertEqual(self.run_fixture().schema_version, 10)
         for model in (
             orchestrator.ReviewResult,
             orchestrator.ReviewRecord,
@@ -4281,7 +4308,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
 
     def test_p1_new_run_has_empty_review_state_and_no_audits(self) -> None:
         run = self.run_fixture()
-        self.assertEqual(run.schema_version, 9)
+        self.assertEqual(run.schema_version, 10)
         self.assertEqual(run.review_records, [])
         self.assertEqual(run.unreadable_review_records, [])
         self.assertIsNone(run.review_migration_audit)
@@ -5007,6 +5034,112 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
         self.assertNotIn("terra_resolution", review_models)
 
 
+class PersistedCorrectionPolicyTests(unittest.TestCase):
+    def run_fixture(self, **updates) -> WorkflowRun:
+        values = {
+            "run_id": "policy-fixture",
+            "created_at": "2026-08-02T00:00:00+00:00",
+            "task_ref": "policy",
+            "task_file": "tasks/policy.md",
+            "task_sha256": "0" * 64,
+            "specification": "Persisted policy fixture.",
+            "repo": RepoState(
+                repo="/fixture/repo",
+                branch="main",
+                head="1" * 40,
+                clean=True,
+                origin="https://example.invalid/repo.git",
+            ),
+            "resolved_correction_policy": resolve_correction_policy(),
+        }
+        values.update(updates)
+        return WorkflowRun(**values)
+
+    def test_g25_i1_i2_closed_frozen_policy_and_counter_validation(self) -> None:
+        policy = resolve_correction_policy()
+        self.assertEqual(policy.policy_id, "builtin.correction_escalation.v1")
+        self.assertEqual(policy.maximum_total_corrections, 12)
+        self.assertEqual(policy.maximum_sol_escalations_per_persistent_finding, 2)
+        self.assertEqual(
+            policy.persistent_finding_actions,
+            (
+                "ordinary_correction",
+                "sol_guided_correction",
+                "sol_guided_correction",
+                "block",
+            ),
+        )
+        for model in (ResolvedCorrectionPolicy, PolicyMigrationAudit):
+            self.assertTrue(model.model_config.get("frozen"))
+            self.assertTrue(model.model_config.get("strict"))
+            self.assertEqual(model.model_config.get("extra"), "forbid")
+        with self.assertRaises(Exception):
+            policy.maximum_total_corrections = 13
+        with self.assertRaises(ValueError):
+            ResolvedCorrectionPolicy.model_validate(
+                {
+                    **policy.model_dump(),
+                    "persistent_finding_actions": (
+                        "ordinary_correction",
+                        "ordinary_correction",
+                        "ordinary_correction",
+                        "block",
+                    ),
+                }
+            )
+        with self.assertRaises(ValueError):
+            ResolvedCorrectionPolicy.model_validate(
+                {**policy.model_dump(), "unknown": "not configuration"}
+            )
+        with self.assertRaisesRegex(ValueError, "ordinary run lacks"):
+            self.run_fixture(resolved_correction_policy=None)
+        with self.assertRaisesRegex(ValueError, "correction cycles exceed"):
+            self.run_fixture(correction_cycles=13)
+        self.assertNotIn(
+            "le",
+            WorkflowRun.model_fields["correction_cycles"].metadata,
+        )
+
+    def test_g25_p1_through_p7_saved_schedule_and_global_bound(self) -> None:
+        run = self.run_fixture()
+        self.assertEqual(
+            [
+                orchestrator._correction_action(run, occurrence)
+                for occurrence in range(1, 5)
+            ],
+            [
+                "ordinary_correction",
+                "sol_guided_correction",
+                "sol_guided_correction",
+                "block",
+            ],
+        )
+        self.assertEqual(orchestrator._correction_action(run, 20), "block")
+        at_capacity = self.run_fixture(correction_cycles=12)
+        self.assertEqual(orchestrator._correction_action(at_capacity, 1), "block")
+        report = orchestrator._run_report(run)
+        self.assertEqual(report["resolved_correction_policy"], policy_dump(run))
+
+    def test_g25_c2_saved_snapshot_never_calls_resolver_for_decisions(self) -> None:
+        run = self.run_fixture()
+        with patch.object(
+            orchestrator,
+            "resolve_correction_policy",
+            side_effect=AssertionError("resolver must only serve new runs"),
+        ):
+            self.assertEqual(
+                orchestrator._correction_action(run, 2),
+                "sol_guided_correction",
+            )
+
+
+def policy_dump(run: WorkflowRun) -> dict[str, object]:
+    policy = run.resolved_correction_policy
+    if policy is None:
+        raise AssertionError("ordinary fixture requires a policy")
+    return policy.model_dump(mode="json")
+
+
 class ProviderFailureContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -5327,6 +5460,7 @@ Diff:
             task_file="tasks/009-example.md",
             task_sha256="0" * 64,
             specification="Audit failure provenance.",
+            resolved_correction_policy=resolve_correction_policy(),
             repo=RepoState(
                 repo=str(self.repo),
                 branch="main",

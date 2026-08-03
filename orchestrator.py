@@ -24,6 +24,7 @@ from rich.table import Table
 
 from models import (
     ADVERSARIAL_REVIEW_ROUTE,
+    CorrectionPolicyAction,
     CURRENT_RUN_SCHEMA_VERSION,
     ESCALATION_EXECUTIVE_ROUTE,
     GitRecord,
@@ -39,6 +40,7 @@ from models import (
     RepoState,
     ReviewRecord,
     ReviewResult,
+    ResolvedCorrectionPolicy,
     TargetOwnership,
     UnreadableReviewRecord,
     WorkflowRun,
@@ -47,6 +49,7 @@ from models import (
     WriterAttemptState,
     WriterRecoveryAction,
     WriterRecoveryDecision,
+    resolve_correction_policy,
 )
 from providers import (
     DEFAULT_REPO,
@@ -782,8 +785,9 @@ def migrate_run_record(
             detail = f"{detail}:{exc.field_path}"
         raise ControllerError(f"run migration {detail}") from exc
     audit = (
-        result.run.identity_migration_audit
+        result.run.policy_migration_audit
         or result.run.review_migration_audit
+        or result.run.identity_migration_audit
     )
     if audit is None:
         raise ControllerError("run migration migration_audit_invalid")
@@ -1400,6 +1404,11 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
         "provider_retry_attempts": retry_attempts,
         "wall_seconds": wall_seconds,
         "corrections": run.correction_cycles,
+        "resolved_correction_policy": (
+            run.resolved_correction_policy.model_dump(mode="json")
+            if run.resolved_correction_policy is not None
+            else None
+        ),
         "distinct_defects": len(defect_keys),
         "unreadable_review_count": len(unreadable_review_records),
         "unreadable_review_records": unreadable_review_records,
@@ -1490,6 +1499,17 @@ def _print_run_report(run: WorkflowRun) -> None:
     )
 
     console.print(f"Corrections: {report['corrections']}")
+    policy = report["resolved_correction_policy"]
+    if policy is not None:
+        console.print(
+            "Correction policy: "
+            f"{policy['policy_id']} "
+            f"({report['corrections']}/{policy['maximum_total_corrections']}; "
+            f"{policy['maximum_sol_escalations_per_persistent_finding']} "
+            "Sol escalation(s) per persistent finding; "
+            + " -> ".join(policy["persistent_finding_actions"])
+            + ")"
+        )
     console.print(f"Distinct defects: {report['distinct_defects']}")
     unreadable = report["unreadable_review_records"]
     if unreadable:
@@ -1655,10 +1675,6 @@ def _stageable_changed_files(repo: Path, files: list[str]) -> list[str]:
     ]
 
 
-MAX_TOTAL_CORRECTIONS = 12
-MAX_SOL_ESCALATIONS_PER_FINDING = 2
-
-
 def _finding_key(result: ReviewResult) -> str:
     if result.finding_key:
         return result.finding_key
@@ -1684,6 +1700,46 @@ def _current_finding_streak(run: WorkflowRun, result: ReviewResult) -> int:
             break
         streak += 1
     return max(1, streak)
+
+
+def _saved_correction_policy(run: WorkflowRun) -> ResolvedCorrectionPolicy:
+    policy = run.resolved_correction_policy
+    if policy is None:
+        raise ControllerError("run lacks a resolved correction policy")
+    return policy
+
+
+def _correction_action(
+    run: WorkflowRun,
+    finding_streak: int,
+) -> CorrectionPolicyAction:
+    policy = _saved_correction_policy(run)
+    if run.correction_cycles >= policy.maximum_total_corrections:
+        return "block"
+    index = min(finding_streak - 1, len(policy.persistent_finding_actions) - 1)
+    return policy.persistent_finding_actions[index]
+
+
+def _block_for_correction_policy(
+    controller: "Controller",
+    run: WorkflowRun,
+    finding_key: str,
+) -> WorkflowRun:
+    policy = _saved_correction_policy(run)
+    if run.correction_cycles >= policy.maximum_total_corrections:
+        return controller._block(
+            run,
+            "blocked_correction_budget",
+            "implementation still failing after "
+            f"{policy.maximum_total_corrections} total corrections",
+        )
+    return controller._block(
+        run,
+        "blocked_repeated_finding",
+        f"finding {finding_key} still fails after "
+        f"{policy.maximum_sol_escalations_per_persistent_finding} "
+        "Sol-guided corrections",
+    )
 
 
 def _sol_prompt(
@@ -1835,6 +1891,11 @@ class Controller:
 
     @staticmethod
     def _require_executable(run: WorkflowRun) -> None:
+        if run.policy_migration_audit is not None:
+            raise ControllerError(
+                "run execution refused: migrated record disposition is "
+                f"{run.policy_migration_audit.disposition}"
+            )
         if run.identity_migration_audit is not None:
             raise ControllerError(
                 "run execution refused: migrated record disposition is "
@@ -1939,15 +2000,15 @@ class Controller:
         if run.implementation_review is None:
             run.stage = "created"
         else:
-            if run.correction_cycles >= MAX_TOTAL_CORRECTIONS:
-                run.stage = "blocked_correction_budget"
-                run.last_error = (
-                    f"implementation still failing after "
-                    f"{MAX_TOTAL_CORRECTIONS} total corrections"
+            policy = _saved_correction_policy(run)
+            if run.correction_cycles >= policy.maximum_total_corrections:
+                return _block_for_correction_policy(
+                    self,
+                    run,
+                    _finding_key(run.implementation_review),
                 )
-            else:
-                run.correction_cycles += 1
-                run.stage = "correction_pending"
+            run.correction_cycles += 1
+            run.stage = "correction_pending"
 
         self._save(run)
         return run
@@ -2820,18 +2881,14 @@ class Controller:
         if result.category == "POLICY_AMBIGUITY":
             return self._policy_stop(run, result.summary)
 
-        if run.correction_cycles >= MAX_TOTAL_CORRECTIONS:
-            return self._block(
-                run,
-                "blocked_correction_budget",
-                f"implementation still failing after {MAX_TOTAL_CORRECTIONS} total corrections",
-            )
-
         finding_key = _finding_key(result)
         streak = _current_finding_streak(run, result)
+        action = _correction_action(run, streak)
+        if action == "block":
+            return _block_for_correction_policy(self, run, finding_key)
 
         # New defect: one ordinary bounded Luna correction.
-        if streak == 1:
+        if action == "ordinary_correction":
             run.sol_guidance = None
             run.correction_cycles += 1
             run.stage = "correction_pending"
@@ -2840,18 +2897,13 @@ class Controller:
                 return run
             return self._review_and_correct(run)
 
-        # Same defect survived. Escalate to Sol twice before involving a human.
-        if streak <= 1 + MAX_SOL_ESCALATIONS_PER_FINDING:
+        if action == "sol_guided_correction":
             escalation_round = streak - 1
             if not self._escalate_to_sol(run, finding_key, escalation_round):
                 return run
             return self._run_from(run)
 
-        return self._block(
-            run,
-            "blocked_repeated_finding",
-            f"finding {finding_key} still fails after two Sol-guided corrections",
-        )
+        raise ControllerError("resolved correction policy action is unsupported")
 
 
     def _approval_gates(self, run: WorkflowRun) -> WorkflowRun:
@@ -2912,6 +2964,7 @@ class Controller:
             task_sha256=hashlib.sha256(specification.encode()).hexdigest(),
             specification=specification,
             repo=state,
+            resolved_correction_policy=resolve_correction_policy(),
         )
         if not state.clean:
             self._save(run)
@@ -2942,12 +2995,20 @@ class Controller:
             if not self._verify(run):
                 return run
         if run.stage == "sol_guidance_ready":
-            if run.correction_cycles >= MAX_TOTAL_CORRECTIONS:
-                return self._block(
+            if run.implementation_review is None:
+                raise ControllerError("Sol guidance lacks an implementation review")
+            action = _correction_action(
+                run,
+                _current_finding_streak(run, run.implementation_review),
+            )
+            if action == "block":
+                return _block_for_correction_policy(
+                    self,
                     run,
-                    "blocked_correction_budget",
-                    f"implementation still failing after {MAX_TOTAL_CORRECTIONS} total corrections",
+                    _finding_key(run.implementation_review),
                 )
+            if action != "sol_guided_correction":
+                raise ControllerError("Sol guidance does not match the saved policy")
             run.correction_cycles += 1
             run.stage = "correction_pending"
             self._save(run)
@@ -3027,7 +3088,6 @@ class Controller:
 
         if (
             run.stage in {"blocked_after_correction", "blocked_after_escalation"}
-            and run.correction_cycles < MAX_TOTAL_CORRECTIONS
             and run.implementation_review is not None
             and run.implementation_review.category not in {"PASS", "POLICY_AMBIGUITY"}
         ):

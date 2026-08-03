@@ -27,12 +27,15 @@ from models import (
     ProviderOperation,
     ProviderRecord,
     ProviderRouteIdentity,
+    ReviewMigrationAudit,
+    ReviewRecord,
     RepoState,
     ReviewCategory,
     ReviewStatus,
     RunMigrationDisposition,
     RunStructuralClass,
     TargetOwnership,
+    UnreadableReviewRecord,
     WorkflowRun,
     WriterAttemptState,
     WriterRecoveryDecision,
@@ -225,6 +228,49 @@ class _RunV8(_RunV7):
         return self
 
 
+class _RunV9(_RunV8):
+    """The exact historical schema-9 shape before persisted policy snapshots."""
+
+    schema_version: Literal[9] = 9
+    review_records: list[ReviewRecord] = Field(default_factory=list)
+    unreadable_review_records: list[UnreadableReviewRecord] = Field(
+        default_factory=list
+    )
+    review_migration_audit: ReviewMigrationAudit | None = None
+
+    @model_validator(mode="after")
+    def validate_review_audit_presence(self) -> "_RunV9":
+        audit = self.review_migration_audit
+        if audit is None:
+            return self
+        if not audit.applied_steps or audit.applied_steps[-1] != "8_to_9":
+            raise ValueError("review migration steps are incoherent")
+        if self.identity_migration_audit is None:
+            if (
+                audit.source_schema_version < 8
+                or audit.applied_steps != ("8_to_9",)
+            ):
+                raise ValueError("review migration lineage is incoherent")
+        elif audit.source_schema_version <= 7 and (
+            self.identity_migration_audit.migration_id != audit.migration_id
+            or self.identity_migration_audit.migrated_at != audit.migrated_at
+            or self.identity_migration_audit.source_schema_version
+            != audit.source_schema_version
+            or self.identity_migration_audit.source_structural_class
+            != audit.source_structural_class
+            or self.identity_migration_audit.source_sha256 != audit.source_sha256
+            or self.identity_migration_audit.applied_steps
+            != audit.applied_steps[:-1]
+            or self.identity_migration_audit.disposition != audit.disposition
+        ):
+            raise ValueError("review migration lineage is incoherent")
+        if audit.parsed_count != len(self.review_records):
+            raise ValueError("review migration audit parsed count is incoherent")
+        if audit.unreadable_count != len(self.unreadable_review_records):
+            raise ValueError("review migration audit unreadable count is incoherent")
+        return self
+
+
 _HISTORICAL_MODELS: dict[int, type[BaseModel]] = {
     1: _RunV1,
     2: _RunV2,
@@ -234,6 +280,7 @@ _HISTORICAL_MODELS: dict[int, type[BaseModel]] = {
     6: _RunV6,
     7: _RunV7,
     8: _RunV8,
+    9: _RunV9,
 }
 
 
@@ -497,6 +544,10 @@ def _v8_coherence_reason(run: _RunV8) -> tuple[str, str | None] | None:
     return None
 
 
+def _v9_coherence_reason(run: _RunV9) -> tuple[str, str | None] | None:
+    return _v8_coherence_reason(run)
+
+
 _LEGACY_PROVIDER_IDENTITIES = {
     ("Luna High", "implementation"): (
         IMPLEMENTATION_ROUTE,
@@ -611,6 +662,14 @@ def _migration_disposition(
             "inspection_only",
         }:
             return audit["disposition"]
+    if schema_version == 9:
+        audit = payload.get("review_migration_audit")
+        if isinstance(audit, dict) and audit.get("disposition") in {
+            "resume_eligibility_deferred",
+            "resume_blocked",
+            "inspection_only",
+        }:
+            return audit["disposition"]
     if schema_version < 6:
         return "resume_eligibility_deferred"
     blocked_stages = {
@@ -704,7 +763,11 @@ def classify_run_bytes(source: bytes) -> RecordClassification:
                 reason_code="archive_only",
                 field_path=_bounded_field_path(exc),
             )
-        if run.review_migration_audit is not None:
+        if run.policy_migration_audit is not None:
+            state: RecordState = "RESUME_BLOCKED"
+            disposition = run.policy_migration_audit.disposition
+            structural_class = run.policy_migration_audit.source_structural_class
+        elif run.review_migration_audit is not None:
             state: RecordState = "RESUME_BLOCKED"
             disposition = run.review_migration_audit.disposition
             structural_class = run.review_migration_audit.source_structural_class
@@ -776,11 +839,15 @@ def classify_run_bytes(source: bytes) -> RecordClassification:
     structural_class: RunStructuralClass = (
         _v6_structural_class(payload) if version == 6 else f"V{version}"  # type: ignore[assignment]
     )
-    if version in {6, 7, 8}:
+    if version in {6, 7, 8, 9}:
         coherence = (
             _v6_coherence_reason(historical)  # type: ignore[arg-type]
             if version in {6, 7}
-            else _v8_coherence_reason(historical)  # type: ignore[arg-type]
+            else (
+                _v8_coherence_reason(historical)  # type: ignore[arg-type]
+                if version == 8
+                else _v9_coherence_reason(historical)  # type: ignore[arg-type]
+            )
         )
         if coherence is not None:
             reason, field_path = coherence
@@ -1141,6 +1208,27 @@ def _step_8_to_9(
     return result, reasons
 
 
+def _step_9_to_10(
+    payload: dict[str, Any], context: MigrationContext
+) -> tuple[dict[str, Any], list[str]]:
+    result = copy.deepcopy(payload)
+    reasons = ["missing_resolved_correction_policy"]
+    result["schema_version"] = 10
+    result["resolved_correction_policy"] = None
+    result["policy_migration_audit"] = {
+        "migration_id": context.migration_id,
+        "migrated_at": context.migrated_at,
+        "source_schema_version": context.source_schema_version,
+        "target_schema_version": 10,
+        "source_structural_class": context.source_structural_class,
+        "source_sha256": context.source_sha256,
+        "applied_steps": list(context.applied_steps),
+        "reason_codes": sorted(set((*context.reason_codes, *reasons))),
+        "disposition": context.disposition,
+    }
+    return result, reasons
+
+
 MigrationStep = Callable[
     [dict[str, Any], MigrationContext],
     tuple[dict[str, Any], list[str]],
@@ -1154,6 +1242,7 @@ MIGRATION_REGISTRY: dict[tuple[int, int], MigrationStep] = {
     (6, 7): _step_6_to_7,
     (7, 8): _step_7_to_8,
     (8, 9): _step_8_to_9,
+    (9, 10): _step_9_to_10,
 }
 
 
@@ -1242,7 +1331,7 @@ def migrate_classification(
         )
         payload, reasons = step(payload, context)
         version += 1
-        if version <= 8:
+        if version <= 9:
             _validate_historical(payload, version)
         reason_codes.extend(reasons)
         applied_steps.append(next_step)
@@ -1265,25 +1354,40 @@ def migrate_classification(
             or identity_audit.source_structural_class
             != classification.structural_class
             or identity_audit.source_sha256 != classification.source_sha256
-            or identity_audit.applied_steps != tuple(applied_steps[:-1])
+            or identity_audit.applied_steps != tuple(applied_steps[:-2])
             or identity_audit.disposition != classification.disposition
         ):
             raise MigrationError("identity_migration_audit_invalid")
 
     review_audit = run.review_migration_audit
-    if (
+    if source_version < 9 and (
         review_audit is None
         or review_audit.source_schema_version != source_version
         or review_audit.target_schema_version != 9
         or review_audit.source_structural_class
         != classification.structural_class
         or review_audit.source_sha256 != classification.source_sha256
-        or review_audit.applied_steps != tuple(applied_steps)
+        or review_audit.applied_steps != tuple(applied_steps[:-1])
         or review_audit.disposition != classification.disposition
         or review_audit.parsed_count != len(run.review_records)
         or review_audit.unreadable_count != len(run.unreadable_review_records)
     ):
         raise MigrationError("review_migration_audit_invalid")
+
+    policy_audit = run.policy_migration_audit
+    if (
+        policy_audit is None
+        or run.resolved_correction_policy is not None
+        or policy_audit.source_schema_version != source_version
+        or policy_audit.target_schema_version != 10
+        or policy_audit.source_structural_class
+        != classification.structural_class
+        or policy_audit.source_sha256 != classification.source_sha256
+        or policy_audit.applied_steps != tuple(applied_steps)
+        or policy_audit.disposition != classification.disposition
+        or "missing_resolved_correction_policy" not in policy_audit.reason_codes
+    ):
+        raise MigrationError("policy_migration_audit_invalid")
 
     if source_version <= 6:
         audit = run.migration_audit
@@ -1293,7 +1397,7 @@ def migrate_classification(
             or audit.target_schema_version != 7
             or audit.source_structural_class != classification.structural_class
             or audit.source_sha256 != classification.source_sha256
-            or audit.applied_steps != tuple(applied_steps[:-2])
+            or audit.applied_steps != tuple(applied_steps[:-3])
             or audit.disposition != classification.disposition
         ):
             raise MigrationError("migration_audit_invalid")
@@ -1320,6 +1424,20 @@ def migrate_classification(
                     if key == "identity_migration_audit"
                     else "migration_audit_invalid"
                 )
+    elif source_version == 9:
+        for key in (
+            "migration_audit",
+            "identity_migration_audit",
+            "review_migration_audit",
+        ):
+            original = classification.payload.get(key)
+            migrated_value = (
+                getattr(run, key).model_dump(mode="json")
+                if getattr(run, key) is not None
+                else None
+            )
+            if migrated_value != original:
+                raise MigrationError("review_migration_audit_invalid")
     return MigrationResult(
         run=run,
         source_sha256=classification.source_sha256,

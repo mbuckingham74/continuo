@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-CURRENT_RUN_SCHEMA_VERSION = 9
+CURRENT_RUN_SCHEMA_VERSION = 10
 OLDEST_MIGRATABLE_RUN_SCHEMA_VERSION = 1
 
 
@@ -214,6 +214,7 @@ RunStructuralClass = Literal[
     "V6-current",
     "V7",
     "V8",
+    "V9",
 ]
 
 
@@ -264,6 +265,72 @@ class ReviewMigrationAudit(BaseModel):
     reason_codes: tuple[str, ...] = Field(default_factory=tuple, strict=False)
     parsed_count: int = Field(ge=0)
     unreadable_count: int = Field(ge=0)
+    disposition: RunMigrationDisposition
+
+
+CorrectionPolicyAction = Literal[
+    "ordinary_correction",
+    "sol_guided_correction",
+    "block",
+]
+
+
+class ResolvedCorrectionPolicy(BaseModel):
+    """The closed correction/escalation policy fixed when a run is created."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    policy_id: Literal["builtin.correction_escalation.v1"] = (
+        "builtin.correction_escalation.v1"
+    )
+    maximum_total_corrections: Literal[12] = 12
+    maximum_sol_escalations_per_persistent_finding: Literal[2] = 2
+    persistent_finding_actions: tuple[
+        CorrectionPolicyAction,
+        CorrectionPolicyAction,
+        CorrectionPolicyAction,
+        CorrectionPolicyAction,
+    ] = Field(
+        default=(
+            "ordinary_correction",
+            "sol_guided_correction",
+            "sol_guided_correction",
+            "block",
+        ),
+        strict=False,
+    )
+
+    @model_validator(mode="after")
+    def validate_v1_schedule(self) -> "ResolvedCorrectionPolicy":
+        if self.persistent_finding_actions != (
+            "ordinary_correction",
+            "sol_guided_correction",
+            "sol_guided_correction",
+            "block",
+        ):
+            raise ValueError("correction policy schedule is not recognized")
+        return self
+
+
+def resolve_correction_policy() -> ResolvedCorrectionPolicy:
+    """Resolve the sole built-in policy for a newly created run."""
+
+    return ResolvedCorrectionPolicy()
+
+
+class PolicyMigrationAudit(BaseModel):
+    """Immutable proof that a historical record had no saved policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    migration_id: str = Field(min_length=1, max_length=64)
+    migrated_at: str
+    source_schema_version: int = Field(ge=1, lt=10)
+    target_schema_version: Literal[10] = 10
+    source_structural_class: RunStructuralClass
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    applied_steps: tuple[str, ...] = Field(min_length=1, strict=False)
+    reason_codes: tuple[str, ...] = Field(default_factory=tuple, strict=False)
     disposition: RunMigrationDisposition
 
 
@@ -405,7 +472,7 @@ class WorkflowRun(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal[9] = CURRENT_RUN_SCHEMA_VERSION
+    schema_version: Literal[10] = CURRENT_RUN_SCHEMA_VERSION
     run_id: str
     created_at: str
     updated_at: str | None = None
@@ -415,7 +482,8 @@ class WorkflowRun(BaseModel):
     specification: str
     repo: RepoState
     stage: str = "created"
-    correction_cycles: int = Field(default=0, ge=0, le=12)
+    correction_cycles: int = Field(default=0, ge=0)
+    resolved_correction_policy: ResolvedCorrectionPolicy | None
     spec_review: ReviewResult | None = None
     implementation_review: ReviewResult | None = None
     review_records: list[ReviewRecord] = Field(default_factory=list)
@@ -432,6 +500,7 @@ class WorkflowRun(BaseModel):
     migration_audit: RunMigrationAudit | None = None
     identity_migration_audit: IdentityMigrationAudit | None = None
     review_migration_audit: ReviewMigrationAudit | None = None
+    policy_migration_audit: PolicyMigrationAudit | None = None
     target_ownership: TargetOwnership | None = None
     active_writer_attempt: WriterAttemptState | None = None
     writer_recovery_decisions: list[WriterRecoveryDecision] = Field(
@@ -451,6 +520,7 @@ class WorkflowRun(BaseModel):
         legacy_audit = self.migration_audit
         identity_audit = self.identity_migration_audit
         review_audit = self.review_migration_audit
+        policy_audit = self.policy_migration_audit
         if legacy_audit is not None and identity_audit is None:
             raise ValueError("schema-8 migration audit lacks identity audit")
         if identity_audit is not None:
@@ -519,6 +589,41 @@ class WorkflowRun(BaseModel):
                     "review migration audit unreadable count is incoherent"
                 )
 
+        if policy_audit is not None:
+            if (
+                not policy_audit.applied_steps
+                or policy_audit.applied_steps[-1] != "9_to_10"
+                or "missing_resolved_correction_policy"
+                not in policy_audit.reason_codes
+            ):
+                raise ValueError("policy migration audit is incoherent")
+            if self.resolved_correction_policy is not None:
+                raise ValueError("migrated run has a resolved correction policy")
+            if policy_audit.source_schema_version == 9:
+                if policy_audit.applied_steps != ("9_to_10",):
+                    raise ValueError("policy migration lineage is incoherent")
+            elif review_audit is None or (
+                review_audit.migration_id != policy_audit.migration_id
+                or review_audit.migrated_at != policy_audit.migrated_at
+                or review_audit.source_schema_version
+                != policy_audit.source_schema_version
+                or review_audit.source_structural_class
+                != policy_audit.source_structural_class
+                or review_audit.source_sha256 != policy_audit.source_sha256
+                or review_audit.applied_steps != policy_audit.applied_steps[:-1]
+                or review_audit.disposition != policy_audit.disposition
+            ):
+                raise ValueError("policy migration lineage is incoherent")
+        elif self.resolved_correction_policy is None:
+            raise ValueError("ordinary run lacks a resolved correction policy")
+
+        if (
+            self.resolved_correction_policy is not None
+            and self.correction_cycles
+            > self.resolved_correction_policy.maximum_total_corrections
+        ):
+            raise ValueError("correction cycles exceed resolved policy")
+
         pending = (
             self.provider_resume_stage,
             self.provider_resume_prompt,
@@ -534,6 +639,7 @@ class WorkflowRun(BaseModel):
             self.migration_audit is not None
             or self.identity_migration_audit is not None
             or self.review_migration_audit is not None
+            or self.policy_migration_audit is not None
         )
         for record in self.provider_runs:
             expected_role = OPERATION_ROLES[record.operation_id]
