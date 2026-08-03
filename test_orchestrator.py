@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import orchestrator
+from configuration import resolve_configuration
 import providers
 import run_migrations
 import typer
@@ -49,6 +50,32 @@ from providers import (
 
 CLAUDE_FIXTURES = Path(__file__).parent / "test_fixtures/claude"
 _TEST_PROVIDER_INVOCATIONS = itertools.count(1)
+
+
+def _workflow_run(**kwargs) -> WorkflowRun:
+    """Build an ordinary schema-13 fixture with target-bound configuration."""
+
+    repo = kwargs["repo"]
+    repo_path = Path(repo.repo).resolve()
+    try:
+        identity = orchestrator.target_identity(repo_path)
+        target_key = identity.target_key
+        canonical_repo = identity.canonical_repo
+    except (FileNotFoundError, OSError):
+        canonical_repo = str(repo_path)
+        target_key = hashlib.sha256(
+            f"continuo-test-target-v1\0{canonical_repo}".encode()
+        ).hexdigest()
+    missing_root = repo_path.parent / f".continuo-test-absent-{target_key[:16]}"
+    kwargs.setdefault(
+        "resolved_configuration",
+        resolve_configuration(
+            target_key=target_key,
+            canonical_repo=canonical_repo,
+            controller_root=missing_root,
+        ).configuration,
+    )
+    return WorkflowRun(**kwargs)
 
 
 def git(repo: Path, *args: str) -> str:
@@ -154,6 +181,7 @@ class ControllerTests(unittest.TestCase):
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-m", "fixture")
         self.runs = Path(self.temp.name) / "runs"
+        self.configuration_root = Path(self.temp.name) / "configuration"
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -177,6 +205,7 @@ class ControllerTests(unittest.TestCase):
             luna=luna or self.luna,
             approval=approval,
             approval_actor=approval_actor,
+            controller_root=self.configuration_root,
         )
 
     def luna(self, prompt: str, repo: Path) -> ProviderExecution:
@@ -506,7 +535,7 @@ class ControllerTests(unittest.TestCase):
         deleted.unlink()
         git(self.repo, "add", "-A", "--", deleted.name)
 
-        run = WorkflowRun(
+        run = _workflow_run(
             run_id="staged-delete",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -1194,7 +1223,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_g27_invocation_group_validation_fails_closed(self) -> None:
         invocation_id = "logical-review-validation"
-        valid = WorkflowRun(
+        valid = _workflow_run(
             run_id="g27-validation",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -1692,7 +1721,7 @@ class ControllerTests(unittest.TestCase):
             provider_calls += 1
             return review_execution("PASS", "PASS")
 
-        run = WorkflowRun(
+        run = _workflow_run(
             run_id="timeout-recovery",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -1829,7 +1858,7 @@ class ControllerTests(unittest.TestCase):
             provider_calls += 1
             return review_execution("PASS", "PASS")
 
-        run = WorkflowRun(
+        run = _workflow_run(
             run_id="native-failure-recovery",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -1864,7 +1893,7 @@ class ControllerTests(unittest.TestCase):
         )
 
         _, malformed = claude_fixture("malformed_envelope")
-        malformed_run = WorkflowRun(
+        malformed_run = _workflow_run(
             run_id="malformed-content-recovery",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -1903,7 +1932,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(provider_calls, 0)
 
         _, success = claude_fixture("success")
-        success_run = WorkflowRun(
+        success_run = _workflow_run(
             run_id="successful-content-recovery",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -1946,7 +1975,7 @@ class ControllerTests(unittest.TestCase):
         )
 
     def test_legacy_failure_recovery_does_not_scan_model_stdout(self) -> None:
-        run = WorkflowRun(
+        run = _workflow_run(
             run_id="legacy-model-prose",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -2391,7 +2420,7 @@ class ControllerTests(unittest.TestCase):
             raise AssertionError("writer crash recovery must not invoke Luna")
 
         def interrupted_run(run_id):
-            return WorkflowRun(
+            return _workflow_run(
                 run_id=run_id,
                 created_at="2026-08-02T00:00:00+00:00",
                 task_ref="009",
@@ -2519,7 +2548,7 @@ class ControllerTests(unittest.TestCase):
             calls += 1
             raise AssertionError("resume must not invoke a recovery writer")
 
-        retry_crash = WorkflowRun(
+        retry_crash = _workflow_run(
             run_id="retry-decision-crash",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -2570,7 +2599,7 @@ class ControllerTests(unittest.TestCase):
 
         (self.repo / "adopted.py").write_text("# adopted\n")
         adopted_fingerprint = orchestrator.working_tree_fingerprint(self.repo)
-        adopt_crash = WorkflowRun(
+        adopt_crash = _workflow_run(
             run_id="adopt-decision-crash",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -2741,7 +2770,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_writer_schema_round_trip_legacy_defaults_and_report(self) -> None:
         fingerprint = "a" * 64
-        run = WorkflowRun(
+        run = _workflow_run(
             run_id="writer-audit",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -2914,6 +2943,7 @@ class ControllerTests(unittest.TestCase):
                 terra=lambda prompt, repo: ProviderExecution(
                     ["codex"], 0, "human decision required", ""
                 ),
+                controller_root=self.configuration_root,
             ).new_run("009")
 
         self.assertEqual(result.stage, "blocked_policy_ambiguity")
@@ -3265,7 +3295,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_claim_crash_boundaries_and_writer_owner_cannot_be_bypassed(self) -> None:
         orphan_runs = self.runs / "claim-rollback"
-        orphan = WorkflowRun(
+        orphan = _workflow_run(
             run_id="claim-rollback-orphan",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -3307,7 +3337,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(later.stage, "blocked_policy_ambiguity")
 
         committed_runs = self.runs / "claim-committed"
-        created = WorkflowRun(
+        created = _workflow_run(
             run_id="claim-committed-before-provider",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -3348,7 +3378,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(resumed.stage, "blocked_policy_ambiguity")
 
         writer_runs = self.runs / "writer-owner"
-        writer = WorkflowRun(
+        writer = _workflow_run(
             run_id="writer-block-owner",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -3376,7 +3406,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_legacy_claim_round_trip_reporting_and_scope_boundaries(self) -> None:
         legacy_runs = self.runs / "legacy"
-        legacy = WorkflowRun(
+        legacy = _workflow_run(
             run_id="legacy-unowned",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -3510,7 +3540,7 @@ class StableProviderIdentityTests(unittest.TestCase):
             ),
         }
         values.update(updates)
-        return WorkflowRun(**values)
+        return _workflow_run(**values)
 
     def test_catalog_is_closed_unique_and_current_schema_has_no_legacy_fields(self) -> None:
         routes = tuple(orchestrator.ROUTE_IDENTITIES.values())
@@ -3538,7 +3568,7 @@ class StableProviderIdentityTests(unittest.TestCase):
         )
         run = self.run_fixture(provider_runs=[record])
         dumped = run.model_dump(mode="json")
-        self.assertEqual(dumped["schema_version"], 12)
+        self.assertEqual(dumped["schema_version"], 13)
         self.assertIsNone(dumped["migration_audit"])
         self.assertIsNone(dumped["identity_migration_audit"])
         self.assertNotIn("provider", dumped["provider_runs"][0])
@@ -3839,7 +3869,7 @@ class PrivateStorageTests(unittest.TestCase):
         self.temp.cleanup()
 
     def run_fixture(self, run_id: str = "private-run") -> WorkflowRun:
-        return WorkflowRun(
+        return _workflow_run(
             run_id=run_id,
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -4102,25 +4132,10 @@ class PrivateStorageTests(unittest.TestCase):
 import os
 from pathlib import Path
 import orchestrator
-from models import RepoState, WorkflowRun, resolve_correction_policy
 runs = Path(os.environ['CONTINUO_TEST_RUNS'])
-run = WorkflowRun(
-    run_id='crash',
-    created_at='2026-08-02T00:00:00+00:00',
-    task_ref='009',
-    task_file='tasks/009.md',
-    task_sha256='0' * 64,
-    specification='crash replacement',
-    resolved_correction_policy=resolve_correction_policy(),
-    repo=RepoState(
-        repo=os.environ['CONTINUO_TEST_REPO'],
-        branch='main',
-        head='1' * 40,
-        clean=True,
-        origin='https://example.invalid/jobs.git',
-    ),
-    stage='changed',
-)
+run = orchestrator.load_run('crash', runs)
+run.specification = 'crash replacement'
+run.stage = 'changed'
 orchestrator.os.replace = lambda source, destination: os._exit(17)
 orchestrator.persist(run, runs)
 """
@@ -4229,7 +4244,7 @@ orchestrator.persist(run, runs)
         with patch.object(
             orchestrator, "RUNS", runs
         ), orchestrator.console.capture() as capture:
-            orchestrator.status(None)
+            orchestrator.status(None, False, None)
         concise = capture.get()
         self.assertIn("inspection", concise)
         self.assertNotIn("sensitive specification fixture", concise)
@@ -4239,7 +4254,7 @@ orchestrator.persist(run, runs)
         with patch.object(
             orchestrator, "RUNS", runs
         ), orchestrator.console.capture() as capture:
-            orchestrator.report("inspection")
+            orchestrator.report("inspection", False, None)
         report = capture.get()
         self.assertIn("Hardened legacy storage permissions", report)
         self.assertNotIn("sensitive specification fixture", report)
@@ -4249,7 +4264,7 @@ orchestrator.persist(run, runs)
         with patch.object(
             orchestrator, "RUNS", runs
         ), orchestrator.console.capture() as capture:
-            orchestrator.status("inspection")
+            orchestrator.status("inspection", False, None)
         full = capture.get()
         self.assertIn("sensitive specification fixture", full)
         self.assertEqual(self.mode(run_path), 0o600)
@@ -4259,7 +4274,7 @@ orchestrator.persist(run, runs)
         self.assertNotIn("os.umask", source)
         self.assertNotIn("os.chown", source)
         self.assertNotIn("force-unlock", source)
-        self.assertEqual(self.run_fixture().schema_version, 12)
+        self.assertEqual(self.run_fixture().schema_version, 13)
         command_names = {
             command.name or command.callback.__name__.replace("_", "-")
             for command in orchestrator.app.registered_commands
@@ -4288,6 +4303,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-m", "fixture")
         self.runs = Path(self.temp.name) / "runs"
+        self.configuration_root = Path(self.temp.name) / "configuration"
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -4301,6 +4317,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
             sol=sol or (lambda prompt, repo: providers.ProviderExecution(["codex"], 0, "GUIDANCE: bounded guidance", "")),
             luna=luna or self.luna,
             approval=approval,
+            controller_root=self.configuration_root,
         )
 
     def luna(self, prompt, repo):
@@ -4328,7 +4345,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
             ),
         }
         values.update(updates)
-        return WorkflowRun(**values)
+        return _workflow_run(**values)
 
     def review_result(self, category, summary="fixture", finding_key=None):
         if category == "PASS":
@@ -4371,7 +4388,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
         )
 
     def armed_review_run(self, stage, operation, *, stdout=None, **updates):
-        run = WorkflowRun(
+        run = _workflow_run(
             run_id=f"{stage}-recovery",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -4395,8 +4412,8 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
         return run
 
     def test_i1_model_shapes_schema_and_no_raw_reparse_in_control(self) -> None:
-        self.assertEqual(orchestrator.CURRENT_RUN_SCHEMA_VERSION, 12)
-        self.assertEqual(self.run_fixture().schema_version, 12)
+        self.assertEqual(orchestrator.CURRENT_RUN_SCHEMA_VERSION, 13)
+        self.assertEqual(self.run_fixture().schema_version, 13)
         for model in (
             orchestrator.ReviewResult,
             orchestrator.ReviewRecord,
@@ -4603,7 +4620,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
 
     def test_p1_new_run_has_empty_review_state_and_no_audits(self) -> None:
         run = self.run_fixture()
-        self.assertEqual(run.schema_version, 12)
+        self.assertEqual(run.schema_version, 13)
         self.assertEqual(run.review_records, [])
         self.assertEqual(run.unreadable_review_records, [])
         self.assertIsNone(run.review_migration_audit)
@@ -5032,7 +5049,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
 
         orchestrator.persist(run, self.runs)
         with patch.object(orchestrator, "RUNS", self.runs), orchestrator.console.capture() as capture:
-            orchestrator.status(run.run_id)
+            orchestrator.status(run.run_id, False, None)
         status_output = capture.get()
         self.assertIn("unreadable_review_records", status_output)
         self.assertIn("invalid_review_envelope", status_output)
@@ -5225,7 +5242,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
         self.assertNotIn("unreadable review record(s)", report_output)
 
         with patch.object(orchestrator, "RUNS", self.runs), orchestrator.console.capture() as capture:
-            orchestrator.status(run.run_id)
+            orchestrator.status(run.run_id, False, None)
         status_output = capture.get()
         self.assertIn("review_records", status_output)
         self.assertIn("specification_review", status_output)
@@ -5244,14 +5261,14 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
         path.chmod(0o600)
 
         with patch.object(orchestrator, "RUNS", self.runs), orchestrator.console.capture() as capture:
-            orchestrator.status(run_id)
+            orchestrator.status(run_id, False, None)
         bounded = capture.get()
         self.assertIn("MIGRATION_REQUIRED", bounded)
         self.assertNotIn("Synthetic current review output", bounded)
 
         with orchestrator.console.capture():
             with self.assertRaises(typer.Exit):
-                orchestrator.report(run_id)
+                orchestrator.report(run_id, False, None)
 
         with self.assertRaisesRegex(
             orchestrator.ControllerError,
@@ -5267,7 +5284,7 @@ class ImmutableReviewHistoryTests(unittest.TestCase):
         path.write_bytes(migrated.model_dump_json().encode() + b"\n")
         path.chmod(0o600)
         with patch.object(orchestrator, "RUNS", self.runs), orchestrator.console.capture() as capture:
-            orchestrator.status(run_id)
+            orchestrator.status(run_id, False, None)
         blocked = capture.get()
         self.assertIn("RESUME_BLOCKED", blocked)
         self.assertNotIn("Synthetic current review output", blocked)
@@ -5345,7 +5362,7 @@ class PersistedCorrectionPolicyTests(unittest.TestCase):
             "resolved_correction_policy": resolve_correction_policy(),
         }
         values.update(updates)
-        return WorkflowRun(**values)
+        return _workflow_run(**values)
 
     def test_g25_i1_i2_closed_frozen_policy_and_counter_validation(self) -> None:
         policy = resolve_correction_policy()
@@ -5745,7 +5762,7 @@ Diff:
         self.assertTrue(execution.attempts[0].retry_scheduled)
 
     def test_audit_fields_round_trip_and_legacy_defaults_remain_none(self) -> None:
-        run = WorkflowRun(
+        run = _workflow_run(
             run_id="failure-audit",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -6028,13 +6045,18 @@ class Gate28CliContractTests(unittest.TestCase):
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-m", "fixture")
         self.runs = Path(self.temp.name) / "runs"
+        self.configuration_root = Path(self.temp.name) / "configuration"
         self.runner = CliRunner()
 
     def tearDown(self) -> None:
         self.temp.cleanup()
 
     def invoke(self, *arguments: str):
-        with patch.object(orchestrator, "RUNS", self.runs):
+        with patch.object(orchestrator, "RUNS", self.runs), patch.object(
+            orchestrator,
+            "CONFIGURATION_ROOT",
+            self.configuration_root,
+        ):
             return self.runner.invoke(orchestrator.app, list(arguments))
 
     @staticmethod
@@ -6056,7 +6078,7 @@ class Gate28CliContractTests(unittest.TestCase):
         self.assertEqual(payload["command"], "run")
         self.assertTrue(payload["ok"])
         self.assertIsNone(payload["error"])
-        self.assertEqual(payload["result"]["plan_version"], "continuo.run-plan.v1")
+        self.assertEqual(payload["result"]["plan_version"], "continuo.run-plan.v2")
         self.assertNotIn("specification", payload["result"])
 
     def test_json_failure_is_not_mixed_with_rich_output(self) -> None:

@@ -24,6 +24,18 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from configuration import (
+    CONFIGURATION_ROOT,
+    ACCOUNT_PROFILE_CATALOG,
+    ROUTE_PROFILE_CATALOG,
+    ConfigurationError,
+    ResolvedConfigurationResult,
+    dry_run_configuration_summary,
+    revalidate_sources,
+    resolve_configuration,
+    validate_saved_configuration,
+)
+
 from models import (
     ADVERSARIAL_REVIEW_ROUTE,
     ApprovalDecision,
@@ -46,6 +58,7 @@ from models import (
     ReviewRecord,
     ReviewResult,
     ResolvedCorrectionPolicy,
+    RunOverrides,
     TargetOwnership,
     UnreadableReviewRecord,
     WorkflowRun,
@@ -244,8 +257,8 @@ def resolve_task(repo: Path, task_ref: str) -> tuple[str, Path, str]:
 
 
 CLI_CONTRACT_VERSION = "continuo.cli.v1"
-RUN_PLAN_VERSION = "continuo.run-plan.v1"
-DOCTOR_VERSION = "continuo.doctor.v1"
+RUN_PLAN_VERSION = "continuo.run-plan.v2"
+DOCTOR_VERSION = "continuo.doctor.v2"
 
 _PLANNED_STAGES = (
     ("created", "controller"),
@@ -279,6 +292,9 @@ def build_dry_run_plan(
     repo: Path,
     task_ref: str,
     runs_dir: Path = RUNS,
+    *,
+    controller_root: Path | None = None,
+    run_overrides: RunOverrides | None = None,
 ) -> dict[str, object]:
     """Read deterministic pre-provider inputs without creating controller state."""
 
@@ -288,6 +304,13 @@ def build_dry_run_plan(
     storage = _read_only_storage_status(runs_dir)
     if storage["status"] == "fail":
         raise ControllerError("private storage is unsafe for a dry-run plan")
+    identity = target_identity(repo)
+    resolved = resolve_configuration(
+        target_key=identity.target_key,
+        canonical_repo=identity.canonical_repo,
+        controller_root=(controller_root or CONFIGURATION_ROOT),
+        run_overrides=run_overrides,
+    )
     relative, _, specification = resolve_task(repo, task_ref)
     return {
         "plan_version": RUN_PLAN_VERSION,
@@ -307,6 +330,7 @@ def build_dry_run_plan(
             {"id": stage, "authority": authority}
             for stage, authority in _PLANNED_STAGES
         ],
+        "configuration": dry_run_configuration_summary(resolved.configuration),
         "run_storage": storage,
     }
 
@@ -320,7 +344,12 @@ def _doctor_check(
     return {"id": check_id, "status": status, "code": code, "summary": summary}
 
 
-def doctor_report(repo: Path, runs_dir: Path = RUNS) -> dict[str, object]:
+def doctor_report(
+    repo: Path,
+    runs_dir: Path = RUNS,
+    *,
+    controller_root: Path | None = None,
+) -> dict[str, object]:
     """Return local readiness evidence without repairing or invoking providers."""
 
     checks: list[dict[str, str]] = []
@@ -368,6 +397,54 @@ def doctor_report(repo: Path, runs_dir: Path = RUNS) -> dict[str, object]:
                 _doctor_check("target_state", "unknown", "git_unavailable", "Target state was not inspected."),
             )
         )
+
+    if state is None:
+        checks.append(
+            _doctor_check(
+                "configuration",
+                "unknown",
+                "target_unavailable",
+                "Configuration target binding could not be inspected.",
+            )
+        )
+    else:
+        try:
+            identity = target_identity(repo)
+            resolved = resolve_configuration(
+                target_key=identity.target_key,
+                canonical_repo=identity.canonical_repo,
+                controller_root=(controller_root or CONFIGURATION_ROOT),
+            )
+        except ConfigurationError as exc:
+            checks.append(
+                _doctor_check(
+                    "configuration",
+                    "fail",
+                    exc.code,
+                    "Trusted configuration is unavailable or invalid.",
+                )
+            )
+        else:
+            builtin = (
+                resolved.configuration.project_source.source_kind
+                == "builtin_compatibility"
+            )
+            checks.append(
+                _doctor_check(
+                    "configuration",
+                    "warn" if builtin else "pass",
+                    (
+                        "configuration_builtin_compatibility"
+                        if builtin
+                        else "configuration_valid"
+                    ),
+                    (
+                        "Built-in compatibility configuration is active."
+                        if builtin
+                        else "Trusted project configuration is valid."
+                    ),
+                )
+            )
 
     storage = _read_only_storage_status(runs_dir)
     checks.append(_doctor_check("run_storage", storage["status"], storage["code"], storage["summary"]))
@@ -1682,6 +1759,28 @@ def _run_report(run: WorkflowRun) -> dict[str, object]:
     )
 
     return {
+        "configuration": (
+            {
+                "profile_id": run.resolved_configuration.profile_id,
+                "configuration_sha256": (
+                    run.resolved_configuration.configuration_sha256
+                ),
+                "role_bindings": {
+                    role: {
+                        "route_id": binding.route_profile.route_id,
+                        "provider_account_profile_id": (
+                            binding.provider_account_profile
+                            .provider_account_profile_id
+                        ),
+                    }
+                    for role, binding in (
+                        run.resolved_configuration.role_bindings.items()
+                    )
+                },
+            }
+            if run.resolved_configuration is not None
+            else None
+        ),
         "provider_logical_invocations_total": len(invocation_groups),
         "provider_physical_attempts_total": len(run.provider_runs),
         "role_logical_invocation_counts": dict(logical_role_counts),
@@ -1753,6 +1852,13 @@ def _print_run_report(run: WorkflowRun) -> None:
         "Wall-clock span: "
         + _format_duration(report["wall_seconds"])
     )
+    configuration = report["configuration"]
+    if configuration is not None:
+        console.print(
+            "Configuration: "
+            f"{configuration['profile_id']} "
+            f"({configuration['configuration_sha256'][:12]})"
+        )
 
     logical_total = int(report["provider_logical_invocations_total"])
     physical_total = int(report["provider_physical_attempts_total"])
@@ -2198,6 +2304,8 @@ class Controller:
         luna: Callable[[str, Path], ProviderExecution] = execute_luna_implementation,
         approval: Callable[[str], bool] | None = None,
         approval_actor: Callable[[], str] | None = None,
+        controller_root: Path | None = None,
+        run_overrides: RunOverrides | None = None,
     ) -> None:
         self.repo = repo
         self.runs_dir = runs_dir
@@ -2205,6 +2313,11 @@ class Controller:
         self.terra = terra
         self.sol = sol
         self.luna = luna
+        resolved_root = controller_root or CONFIGURATION_ROOT
+        if not resolved_root.is_absolute():
+            raise ControllerError("configuration controller root must be absolute")
+        self.controller_root = resolved_root
+        self.run_overrides = run_overrides
         self._providers_by_role: dict[
             str,
             Callable[[str, Path], ProviderExecution],
@@ -2298,15 +2411,67 @@ class Controller:
 
     def _provider_for(
         self,
+        run: WorkflowRun,
         identity: ProviderRouteIdentity,
     ) -> Callable[[str, Path], ProviderExecution]:
+        self._require_provider_binding(run, identity)
         catalog = ROUTE_IDENTITIES[identity.role_id]
         if _identity_control_key(identity) != _identity_control_key(catalog):
             raise ControllerError("saved provider route is not recognized")
         return self._providers_by_role[identity.role_id]
 
     @staticmethod
+    def _require_provider_binding(
+        run: WorkflowRun,
+        identity: ProviderRouteIdentity,
+    ) -> None:
+        configuration = run.resolved_configuration
+        if configuration is None:
+            raise ControllerError("configuration_missing")
+        binding = configuration.role_bindings.get(identity.role_id)
+        if binding is None:
+            raise ControllerError("configuration_binding_mismatch")
+        route = binding.route_profile
+        account = binding.provider_account_profile
+        registered_route = ROUTE_PROFILE_CATALOG.get(identity.route_id)
+        registered_account = ACCOUNT_PROFILE_CATALOG.get(
+            account.provider_account_profile_id
+        )
+        if (
+            registered_route is None
+            or registered_account is None
+            or route != registered_route
+            or account != registered_account
+            or route.route_id != identity.route_id
+            or route.role_id != identity.role_id
+            or route.provider_adapter_id != identity.provider_adapter_id
+            or route.model_id != identity.model_id
+            or route.provider_adapter_id != account.provider_adapter_id
+        ):
+            raise ControllerError("configuration_binding_mismatch")
+
+    def _validate_live_configuration(self, run: WorkflowRun) -> None:
+        configuration = run.resolved_configuration
+        if configuration is None:
+            raise ControllerError("configuration_missing")
+        identity = target_identity(self.repo)
+        try:
+            validate_saved_configuration(
+                configuration,
+                target_key=identity.target_key,
+                canonical_repo=identity.canonical_repo,
+                controller_root=self.controller_root,
+            )
+        except ConfigurationError as exc:
+            raise ControllerError(str(exc)) from exc
+
+    @staticmethod
     def _require_executable(run: WorkflowRun) -> None:
+        if run.configuration_migration_audit is not None:
+            raise ControllerError(
+                "run execution refused: migrated record disposition is "
+                f"{run.configuration_migration_audit.disposition}"
+            )
         if run.provider_invocation_migration_audit is not None:
             raise ControllerError(
                 "run execution refused: migrated record disposition is "
@@ -2351,6 +2516,7 @@ class Controller:
     def approve_policy(self, run_id: str, approved_text: str) -> WorkflowRun:
         run = load_run(run_id, self.runs_dir)
         self._require_executable(run)
+        self._validate_live_configuration(run)
         coordinator = TargetCoordinator(self.repo, self.runs_dir)
         if run.target_ownership is None:
             self._resume_guard(run)
@@ -2452,6 +2618,7 @@ class Controller:
     def decline_policy(self, run_id: str, text: str = "Policy decision declined.") -> WorkflowRun:
         run = load_run(run_id, self.runs_dir)
         self._require_executable(run)
+        self._validate_live_configuration(run)
         coordinator = TargetCoordinator(self.repo, self.runs_dir)
         if run.target_ownership is None:
             self._resume_guard(run)
@@ -2473,6 +2640,7 @@ class Controller:
     ) -> WorkflowRun:
         run = load_run(run_id, self.runs_dir)
         self._require_executable(run)
+        self._validate_live_configuration(run)
         coordinator = TargetCoordinator(self.repo, self.runs_dir)
         if run.target_ownership is None:
             self._resume_guard(run)
@@ -2595,6 +2763,7 @@ class Controller:
     def release_target(self, run_id: str, note: str) -> WorkflowRun:
         run = load_run(run_id, self.runs_dir)
         self._require_executable(run)
+        self._validate_live_configuration(run)
         note = note.strip()
         if not note:
             raise ControllerError("target release note cannot be empty")
@@ -2733,7 +2902,7 @@ class Controller:
             f"[yellow]Invalid {identity.display_name} structured output; "
             "retrying the same provider once.[/yellow]"
         )
-        provider = self._provider_for(identity)
+        provider = self._provider_for(run, identity)
         execution = provider(prompt, self.repo)
         execution = _record_provider(
             run,
@@ -2830,7 +2999,7 @@ class Controller:
                 "blocked_interrupted_provider",
                 "saved provider identity does not match the resume stage",
             )
-        provider = self._provider_for(saved_identity)
+        provider = self._provider_for(run, saved_identity)
         run.stage = stage
         run.last_error = None
         self._save(run)
@@ -2872,6 +3041,7 @@ class Controller:
         return result
 
     def _policy_stop(self, run: WorkflowRun, reason: str) -> WorkflowRun:
+        self._require_provider_binding(run, POLICY_AUTHORITY_ROUTE)
         run.stage = "terra_resolving"
         prompt = _terra_prompt(run, reason)
         self._arm_provider(
@@ -2913,6 +3083,7 @@ class Controller:
         return run
 
     def _review(self, run: WorkflowRun, purpose: str) -> ReviewResult | None:
+        self._require_provider_binding(run, ADVERSARIAL_REVIEW_ROUTE)
         run.stage = (
             "spec_reviewing"
             if purpose == "specification"
@@ -3141,6 +3312,7 @@ class Controller:
         )
 
     def _execute_armed_writer(self, run: WorkflowRun) -> bool:
+        self._require_provider_binding(run, IMPLEMENTATION_ROUTE)
         active = run.active_writer_attempt
         prompt = run.provider_resume_prompt
         if active is None or not prompt:
@@ -3207,6 +3379,7 @@ class Controller:
         return self._verify(run)
 
     def _implement(self, run: WorkflowRun, correction: bool = False) -> bool:
+        self._require_provider_binding(run, IMPLEMENTATION_ROUTE)
         stage: WriterAttemptStage = (
             "correcting" if correction else "implementing"
         )
@@ -3256,6 +3429,7 @@ class Controller:
         finding_key: str,
         escalation_round: int,
     ) -> bool:
+        self._require_provider_binding(run, ESCALATION_EXECUTIVE_ROUTE)
         run.stage = "sol_escalating"
         prompt = _sol_prompt(
             run,
@@ -3437,6 +3611,16 @@ class Controller:
 
     def new_run(self, task_ref: str) -> WorkflowRun:
         state = repo_state(self.repo)
+        identity = target_identity(self.repo)
+        try:
+            resolved = resolve_configuration(
+                target_key=identity.target_key,
+                canonical_repo=identity.canonical_repo,
+                controller_root=self.controller_root,
+                run_overrides=self.run_overrides,
+            )
+        except ConfigurationError as exc:
+            raise ControllerError(str(exc)) from exc
         relative, _, specification = resolve_task(self.repo, task_ref)
         run = WorkflowRun(
             run_id=uuid.uuid4().hex[:12],
@@ -3447,10 +3631,19 @@ class Controller:
             specification=specification,
             repo=state,
             resolved_correction_policy=resolve_correction_policy(),
+            resolved_configuration=resolved.configuration,
         )
         if not state.clean:
+            try:
+                revalidate_sources(resolved)
+            except ConfigurationError as exc:
+                raise ControllerError(str(exc)) from exc
             self._save(run)
             return self._block(run, "blocked_dirty_repo", "jobs repo must be clean before starting")
+        try:
+            revalidate_sources(resolved)
+        except ConfigurationError as exc:
+            raise ControllerError(str(exc)) from exc
         coordinator = TargetCoordinator(self.repo, self.runs_dir)
         coordinator.claim_new(run)
         with coordinator.execute(run) as connection:
@@ -3524,6 +3717,7 @@ class Controller:
     def resume(self, run_id: str) -> WorkflowRun:
         run = load_run(run_id, self.runs_dir)
         self._require_executable(run)
+        self._validate_live_configuration(run)
         coordinator = TargetCoordinator(self.repo, self.runs_dir)
         if run.target_ownership is None:
             self._resume_guard(run)
@@ -3917,7 +4111,11 @@ def _require_json_version(
 
 
 def _error_code(exc: Exception) -> str:
+    if isinstance(exc, ConfigurationError):
+        return exc.code
     message = str(exc).lower()
+    if message.startswith("configuration_"):
+        return message.split(":", 1)[0]
     if "task-ref" in message or "single safe identifier" in message:
         return "invalid_input"
     if "no task specification matches" in message:
@@ -3946,7 +4144,12 @@ def _handle_error(
             with console.capture():
                 return action()
         return action()
-    except (ControllerError, OSError, subprocess.SubprocessError) as exc:
+    except (
+        ConfigurationError,
+        ControllerError,
+        OSError,
+        subprocess.SubprocessError,
+    ) as exc:
         if json_output and command is not None:
             _emit_json(
                 command,

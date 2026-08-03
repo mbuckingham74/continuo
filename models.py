@@ -1,5 +1,7 @@
 """Persistent data models used by the orchestration controller."""
 
+import hashlib
+import json
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Literal
@@ -7,7 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-CURRENT_RUN_SCHEMA_VERSION = 12
+CURRENT_RUN_SCHEMA_VERSION = 13
 OLDEST_MIGRATABLE_RUN_SCHEMA_VERSION = 1
 
 
@@ -217,6 +219,7 @@ RunStructuralClass = Literal[
     "V9",
     "V10",
     "V11",
+    "V12",
 ]
 
 
@@ -318,6 +321,314 @@ def resolve_correction_policy() -> ResolvedCorrectionPolicy:
     """Resolve the sole built-in policy for a newly created run."""
 
     return ResolvedCorrectionPolicy()
+
+
+_STABLE_CONTROL_ID = r"^[a-z0-9][a-z0-9._:-]{0,239}$"
+_SHA256 = r"^[0-9a-f]{64}$"
+
+
+def _authority_sha256(value: BaseModel, *, exclude: set[str]) -> str:
+    payload = value.model_dump(mode="json", exclude=exclude)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8") + b"\n"
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class EffortPolicy(BaseModel):
+    """Closed adapter-owned effort authority carried by a complete route."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    mode: Literal["explicit", "provider_default", "not_supported"]
+    effort_id: str | None = Field(default=None, pattern=_STABLE_CONTROL_ID)
+    enforcement_policy_id: str | None = Field(
+        default=None,
+        pattern=_STABLE_CONTROL_ID,
+    )
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> "EffortPolicy":
+        if self.mode == "explicit":
+            if self.effort_id is None or self.enforcement_policy_id is None:
+                raise ValueError("explicit effort lacks enforcement identity")
+        elif self.mode == "provider_default":
+            if self.effort_id is not None or self.enforcement_policy_id is None:
+                raise ValueError("provider-default effort is incoherent")
+        elif self.effort_id is not None or self.enforcement_policy_id is not None:
+            raise ValueError("unsupported effort carries control identity")
+        return self
+
+
+class ProviderRouteProfile(BaseModel):
+    """Immutable, completely registered provider-route authority payload."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    provider_route_profile_schema_version: Literal[2] = 2
+    route_id: str = Field(pattern=_STABLE_CONTROL_ID)
+    role_id: OrchestrationRole
+    provider_adapter_id: ProviderAdapterId
+    model_id: str = Field(min_length=1, max_length=240)
+    operation_ids: tuple[ProviderOperation, ...] = Field(min_length=1, strict=False)
+    command_builder_policy_id: str = Field(pattern=_STABLE_CONTROL_ID)
+    output_contract_id: str = Field(pattern=_STABLE_CONTROL_ID)
+    capability_profile_id: str = Field(pattern=_STABLE_CONTROL_ID)
+    prompt_preamble_id: str = Field(pattern=_STABLE_CONTROL_ID)
+    supervision_policy_id: str = Field(pattern=_STABLE_CONTROL_ID)
+    retry_policy_id: str = Field(pattern=_STABLE_CONTROL_ID)
+    content_retry_policy_id: str = Field(pattern=_STABLE_CONTROL_ID)
+    effort: EffortPolicy
+    route_profile_sha256: str = Field(pattern=_SHA256)
+
+    @model_validator(mode="after")
+    def validate_hash_and_operations(self) -> "ProviderRouteProfile":
+        if len(set(self.operation_ids)) != len(self.operation_ids):
+            raise ValueError("route operations are duplicated")
+        if any(OPERATION_ROLES[item] != self.role_id for item in self.operation_ids):
+            raise ValueError("route operation does not match role")
+        if _authority_sha256(self, exclude={"route_profile_sha256"}) != self.route_profile_sha256:
+            raise ValueError("route profile hash is incoherent")
+        return self
+
+
+class ProviderAccountProfile(BaseModel):
+    """Immutable non-secret provider-account authority payload."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    provider_account_profile_schema_version: Literal[1] = 1
+    provider_account_profile_contract_id: Literal[
+        "continuo.provider-account-profile.v1"
+    ] = "continuo.provider-account-profile.v1"
+    provider_account_profile_id: str = Field(pattern=_STABLE_CONTROL_ID)
+    provider_adapter_id: ProviderAdapterId
+    authentication_method_id: str = Field(pattern=_STABLE_CONTROL_ID)
+    transport_scope_profile_id: str = Field(pattern=_STABLE_CONTROL_ID)
+    identity_assurance: Literal["controller_profile", "provider_verified"]
+    remote_principal_id: str | None = Field(default=None, min_length=1, max_length=240)
+    provider_account_profile_sha256: str = Field(pattern=_SHA256)
+
+    @model_validator(mode="after")
+    def validate_identity_and_hash(self) -> "ProviderAccountProfile":
+        if self.identity_assurance == "provider_verified":
+            if self.remote_principal_id is None:
+                raise ValueError("verified account lacks remote principal identity")
+        elif self.remote_principal_id is not None:
+            raise ValueError("controller account invents remote principal identity")
+        if _authority_sha256(
+            self,
+            exclude={"provider_account_profile_sha256"},
+        ) != self.provider_account_profile_sha256:
+            raise ValueError("provider account profile hash is incoherent")
+        return self
+
+
+class RouteAccountSelection(BaseModel):
+    """One atomic route/account selection; neither half can inherit."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    route_id: str = Field(pattern=_STABLE_CONTROL_ID)
+    provider_account_profile_id: str = Field(pattern=_STABLE_CONTROL_ID)
+
+
+class RoleBindingPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    permitted_bindings: tuple[RouteAccountSelection, ...] = Field(
+        min_length=1,
+        max_length=32,
+        strict=False,
+    )
+    default_binding: RouteAccountSelection
+
+    @model_validator(mode="after")
+    def validate_bindings(self) -> "RoleBindingPolicy":
+        keys = [
+            (item.route_id, item.provider_account_profile_id)
+            for item in self.permitted_bindings
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("permitted binding is duplicated")
+        default = (
+            self.default_binding.route_id,
+            self.default_binding.provider_account_profile_id,
+        )
+        if default not in keys:
+            raise ValueError("default binding is not permitted")
+        return self
+
+
+class ConfigurationTargetBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    target_key: str = Field(pattern=_SHA256)
+    canonical_repo: str = Field(min_length=1, max_length=4096)
+
+
+class ProjectPolicySelection(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    correction_policy_id: Literal["builtin.correction_escalation.v1"] = (
+        "builtin.correction_escalation.v1"
+    )
+
+
+class ProjectConfiguration(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    project_configuration_schema_version: Literal[2] = 2
+    project_configuration_id: str = Field(
+        pattern=r"^project-config-v2:[0-9a-f]{64}$"
+    )
+    target_binding: ConfigurationTargetBinding
+    profile_id: Literal["continuo.jobs-compat.v1"] = "continuo.jobs-compat.v1"
+    role_bindings: dict[OrchestrationRole, RoleBindingPolicy]
+    policy: ProjectPolicySelection
+
+    @model_validator(mode="after")
+    def validate_complete_target(self) -> "ProjectConfiguration":
+        if set(self.role_bindings) != set(ROUTE_IDENTITIES):
+            raise ValueError("project configuration must define every role")
+        expected = f"project-config-v2:{self.target_binding.target_key}"
+        if self.project_configuration_id != expected:
+            raise ValueError("project configuration id does not match target")
+        return self
+
+
+class UserDefaults(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    user_defaults_schema_version: Literal[2] = 2
+    role_bindings: dict[OrchestrationRole, RouteAccountSelection] = Field(
+        default_factory=dict,
+        max_length=4,
+    )
+
+
+class RunOverrides(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    run_overrides_schema_version: Literal[2] = 2
+    role_bindings: dict[OrchestrationRole, RouteAccountSelection] = Field(
+        default_factory=dict,
+        max_length=4,
+    )
+
+
+class ConfigurationSourceMetadata(BaseModel):
+    """Redacted immutable source provenance with no private controller path."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    source_kind: Literal["private_file", "builtin_compatibility", "absent", "typed"]
+    schema_version: int | None = Field(default=None, ge=1)
+    source_id: str | None = Field(default=None, min_length=1, max_length=240)
+    target_key: str | None = Field(default=None, pattern=_SHA256)
+    canonical_repo: str | None = Field(default=None, min_length=1, max_length=4096)
+    payload_sha256: str | None = Field(default=None, pattern=_SHA256)
+
+    @model_validator(mode="after")
+    def validate_kind(self) -> "ConfigurationSourceMetadata":
+        if self.source_kind == "absent":
+            if any(
+                value is not None
+                for value in (
+                    self.schema_version,
+                    self.source_id,
+                    self.target_key,
+                    self.canonical_repo,
+                    self.payload_sha256,
+                )
+            ):
+                raise ValueError("absent source contains provenance")
+        elif self.schema_version is None or self.payload_sha256 is None:
+            raise ValueError("present source lacks provenance")
+        project_source = self.source_kind == "builtin_compatibility" or (
+            self.source_kind == "private_file"
+            and self.source_id is not None
+            and self.source_id.startswith("project-config-v2:")
+        )
+        if project_source and (
+            self.source_id is None
+            or self.target_key is None
+            or self.canonical_repo is None
+        ):
+            raise ValueError("project source lacks target provenance")
+        return self
+
+
+class ResolvedRoleBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    selection_source: Literal["run_override", "user_default", "project_default"]
+    route_profile: ProviderRouteProfile
+    provider_account_profile: ProviderAccountProfile
+
+    @model_validator(mode="after")
+    def validate_adapter(self) -> "ResolvedRoleBinding":
+        if (
+            self.route_profile.provider_adapter_id
+            != self.provider_account_profile.provider_adapter_id
+        ):
+            raise ValueError("route/account adapters do not match")
+        return self
+
+
+class ResolvedConfiguration(BaseModel):
+    """Complete immutable authority snapshot persisted before workflow work."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    resolved_configuration_schema_version: Literal[2] = 2
+    profile_id: Literal["continuo.jobs-compat.v1"] = "continuo.jobs-compat.v1"
+    role_bindings: dict[OrchestrationRole, ResolvedRoleBinding]
+    correction_policy: ResolvedCorrectionPolicy
+    project_source: ConfigurationSourceMetadata
+    user_defaults_source: ConfigurationSourceMetadata
+    run_overrides_source: ConfigurationSourceMetadata
+    selected_account_profile_hashes: dict[OrchestrationRole, str]
+    configuration_sha256: str = Field(pattern=_SHA256)
+
+    @model_validator(mode="after")
+    def validate_complete_hash(self) -> "ResolvedConfiguration":
+        required = set(ROUTE_IDENTITIES)
+        if set(self.role_bindings) != required:
+            raise ValueError("resolved configuration must bind every role")
+        if set(self.selected_account_profile_hashes) != required:
+            raise ValueError("resolved account provenance must cover every role")
+        for role, binding in self.role_bindings.items():
+            if binding.route_profile.role_id != role:
+                raise ValueError("resolved route role is incoherent")
+            if (
+                self.selected_account_profile_hashes[role]
+                != binding.provider_account_profile.provider_account_profile_sha256
+            ):
+                raise ValueError("resolved account hash is incoherent")
+        if _authority_sha256(self, exclude={"configuration_sha256"}) != self.configuration_sha256:
+            raise ValueError("resolved configuration hash is incoherent")
+        return self
+
+
+class ConfigurationMigrationAudit(BaseModel):
+    """Proof that a historical run lacked resolved configuration authority."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    migration_id: str = Field(min_length=1, max_length=64)
+    migrated_at: str
+    source_schema_version: int = Field(ge=1, lt=13)
+    target_schema_version: Literal[13] = 13
+    source_structural_class: RunStructuralClass
+    source_sha256: str = Field(pattern=_SHA256)
+    applied_steps: tuple[str, ...] = Field(min_length=1, strict=False)
+    reason_codes: tuple[str, ...] = Field(default_factory=tuple, strict=False)
+    disposition: RunMigrationDisposition
 
 
 class PolicyMigrationAudit(BaseModel):
@@ -545,7 +856,7 @@ class WorkflowRun(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal[12] = CURRENT_RUN_SCHEMA_VERSION
+    schema_version: Literal[13] = CURRENT_RUN_SCHEMA_VERSION
     run_id: str
     created_at: str
     updated_at: str | None = None
@@ -557,6 +868,7 @@ class WorkflowRun(BaseModel):
     stage: str = "created"
     correction_cycles: int = Field(default=0, ge=0)
     resolved_correction_policy: ResolvedCorrectionPolicy | None
+    resolved_configuration: ResolvedConfiguration | None
     spec_review: ReviewResult | None = None
     implementation_review: ReviewResult | None = None
     review_records: list[ReviewRecord] = Field(default_factory=list)
@@ -580,6 +892,7 @@ class WorkflowRun(BaseModel):
     provider_invocation_migration_audit: (
         ProviderInvocationMigrationAudit | None
     ) = None
+    configuration_migration_audit: ConfigurationMigrationAudit | None = None
     target_ownership: TargetOwnership | None = None
     active_writer_attempt: WriterAttemptState | None = None
     writer_recovery_decisions: list[WriterRecoveryDecision] = Field(
@@ -602,6 +915,7 @@ class WorkflowRun(BaseModel):
         policy_audit = self.policy_migration_audit
         approval_audit = self.approval_migration_audit
         invocation_audit = self.provider_invocation_migration_audit
+        configuration_audit = self.configuration_migration_audit
         if legacy_audit is not None and identity_audit is None:
             raise ValueError("schema-8 migration audit lacks identity audit")
         if identity_audit is not None:
@@ -758,6 +1072,42 @@ class WorkflowRun(BaseModel):
                     "provider invocation migration lineage is incoherent"
                 )
 
+        if configuration_audit is not None:
+            if (
+                not configuration_audit.applied_steps
+                or configuration_audit.applied_steps[-1] != "12_to_13"
+                or "missing_resolved_configuration"
+                not in configuration_audit.reason_codes
+                or self.resolved_configuration is not None
+            ):
+                raise ValueError("configuration migration audit is incoherent")
+            if configuration_audit.source_schema_version == 12:
+                if configuration_audit.applied_steps != ("12_to_13",):
+                    raise ValueError("configuration migration lineage is incoherent")
+            elif invocation_audit is None or (
+                invocation_audit.migration_id != configuration_audit.migration_id
+                or invocation_audit.migrated_at != configuration_audit.migrated_at
+                or invocation_audit.source_schema_version
+                != configuration_audit.source_schema_version
+                or invocation_audit.source_structural_class
+                != configuration_audit.source_structural_class
+                or invocation_audit.source_sha256
+                != configuration_audit.source_sha256
+                or invocation_audit.applied_steps
+                != configuration_audit.applied_steps[:-1]
+                or invocation_audit.disposition
+                != configuration_audit.disposition
+            ):
+                raise ValueError("configuration migration lineage is incoherent")
+        elif self.resolved_configuration is None:
+            raise ValueError("ordinary run lacks resolved configuration")
+        elif (
+            self.resolved_correction_policy is None
+            or self.resolved_configuration.correction_policy
+            != self.resolved_correction_policy
+        ):
+            raise ValueError("resolved configuration policy is incoherent")
+
         if (
             self.resolved_correction_policy is not None
             and self.correction_cycles
@@ -783,6 +1133,7 @@ class WorkflowRun(BaseModel):
             or self.policy_migration_audit is not None
             or self.approval_migration_audit is not None
             or self.provider_invocation_migration_audit is not None
+            or self.configuration_migration_audit is not None
         )
         seen_invocation_ids: set[str] = set()
         current_invocation_id: str | None = None

@@ -17,6 +17,7 @@ import typer
 
 import orchestrator
 import run_migrations
+from configuration import resolve_configuration
 from models import (
     ApprovalDecision,
     ApprovalRequest,
@@ -28,6 +29,32 @@ from models import (
 
 
 FIXTURES = Path(__file__).parent / "test_fixtures" / "run_schemas"
+
+
+def _workflow_run(**kwargs) -> WorkflowRun:
+    """Build an ordinary schema-13 fixture with target-bound configuration."""
+
+    repo = kwargs["repo"]
+    repo_path = Path(repo.repo).resolve()
+    try:
+        identity = orchestrator.target_identity(repo_path)
+        target_key = identity.target_key
+        canonical_repo = identity.canonical_repo
+    except (FileNotFoundError, OSError):
+        canonical_repo = str(repo_path)
+        target_key = hashlib.sha256(
+            f"continuo-test-target-v1\0{canonical_repo}".encode()
+        ).hexdigest()
+    missing_root = repo_path.parent / f".continuo-test-absent-{target_key[:16]}"
+    kwargs.setdefault(
+        "resolved_configuration",
+        resolve_configuration(
+            target_key=target_key,
+            canonical_repo=canonical_repo,
+            controller_root=missing_root,
+        ).configuration,
+    )
+    return WorkflowRun(**kwargs)
 
 
 def fixture_bytes(version: str | int) -> bytes:
@@ -155,6 +182,26 @@ def schema11_bytes() -> bytes:
     return encoded(payload)
 
 
+def schema12_bytes() -> bytes:
+    source = schema11_bytes()
+    classification = run_migrations.classify_run_bytes(source)
+    context = run_migrations.MigrationContext(
+        migration_id="historical-v12-fixture",
+        migrated_at="2026-08-02T12:55:00+00:00",
+        source_schema_version=classification.schema_version,
+        source_structural_class=classification.structural_class,
+        source_sha256=classification.source_sha256,
+        disposition=classification.disposition,
+        applied_steps=("11_to_12",),
+        reason_codes=(),
+    )
+    payload, _ = run_migrations.MIGRATION_REGISTRY[(11, 12)](
+        json.loads(source),
+        context,
+    )
+    return encoded(payload)
+
+
 def schema7_object() -> dict[str, object]:
     return json.loads(schema7_bytes())
 
@@ -170,6 +217,8 @@ def migration_source(version: int) -> bytes:
         return schema10_bytes()
     if version == 11:
         return schema11_bytes()
+    if version == 12:
+        return schema12_bytes()
     if version == 6:
         return fixture_bytes("6_base")
     return fixture_bytes(version)
@@ -304,7 +353,7 @@ class MigrationContractTests(unittest.TestCase):
         )
 
     def test_c1_c2_current_constant_and_noncurrent_writes_fail_closed(self) -> None:
-        current = WorkflowRun(
+        current = _workflow_run(
             run_id="current-schema-eight",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="current",
@@ -320,7 +369,7 @@ class MigrationContractTests(unittest.TestCase):
             ),
             resolved_correction_policy=resolve_correction_policy(),
         )
-        self.assertEqual(current.schema_version, 12)
+        self.assertEqual(current.schema_version, 13)
         self.assertIsNone(current.migration_audit)
         self.assertIsNone(current.identity_migration_audit)
         self.assertIsNone(current.review_migration_audit)
@@ -328,7 +377,7 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(current.review_records, [])
         self.assertEqual(current.unreadable_review_records, [])
 
-        for value in (1, 6, 7, 8, 9, 10, 11, 13, True, "12", 12.0):
+        for value in (1, 6, 7, 8, 9, 10, 11, 12, True, "13", 13.0):
             candidate = current.model_copy(deep=True)
             candidate.__dict__["schema_version"] = value
             with self.subTest(value=value):
@@ -351,15 +400,15 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(candidate.updated_at, unchanged_update)
 
     def test_c3_registry_is_exact_adjacent_closed_and_ordered(self) -> None:
-        expected = [(version, version + 1) for version in range(1, 12)]
+        expected = [(version, version + 1) for version in range(1, 13)]
         self.assertEqual(sorted(run_migrations.MIGRATION_REGISTRY), expected)
         self.assertTrue(all(callable(step) for step in run_migrations.MIGRATION_REGISTRY.values()))
-        for version in range(1, 12):
+        for version in range(1, 13):
             self.assertEqual(
                 run_migrations.migration_steps(version),
-                tuple(f"{item}_to_{item + 1}" for item in range(version, 12)),
+                tuple(f"{item}_to_{item + 1}" for item in range(version, 13)),
             )
-        for invalid in (0, 12, 13):
+        for invalid in (0, 13, 14):
             self.assertEqual(run_migrations.migration_steps(invalid), ())
 
     def test_h1_h2_all_committed_fixtures_classify_and_preserve_exact_values(self) -> None:
@@ -904,7 +953,7 @@ class MigrationContractTests(unittest.TestCase):
         missing = copy.deepcopy(base)
         missing.pop("schema_version")
         self.assertEqual(run_migrations.classify_run_bytes(encoded(missing)).reason_code, "invalid_schema_version")
-        for version in (13, 99):
+        for version in (14, 99):
             payload = copy.deepcopy(base)
             payload["schema_version"] = version
             classified = run_migrations.classify_run_bytes(encoded(payload))
@@ -977,7 +1026,7 @@ class MigrationContractTests(unittest.TestCase):
 
         def observe_replace(source_path: Path, target_path: Path) -> None:
             candidate = json.loads(Path(source_path).read_text())
-            self.assertEqual(candidate["schema_version"], 12)
+            self.assertEqual(candidate["schema_version"], 13)
             replacements.append((Path(source_path), Path(target_path)))
             real_replace(source_path, target_path)
 
@@ -987,7 +1036,7 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(len(replacements), 1)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         persisted = json.loads(path.read_text())
-        self.assertEqual(persisted["schema_version"], 12)
+        self.assertEqual(persisted["schema_version"], 13)
         self.assertEqual(persisted["migration_audit"]["source_sha256"], hashlib.sha256(source).hexdigest())
 
         stable = path.stat()
@@ -1143,7 +1192,7 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(sum(item.endswith(":success") for item in results), 1)
         self.assertEqual(sum("source_changed" in item for item in results), 1)
         persisted = json.loads(path.read_text())
-        self.assertEqual(persisted["schema_version"], 12)
+        self.assertEqual(persisted["schema_version"], 13)
         self.assertEqual(persisted["migration_audit"]["migration_id"], "migration-test-01")
 
     def test_a5_a6_crash_boundaries_leave_one_retryable_or_complete_record(self) -> None:
@@ -1155,7 +1204,7 @@ class MigrationContractTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), source)
         self.assertEqual(list(self.runs.glob(".run-*.tmp")), [])
         self.approve(run_id)
-        self.assertEqual(json.loads(path.read_text())["schema_version"], 12)
+        self.assertEqual(json.loads(path.read_text())["schema_version"], 13)
 
         second_source = fixture_bytes(4)
         second_id, second_path = self.write_run(second_source)
@@ -1170,12 +1219,12 @@ class MigrationContractTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.approve(second_id)
         complete = second_path.read_bytes()
-        self.assertEqual(json.loads(complete)["schema_version"], 12)
+        self.assertEqual(json.loads(complete)["schema_version"], 13)
         self.approve(second_id)
         self.assertEqual(second_path.read_bytes(), complete)
 
     def test_r1_r2_read_surfaces_distinguish_states_and_redact_noncurrent(self) -> None:
-        current = WorkflowRun(
+        current = _workflow_run(
             run_id="current",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="task-current",
@@ -1200,12 +1249,12 @@ class MigrationContractTests(unittest.TestCase):
         self.write_run(encoded(archive), "archive")
         future = copy.deepcopy(historical)
         future["run_id"] = "future"
-        future["schema_version"] = 13
+        future["schema_version"] = 14
         self.write_run(encoded(future), "future")
         self.write_run(b"CORRUPT-SECRET", "corrupt")
 
         with patch.object(orchestrator, "RUNS", self.runs), orchestrator.console.capture() as capture:
-            orchestrator.status(None)
+            orchestrator.status(None, False, None)
         listing = capture.get()
         for state in ("CURRENT", "MIGRATION_REQUIRED", "RESUME_BLOCKED", "ARCHIVE_ONLY", "UNSUPPORTED"):
             self.assertIn(state, listing)
@@ -1213,10 +1262,10 @@ class MigrationContractTests(unittest.TestCase):
             self.assertNotIn(secret, listing)
 
         with patch.object(orchestrator, "RUNS", self.runs), orchestrator.console.capture() as capture:
-            orchestrator.status("current")
+            orchestrator.status("current", False, None)
         self.assertIn("CURRENT-SECRET-SPECIFICATION", capture.get())
         with patch.object(orchestrator, "RUNS", self.runs), orchestrator.console.capture() as capture:
-            orchestrator.status("historical")
+            orchestrator.status("historical", False, None)
         bounded = capture.get()
         self.assertIn("MIGRATION_REQUIRED", bounded)
         self.assertNotIn("HISTORICAL-SECRET-SPECIFICATION", bounded)
@@ -1242,7 +1291,7 @@ class MigrationContractTests(unittest.TestCase):
 
         with patch.object(orchestrator, "RUNS", self.runs), orchestrator.console.capture():
             with self.assertRaises(typer.Exit):
-                orchestrator.report("migrated")
+                orchestrator.report("migrated", False, None)
 
         with patch.object(orchestrator, "TargetCoordinator", side_effect=AssertionError("coordinator created")):
             for action in (
@@ -1254,7 +1303,7 @@ class MigrationContractTests(unittest.TestCase):
                 with self.subTest(action=action):
                     with self.assertRaisesRegex(orchestrator.ControllerError, "migrated record disposition"):
                         action()
-        self.assertEqual(json.loads(path.read_text())["schema_version"], 12)
+        self.assertEqual(json.loads(path.read_text())["schema_version"], 13)
 
     def test_p1_p2_p3_storage_safety_redaction_and_text_independence(self) -> None:
         source = fixture_object(5)
@@ -1309,6 +1358,7 @@ class MigrationContractTests(unittest.TestCase):
                 (9, 10),
                 (10, 11),
                 (11, 12),
+                (12, 13),
             ],
         )
         command_names = {
@@ -1327,11 +1377,11 @@ class PersistedCorrectionPolicyMigrationTests(unittest.TestCase):
         self.assertEqual(classification.treatment, "migrate")
         self.assertEqual(
             run_migrations.migration_steps(9),
-            ("9_to_10", "10_to_11", "11_to_12"),
+            ("9_to_10", "10_to_11", "11_to_12", "12_to_13"),
         )
 
         run = migrated(source)
-        self.assertEqual(run.schema_version, 12)
+        self.assertEqual(run.schema_version, 13)
         self.assertIsNone(run.resolved_correction_policy)
         audit = run.policy_migration_audit
         self.assertIsNotNone(audit)
@@ -1374,10 +1424,10 @@ class ApprovalRecordMigrationTests(unittest.TestCase):
         )
         self.assertEqual(
             run_migrations.migration_steps(10),
-            ("10_to_11", "11_to_12"),
+            ("10_to_11", "11_to_12", "12_to_13"),
         )
         run = migrated(source)
-        self.assertEqual(run.schema_version, 12)
+        self.assertEqual(run.schema_version, 13)
         self.assertEqual(run.approval_requests, [])
         self.assertEqual(run.approval_decisions, [])
         audit = run.approval_migration_audit
@@ -1408,7 +1458,7 @@ class ApprovalRecordMigrationTests(unittest.TestCase):
             decision_text="Commit approved.",
             decided_fingerprint="a" * 64,
         )
-        base = WorkflowRun(
+        base = _workflow_run(
             run_id="approval-fixture",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="009",
@@ -1439,10 +1489,13 @@ class ProviderInvocationMigrationTests(unittest.TestCase):
             (classification.schema_version, classification.structural_class),
             (11, "V11"),
         )
-        self.assertEqual(run_migrations.migration_steps(11), ("11_to_12",))
+        self.assertEqual(
+            run_migrations.migration_steps(11),
+            ("11_to_12", "12_to_13"),
+        )
 
         run = migrated(source)
-        self.assertEqual(run.schema_version, 12)
+        self.assertEqual(run.schema_version, 13)
         self.assertEqual(len(run.provider_runs), len(source_payload["provider_runs"]))
         audit = run.provider_invocation_migration_audit
         self.assertIsNotNone(audit)
@@ -1583,7 +1636,7 @@ class ReviewBackfillMigrationTests(unittest.TestCase):
                 "CURRENT_RUN_SCHEMA_VERSION",
                 registry_source[start:following],
             )
-        self.assertEqual(len(run_migrations._HISTORICAL_MODELS), 11)
+        self.assertEqual(len(run_migrations._HISTORICAL_MODELS), 12)
         self.assertEqual(run_migrations._HISTORICAL_MODELS[8].__name__, "_RunV8")
 
         historical = run_migrations._HISTORICAL_MODELS[8]
@@ -1650,7 +1703,7 @@ class ReviewBackfillMigrationTests(unittest.TestCase):
         self.assertIsNotNone(run)
         self.assertEqual(path.read_bytes() == before, False)
 
-        self.assertEqual(run.schema_version, 12)
+        self.assertEqual(run.schema_version, 13)
         self.assertIsNone(run.identity_migration_audit)
         self.assertIsNone(run.migration_audit)
         audit = run.review_migration_audit
@@ -1690,7 +1743,7 @@ class ReviewBackfillMigrationTests(unittest.TestCase):
             source = migration_source(version)
             run = migrated(source)
             with self.subTest(version=version):
-                self.assertEqual(run.schema_version, 12)
+                self.assertEqual(run.schema_version, 13)
                 self.assertIsNotNone(run.migration_audit)
                 self.assertIsNotNone(run.identity_migration_audit)
                 audit = run.review_migration_audit
@@ -1767,7 +1820,7 @@ class ReviewBackfillMigrationTests(unittest.TestCase):
         self.assertEqual(run.identity_migration_audit.disposition, audit.disposition)
 
     def test_m5_current_v9_source_reports_already_current_without_rewrite(self) -> None:
-        current = WorkflowRun(
+        current = _workflow_run(
             run_id="v9-current-m5",
             created_at="2026-08-02T00:00:00+00:00",
             task_ref="current",

@@ -237,8 +237,23 @@ the approved contracts.
     capability decisions plus all 38 adversarial cases. No runtime code,
     credential, provider, target, Jobs, or Git side effect was authorized or
     performed.
-- [ ] Add validated, versioned configuration and persist its resolved form,
+- [x] Add validated, versioned configuration and persist its resolved form,
   provider-account bindings, complete selected routes, and hash at run creation.
+  - Owner-approved bounded implementation contract and adversarial matrix:
+    [`gate-4/gate-4.2-validated-resolved-configuration.md`](contracts/gate-4/gate-4.2-validated-resolved-configuration.md).
+  - Implementation evidence (2026-08-03): added strict schema-2 source,
+    catalog, route/account, effort, provenance, canonical-hash, and resolved
+    configuration models; descriptor-relative private-source acquisition;
+    atomic precedence and built-in compatibility resolution; schema-13 run
+    persistence plus conservative `12_to_13` absence migration; new-run,
+    resume, provider guard, report, `continuo.run-plan.v2`, and
+    `continuo.doctor.v2` integration; pinned PyYAML; manual source guidance;
+    and isolated adversarial coverage. All 218 deterministic tests, bytecode
+    compilation, root and `UV_NO_EDITABLE=1` installed help/import checks, 56
+    local documentation links, the contiguous 42-case matrix, and
+    `git diff --check` pass. No live provider, credential, external target,
+    Jobs checkout, commit, or push was used; publication remains separately
+    authorized.
 - [ ] Extract current provider commands into provider adapters without changing
   no-fallback policy or permission ceilings.
 - [ ] Add provider/model/effort catalogs and configuration-backed route

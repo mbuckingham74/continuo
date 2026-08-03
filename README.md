@@ -160,6 +160,10 @@ Policy approval, commit approval, and push approval are separate actions. All in
 
 Provider CLIs are not needed to run the unit tests because the tests use deterministic fakes and temporary Git repositories.
 
+Configuration source locations, strict schema-2 shapes, built-in compatibility
+behavior, and interim manual preparation are documented in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
 ## Installation
 
 ```sh
