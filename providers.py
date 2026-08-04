@@ -867,9 +867,6 @@ def execute_luna_implementation(prompt: str, repo: Path = DEFAULT_REPO) -> Provi
 def parse_sonnet_review(execution: ProviderExecution) -> ReviewResult:
     import json
 
-    from adapters import normalize_sonnet_execution
-
-    execution = normalize_sonnet_execution(execution)
     if execution_failed(execution):
         raise RuntimeError(execution.stderr or "Sonnet review failed")
     envelope = json.loads(execution.stdout)

@@ -5551,7 +5551,31 @@ class ProviderFailureContractTests(unittest.TestCase):
         self.assertEqual(normalized.failure_source, "provider_native")
         self.assertEqual(normalized.failure_code, "error_max_turns")
         with self.assertRaises(RuntimeError):
-            providers.parse_sonnet_review(execution)
+            providers.parse_sonnet_review(normalized)
+
+    def test_parse_sonnet_review_does_not_renormalize_adapter_results(self) -> None:
+        success = review_execution("PASS", "PASS")
+        _, recorded_error = claude_fixture("provider_error")
+        normalized_failure = providers.normalize_sonnet_execution(recorded_error)
+        self.assertEqual(normalized_failure.failure_source, "provider_native")
+
+        with patch.object(
+            providers,
+            "normalize_sonnet_execution",
+            wraps=providers.normalize_sonnet_execution,
+        ) as sonnet_normalize, patch.object(
+            providers,
+            "normalize_provider_failure",
+            wraps=providers.normalize_provider_failure,
+        ) as protocol_normalize:
+            self.assertEqual(
+                providers.parse_sonnet_review(success).status, "PASS"
+            )
+            with self.assertRaises(RuntimeError):
+                providers.parse_sonnet_review(normalized_failure)
+
+        sonnet_normalize.assert_not_called()
+        protocol_normalize.assert_not_called()
 
     def test_os_launch_errors_are_configuration_not_provider_auth(self) -> None:
         for error in (
