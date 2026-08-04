@@ -1877,7 +1877,7 @@ class ControllerTests(unittest.TestCase):
             run,
             "specification_review",
             ADVERSARIAL_REVIEW_ROUTE,
-            native_error,
+            orchestrator.normalize_sonnet_execution(native_error),
             capability="read_only",
         )
         self.assertTrue(providers.execution_failed(normalized))
@@ -3654,34 +3654,6 @@ class StableProviderIdentityTests(unittest.TestCase):
                         )
                     ]
                 )
-
-    def test_adapter_not_display_selects_protocol_normalization(self) -> None:
-        _, native_error = claude_fixture("provider_error")
-        review_run = self.run_fixture(run_id="review-adapter")
-        renamed_review = ADVERSARIAL_REVIEW_ROUTE.model_copy(
-            update={"display_name": "shared display"}
-        )
-        normalized = orchestrator._record_provider(
-            review_run,
-            "specification_review",
-            renamed_review,
-            native_error,
-            capability="read_only",
-        )
-        self.assertEqual(normalized.failure_source, "provider_native")
-
-        writer_run = self.run_fixture(run_id="writer-adapter")
-        copied_display = IMPLEMENTATION_ROUTE.model_copy(
-            update={"display_name": ADVERSARIAL_REVIEW_ROUTE.display_name}
-        )
-        ordinary = orchestrator._record_provider(
-            writer_run,
-            "implementation_write",
-            copied_display,
-            native_error,
-            capability="workspace_write",
-        )
-        self.assertNotEqual(ordinary.failure_source, "provider_native")
 
     def test_operation_capability_pending_and_writer_links_fail_closed(self) -> None:
         with self.assertRaisesRegex(

@@ -102,6 +102,8 @@ def _descriptor_payload(
     command_builder_ids: tuple[str, ...],
     failure_classifier_id: str,
     local_probe_id: str,
+    supports_process_group_supervision: bool = True,
+    supports_partial_output_capture: bool = True,
 ) -> dict[str, object]:
     return {
         "provider_adapter_schema_version": 1,
@@ -111,8 +113,8 @@ def _descriptor_payload(
         "command_builder_ids": list(command_builder_ids),
         "failure_classifier_id": failure_classifier_id,
         "local_probe_id": local_probe_id,
-        "supports_process_group_supervision": True,
-        "supports_partial_output_capture": True,
+        "supports_process_group_supervision": supports_process_group_supervision,
+        "supports_partial_output_capture": supports_partial_output_capture,
     }
 
 
@@ -129,8 +131,10 @@ def build_adapter_descriptor(
         failure_classifier_id=failure_classifier_id,
         local_probe_id=local_probe_id,
     )
+    fields = dict(payload)
+    fields["command_builder_ids"] = tuple(payload["command_builder_ids"])
     return AdapterDescriptor(
-        **payload,  # type: ignore[arg-type]
+        **fields,  # type: ignore[arg-type]
         descriptor_sha256=canonical_sha256(payload),
     )
 
@@ -148,6 +152,10 @@ def validate_descriptor(descriptor: AdapterDescriptor) -> None:
         raise AdapterContractError("adapter descriptor lacks an adapter id")
     if not descriptor.command_builder_ids:
         raise AdapterContractError("adapter descriptor lacks command builders")
+    if not isinstance(descriptor.command_builder_ids, tuple):
+        raise AdapterContractError(
+            "adapter descriptor command builders must be immutable"
+        )
     if not descriptor.failure_classifier_id:
         raise AdapterContractError("adapter descriptor lacks a failure classifier")
     if not descriptor.local_probe_id:
@@ -157,6 +165,10 @@ def validate_descriptor(descriptor: AdapterDescriptor) -> None:
         command_builder_ids=descriptor.command_builder_ids,
         failure_classifier_id=descriptor.failure_classifier_id,
         local_probe_id=descriptor.local_probe_id,
+        supports_process_group_supervision=(
+            descriptor.supports_process_group_supervision
+        ),
+        supports_partial_output_capture=descriptor.supports_partial_output_capture,
     )
     if canonical_sha256(payload) != descriptor.descriptor_sha256:
         raise AdapterContractError("adapter descriptor hash is incoherent")

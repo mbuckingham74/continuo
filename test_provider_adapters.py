@@ -98,7 +98,7 @@ class AdapterRegistryStrictnessTests(unittest.TestCase):
                     adapters.ADAPTER_CONTRACT_ID,
                 )
                 self.assertEqual(descriptor.transport_kind, "local_process")
-                self.assertEqual(descriptor.command_builder_ids, [builder])
+                self.assertEqual(descriptor.command_builder_ids, (builder,))
                 self.assertEqual(descriptor.failure_classifier_id, classifier)
                 self.assertEqual(descriptor.local_probe_id, probe)
                 self.assertTrue(
@@ -122,6 +122,21 @@ class AdapterRegistryStrictnessTests(unittest.TestCase):
         )
         self.assertEqual(first.descriptor_sha256, second.descriptor_sha256)
 
+        approved_hashes = {
+            "claude_cli": (
+                "44622fa2aba64ce65498770958f5787e8ea6ffb01fa71db224c026c2e4daf439"
+            ),
+            "codex_cli": (
+                "cc41f7abaea29d2e6af01327f1f01959b48b132e771617e2bc3ef171388eb371"
+            ),
+        }
+        for adapter_id in ("claude_cli", "codex_cli"):
+            with self.subTest(adapter_id=adapter_id):
+                self.assertEqual(
+                    adapters.get_adapter(adapter_id).descriptor.descriptor_sha256,
+                    approved_hashes[adapter_id],
+                )
+
         tampered = adapters.AdapterDescriptor(
             provider_adapter_schema_version=first.provider_adapter_schema_version,
             provider_adapter_id=first.provider_adapter_id,
@@ -139,6 +154,48 @@ class AdapterRegistryStrictnessTests(unittest.TestCase):
         )
         with self.assertRaises(adapters.AdapterContractError):
             adapters.validate_descriptor(tampered)
+
+    def test_descriptor_command_builder_ids_is_an_immutable_tuple(self) -> None:
+        descriptor = adapters.get_adapter("claude_cli").descriptor
+        self.assertIsInstance(descriptor.command_builder_ids, tuple)
+        self.assertEqual(
+            descriptor.command_builder_ids,
+            ("claude-cli.compatibility-builder.v1",),
+        )
+        with self.assertRaises(AttributeError):
+            descriptor.command_builder_ids.append("evil.builder.v1")
+        with self.assertRaises(AttributeError):
+            descriptor.command_builder_ids = descriptor.command_builder_ids + (
+                "evil.builder.v1",
+            )
+
+    def test_descriptor_validation_rejects_mutable_command_builder_ids(self) -> None:
+        descriptor = adapters.get_adapter("codex_cli").descriptor
+        with self.assertRaises(adapters.AdapterContractError):
+            adapters.validate_descriptor(
+                adapters.AdapterDescriptor(
+                    **{
+                        **descriptor.__dict__,
+                        "command_builder_ids": list(descriptor.command_builder_ids),
+                    }
+                )
+            )
+
+    def test_support_boolean_mutation_fails_descriptor_coherence(self) -> None:
+        for field in (
+            "supports_process_group_supervision",
+            "supports_partial_output_capture",
+        ):
+            with self.subTest(field=field):
+                descriptor = adapters.get_adapter("claude_cli").descriptor
+                altered = adapters.AdapterDescriptor(
+                    **{
+                        **descriptor.__dict__,
+                        field: not getattr(descriptor, field),
+                    }
+                )
+                with self.assertRaises(adapters.AdapterContractError):
+                    adapters.validate_descriptor(altered)
 
     def test_descriptor_validation_rejects_unsupported_facts(self) -> None:
         base = dict(

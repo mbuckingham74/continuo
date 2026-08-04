@@ -1575,11 +1575,6 @@ def _record_provider(
             for attempt in execution.attempts
         ),
     )
-    execution = (
-        normalize_sonnet_execution(execution)
-        if identity.provider_adapter_id == "claude_cli"
-        else normalize_provider_execution(execution)
-    )
     invocation_id = logical_invocation_id or (
         f"provider-invocation-{uuid.uuid4().hex[:20]}"
     )
@@ -2474,10 +2469,14 @@ class Controller:
         capability: ProviderCapability,
         provider: Callable[[str, Path], ProviderExecution] | None = None,
     ) -> ProviderExecution:
+        _validate_route_operation(identity, operation_id, capability)
         if provider is None:
             provider = self._provider_for(run, identity)
         if provider not in _DEFAULT_PROVIDER_FACADES:
-            return provider(prompt, self.repo)
+            execution = provider(prompt, self.repo)
+            if identity.provider_adapter_id == "claude_cli":
+                return normalize_sonnet_execution(execution)
+            return normalize_provider_execution(execution)
         configuration = run.resolved_configuration
         if configuration is None:
             raise ControllerError("configuration_missing")

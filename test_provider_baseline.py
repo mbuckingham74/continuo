@@ -815,6 +815,107 @@ class SinglePassNormalizationTests(unittest.TestCase):
             [record.retry_scheduled for record in records], [True, False]
         )
 
+    def test_os_launch_evidence_is_not_overwritten_by_recording(self) -> None:
+        run = self.blank_run("single-pass-os-evidence")
+        execution = ProviderExecution(
+            command=["codex"],
+            returncode=127,
+            stdout="",
+            stderr="FileNotFoundError: no such binary",
+            duration_seconds=0.1,
+            failure_kind="configuration",
+            failure_source="os_error",
+            failure_code="FileNotFoundError:2",
+            capability="read_only",
+        )
+
+        recorded = orchestrator._record_provider(
+            run,
+            "policy_clarification",
+            POLICY_AUTHORITY_ROUTE,
+            execution,
+            capability="read_only",
+        )
+
+        self.assertEqual(recorded.failure_kind, "configuration")
+        self.assertEqual(recorded.failure_source, "os_error")
+        self.assertEqual(recorded.failure_code, "FileNotFoundError:2")
+        record = run.provider_runs[-1]
+        self.assertEqual(record.returncode, 127)
+        self.assertEqual(record.stdout, "")
+        self.assertEqual(record.stderr, "FileNotFoundError: no such binary")
+
+    def test_retry_bits_duration_and_raw_streams_are_persisted_unchanged(self) -> None:
+        run = self.blank_run("single-pass-persisted-fields")
+        command = ["codex", "exec"]
+        attempts = (
+            ProviderAttempt(
+                command=command,
+                returncode=1,
+                stdout="",
+                stderr="HTTP 503 Service Unavailable",
+                duration_seconds=5.5,
+                failure_kind="unavailable",
+                failure_source="stderr",
+                failure_code="503",
+                capability="read_only",
+                retry_scheduled=True,
+            ),
+            ProviderAttempt(
+                command=command,
+                returncode=0,
+                stdout="resolved",
+                stderr="",
+                duration_seconds=7.25,
+                capability="read_only",
+                retry_scheduled=False,
+            ),
+        )
+        execution = ProviderExecution(
+            command=command,
+            returncode=0,
+            stdout="resolved",
+            stderr="",
+            duration_seconds=12.75,
+            capability="read_only",
+            attempts=attempts,
+        )
+
+        orchestrator._record_provider(
+            run,
+            "policy_clarification",
+            POLICY_AUTHORITY_ROUTE,
+            execution,
+            capability="read_only",
+            logical_invocation_id="persisted-fields-invocation",
+        )
+
+        records = run.provider_runs[-2:]
+        self.assertEqual(
+            [
+                (record.retry_scheduled, record.duration_seconds)
+                for record in records
+            ],
+            [(True, 5.5), (False, 7.25)],
+        )
+        self.assertEqual(
+            [record.command for record in records], [command, command]
+        )
+        self.assertEqual(
+            [record.stdout for record in records], ["", "resolved"]
+        )
+        self.assertEqual(
+            [record.stderr for record in records],
+            ["HTTP 503 Service Unavailable", ""],
+        )
+        self.assertEqual(
+            [record.failure_source for record in records], ["stderr", None]
+        )
+        self.assertEqual(
+            [record.logical_invocation_id for record in records],
+            ["persisted-fields-invocation"] * 2,
+        )
+
     def test_incoherent_retry_bits_are_rejected(self) -> None:
         run = self.blank_run("single-pass-incoherent")
         attempt = ProviderAttempt(
@@ -955,6 +1056,210 @@ class ControllerProductionRoutingSeamTests(unittest.TestCase):
 
         self.assertEqual(fake_calls, [("prompt text", self.repo)])
         self.assertEqual(execution.stdout, "fake output")
+
+    def test_injected_boundary_selects_normalization_by_adapter_id(self) -> None:
+        controller = orchestrator.Controller(
+            self.repo, self.runs, controller_root=self.controller_root,
+        )
+        _, native_error = test_orchestrator.claude_fixture("provider_error")
+
+        review_run = self.blank_run("boundary-claude")
+        renamed_review = ADVERSARIAL_REVIEW_ROUTE.model_copy(
+            update={"display_name": "shared display"}
+        )
+        normalized = controller._invoke_route(
+            review_run,
+            renamed_review,
+            "specification_review",
+            "prompt",
+            "read_only",
+            lambda prompt, repo: native_error,
+        )
+        self.assertEqual(normalized.failure_source, "provider_native")
+
+        writer_run = self.blank_run("boundary-codex")
+        copied_display = IMPLEMENTATION_ROUTE.model_copy(
+            update={"display_name": ADVERSARIAL_REVIEW_ROUTE.display_name}
+        )
+        ordinary = controller._invoke_route(
+            writer_run,
+            copied_display,
+            "implementation_write",
+            "prompt",
+            "workspace_write",
+            lambda prompt, repo: native_error,
+        )
+        self.assertNotEqual(ordinary.failure_source, "provider_native")
+
+    def test_invoke_route_rejects_operation_role_mismatch_before_request_work(self) -> None:
+        controller = orchestrator.Controller(
+            self.repo, self.runs, controller_root=self.controller_root,
+        )
+        run = self.blank_run("validate-before-request-operation")
+        with patch.object(
+            orchestrator.adapters,
+            "AdapterAttemptRequest",
+            side_effect=AssertionError("request constructed before validation"),
+        ), patch.object(
+            orchestrator.adapters,
+            "run_compatibility",
+            side_effect=AssertionError("adapter path reached before validation"),
+        ), patch.object(
+            orchestrator.adapters,
+            "get_adapter",
+            side_effect=AssertionError("adapter lookup before validation"),
+        ):
+            with self.assertRaisesRegex(
+                orchestrator.ControllerError, "operation does not match role"
+            ):
+                controller._invoke_route(
+                    run,
+                    ADVERSARIAL_REVIEW_ROUTE,
+                    "policy_clarification",
+                    "prompt",
+                    "read_only",
+                )
+
+    def test_invoke_route_rejects_capability_mismatch_before_request_work(self) -> None:
+        controller = orchestrator.Controller(
+            self.repo, self.runs, controller_root=self.controller_root,
+        )
+        run = self.blank_run("validate-before-request-capability")
+        with patch.object(
+            orchestrator.adapters,
+            "AdapterAttemptRequest",
+            side_effect=AssertionError("request constructed before validation"),
+        ), patch.object(
+            orchestrator.adapters,
+            "run_compatibility",
+            side_effect=AssertionError("adapter path reached before validation"),
+        ), patch.object(
+            orchestrator.adapters,
+            "get_adapter",
+            side_effect=AssertionError("adapter lookup before validation"),
+        ):
+            with self.assertRaisesRegex(
+                orchestrator.ControllerError, "capability does not match role"
+            ):
+                controller._invoke_route(
+                    run,
+                    IMPLEMENTATION_ROUTE,
+                    "implementation_write",
+                    "prompt",
+                    "read_only",
+                )
+
+    def test_default_live_adapter_result_is_normalized_exactly_once(self) -> None:
+        controller = orchestrator.Controller(
+            self.repo, self.runs, controller_root=self.controller_root,
+        )
+        run = self.blank_run("exactly-once-live")
+        route_profile, account = providers._compatibility_binding(
+            "policy_clarification"
+        )
+        request = adapters.AdapterAttemptRequest(
+            operation_id="policy_clarification",
+            route_profile=route_profile,
+            provider_account_profile=account,
+            prompt="prompt",
+            working_directory=self.repo,
+            capability="read_only",
+        )
+
+        def raw_executor(plan):
+            return adapters.RawAttemptResult(
+                subprocess.CompletedProcess(
+                    list(plan.command), 1, "", "HTTP 401 Unauthorized"
+                ),
+                None,
+                None,
+            )
+
+        with patch.object(
+            adapters, "run_single_attempt", side_effect=raw_executor
+        ) as executor, patch.object(
+            providers,
+            "normalize_provider_failure",
+            wraps=providers.normalize_provider_failure,
+        ) as normalize, patch.object(
+            orchestrator,
+            "normalize_sonnet_execution",
+            wraps=orchestrator.normalize_sonnet_execution,
+        ) as sonnet_normalize, patch.object(
+            orchestrator,
+            "normalize_provider_execution",
+            wraps=orchestrator.normalize_provider_execution,
+        ) as protocol_normalize:
+            execution = adapters.run_compatibility(
+                request, sleeper=lambda seconds: None
+            )
+            recorded = orchestrator._record_provider(
+                run,
+                "policy_clarification",
+                POLICY_AUTHORITY_ROUTE,
+                execution,
+                capability="read_only",
+            )
+
+        executor.assert_called_once()
+        normalize.assert_called_once()
+        sonnet_normalize.assert_not_called()
+        protocol_normalize.assert_not_called()
+        self.assertEqual(recorded.failure_kind, "auth")
+        self.assertEqual(recorded.failure_source, "stderr")
+        record = run.provider_runs[-1]
+        self.assertEqual(record.failure_kind, "auth")
+        self.assertEqual(record.failure_source, "stderr")
+        self.assertEqual(record.failure_code, "401")
+
+    def test_injected_legacy_provider_result_is_normalized_exactly_once(self) -> None:
+        controller = orchestrator.Controller(
+            self.repo, self.runs, controller_root=self.controller_root,
+        )
+        run = self.blank_run("exactly-once-injected")
+        calls: list[str] = []
+
+        def legacy_terra(prompt, repo):
+            calls.append(prompt)
+            return providers.ProviderExecution(
+                ["codex"], 1, "", "HTTP 503 Service Unavailable"
+            )
+
+        with patch.object(
+            orchestrator,
+            "normalize_provider_execution",
+            wraps=orchestrator.normalize_provider_execution,
+        ) as protocol_normalize, patch.object(
+            orchestrator,
+            "normalize_sonnet_execution",
+            wraps=orchestrator.normalize_sonnet_execution,
+        ) as sonnet_normalize:
+            execution = controller._invoke_route(
+                run,
+                POLICY_AUTHORITY_ROUTE,
+                "policy_clarification",
+                "prompt",
+                "read_only",
+                legacy_terra,
+            )
+            execution = orchestrator._record_provider(
+                run,
+                "policy_clarification",
+                POLICY_AUTHORITY_ROUTE,
+                execution,
+                capability="read_only",
+            )
+
+        self.assertEqual(calls, ["prompt"])
+        protocol_normalize.assert_called_once()
+        sonnet_normalize.assert_not_called()
+        self.assertEqual(execution.failure_kind, "unavailable")
+        record = run.provider_runs[-1]
+        self.assertEqual(record.failure_source, "stderr")
+        self.assertEqual(record.failure_code, "503")
+        self.assertEqual(record.returncode, 1)
+        self.assertEqual(record.stdout, "")
+        self.assertEqual(record.stderr, "HTTP 503 Service Unavailable")
 
 
 class DoctorProbeSeamTests(unittest.TestCase):
