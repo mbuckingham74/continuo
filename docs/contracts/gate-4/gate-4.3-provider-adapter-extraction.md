@@ -1,9 +1,19 @@
 # Gate 4.3 contract — Extract current provider commands into provider adapters
 
-**Status:** repository-owner approved on 2026-08-04; runtime implementation
-has not started. The architectural reset was committed at
-`402b85128925a38fc5cbc4e23e4a6600f14bdd8f`, and repository-owner approval
+**Status:** repository-owner approved on 2026-08-04; implementation and
+deterministic verification are complete. The architectural reset was committed
+at `402b85128925a38fc5cbc4e23e4a6600f14bdd8f`, and repository-owner approval
 was recorded at `1ff8479fdd50795e071852cf1170df1588c50dba`.
+
+Implementation and correction evidence:
+
+- `5e9287d3f8f4fa2f4b6c4773d62d29584bdd7ab9` — initial Gate 4.3 implementation;
+- `eac8fd4ccec47c5918b35e601f28424d24ffc9b9` — adapter-boundary corrections;
+- `2ea6673505b807a25e7ac0f21e8c9fddee1606b5` — single-pass Sonnet normalization
+  correction.
+
+Final merge/publication evidence is the documentation completion commit and
+the resulting `main` tip.
 
 **Runtime baseline:**
 `9fd0de0e8141d26e2f8f995fc3c63e11c08f024c` (the published Gate 4.2

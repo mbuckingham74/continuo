@@ -255,7 +255,7 @@ the approved contracts.
     Jobs checkout, or push was used.
   - Publication evidence (2026-08-03): approved and published at
     `9fd0de0e8141d26e2f8f995fc3c63e11c08f024c`.
-- [~] Extract current provider commands into provider adapters without changing
+- [x] Extract current provider commands into provider adapters without changing
   no-fallback policy or permission ceilings.
   - Owner-approved bounded contract and adversarial matrix:
     [`gate-4/gate-4.3-provider-adapter-extraction.md`](contracts/gate-4/gate-4.3-provider-adapter-extraction.md).
@@ -263,8 +263,16 @@ the approved contracts.
     committed at `402b85128925a38fc5cbc4e23e4a6600f14bdd8f` on
     `recovery/icloud-2026-08-03`; repository-owner approval was recorded at
     `1ff8479fdd50795e071852cf1170df1588c50dba`.
-  - Runtime implementation is intentionally not started; Gate 4.4 owns the
-    remaining provider-adapter and durable-lifecycle conformance.
+  - Implementation evidence: `5e9287d3f8f4fa2f4b6c4773d62d29584bdd7ab9`
+    (initial Gate 4.3 implementation), `eac8fd4ccec47c5918b35e601f28424d24ffc9b9`
+    (adapter-boundary corrections), and `2ea6673505b807a25e7ac0f21e8c9fddee1606b5`
+    (single-pass Sonnet normalization correction).
+  - Verification evidence (2026-08-04): 303 deterministic tests passing,
+    `compileall` passing, `jobs-orchestrator --help` passing, `git diff --check`
+    passing, and no live provider, credential, external target, Jobs checkout,
+    or provider probe invoked.
+  - Gate 4.4 owns the remaining provider-adapter and durable-lifecycle
+    conformance.
 - [ ] Gate 4.4 — Complete the remaining bounded provider-adapter and durable
   lifecycle conformance required by Gate 3.5 as amended by Gate 4.1: pre-spawn
   logical requests and physical-attempt arming, per-attempt result/retry
