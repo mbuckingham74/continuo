@@ -1,7 +1,8 @@
 # Gate 4.2 contract — Validated and persisted resolved configuration
 
 **Status:** repository-owner approved on 2026-08-03; runtime implementation and
-verification complete on 2026-08-03; publication pending.
+verification complete on 2026-08-03; published at commit
+`9fd0de0e8141d26e2f8f995fc3c63e11c08f024c`.
 
 ## Decision
 
@@ -609,8 +610,10 @@ Verification completed on 2026-08-03:
 - all 56 local Markdown links in the changed documentation resolve, with 42
   unique contiguous `G42-*` matrix IDs.
 
-No live provider, network credential, external target, Jobs checkout,
-configuration in the operator's real controller root, commit, or push was used.
-The implementation remains an uncommitted working-tree diff until the repository
-owner separately authorizes publication; commit identifiers will be recorded
-only after that succeeds.
+No live provider, network credential, external target, Jobs checkout, or
+configuration in the operator's real controller root was used during
+implementation or verification.
+
+Publication evidence (2026-08-03): the repository owner approved publication,
+and the implementation was committed and pushed at
+`9fd0de0e8141d26e2f8f995fc3c63e11c08f024c`.

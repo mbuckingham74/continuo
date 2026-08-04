@@ -27,7 +27,8 @@ under `gate-<number>/` and must be linked from the corresponding tracker item.
 - [`gate-4/`](gate-4/) contains bounded Generic Engine Core implementation
   prerequisites and implementation evidence.
   - [`gate-4.1-effort-provider-account-amendment.md`](gate-4/gate-4.1-effort-provider-account-amendment.md) is the owner-approved additive effort and provider-account binding amendment required before generic routing implementation.
-  - [`gate-4.2-validated-resolved-configuration.md`](gate-4/gate-4.2-validated-resolved-configuration.md) is the owner-approved validated configuration, trusted-source, schema-13 persistence, and migration implementation contract; runtime implementation is complete pending publication.
+  - [`gate-4.2-validated-resolved-configuration.md`](gate-4/gate-4.2-validated-resolved-configuration.md) is the owner-approved validated configuration, trusted-source, schema-13 persistence, and migration implementation contract; runtime implementation is complete and published at commit `9fd0de0e8141d26e2f8f995fc3c63e11c08f024c`.
+  - [`gate-4.3-provider-adapter-extraction.md`](gate-4/gate-4.3-provider-adapter-extraction.md) is the contract awaiting repository-owner approval before Gate 4.3 implementation begins.
 
 Do not put a new full contract, matrix, or implementation transcript back in
 the execution tracker. Keep the tracker to status, a concise result, and a

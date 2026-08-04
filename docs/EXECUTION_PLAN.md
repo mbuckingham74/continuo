@@ -252,10 +252,14 @@ the approved contracts.
     compilation, root and `UV_NO_EDITABLE=1` installed help/import checks, 56
     local documentation links, the contiguous 42-case matrix, and
     `git diff --check` pass. No live provider, credential, external target,
-    Jobs checkout, commit, or push was used; publication remains separately
-    authorized.
-- [ ] Extract current provider commands into provider adapters without changing
+    Jobs checkout, or push was used.
+  - Publication evidence (2026-08-03): approved and published at
+    `9fd0de0e8141d26e2f8f995fc3c63e11c08f024c`.
+- [~] Extract current provider commands into provider adapters without changing
   no-fallback policy or permission ceilings.
+  - Contract awaiting repository-owner approval:
+    [`gate-4/gate-4.3-provider-adapter-extraction.md`](contracts/gate-4/gate-4.3-provider-adapter-extraction.md).
+  - Runtime implementation is intentionally not started.
 - [ ] Add provider/model/effort catalogs and configuration-backed route
   selection. Every selectable combination must resolve to one complete
   registered route; neither CLI nor UI may splice arbitrary models, effort
