@@ -257,9 +257,13 @@ the approved contracts.
     `9fd0de0e8141d26e2f8f995fc3c63e11c08f024c`.
 - [~] Extract current provider commands into provider adapters without changing
   no-fallback policy or permission ceilings.
-  - Contract awaiting repository-owner approval:
+  - Owner-approved bounded contract and adversarial matrix:
     [`gate-4/gate-4.3-provider-adapter-extraction.md`](contracts/gate-4/gate-4.3-provider-adapter-extraction.md).
-  - Runtime implementation is intentionally not started.
+  - Publication evidence (2026-08-04): approved and pushed at
+    `402b85128925a38fc5cbc4e23e4a6600f14bdd8f` on
+    `recovery/icloud-2026-08-03`.
+  - Runtime implementation is intentionally not started; Gate 4.4 owns the
+    remaining provider-adapter and durable-lifecycle conformance.
 - [ ] Gate 4.4 — Complete the remaining bounded provider-adapter and durable
   lifecycle conformance required by Gate 3.5 as amended by Gate 4.1: pre-spawn
   logical requests and physical-attempt arming, per-attempt result/retry
