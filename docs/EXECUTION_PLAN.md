@@ -260,6 +260,15 @@ the approved contracts.
   - Contract awaiting repository-owner approval:
     [`gate-4/gate-4.3-provider-adapter-extraction.md`](contracts/gate-4/gate-4.3-provider-adapter-extraction.md).
   - Runtime implementation is intentionally not started.
+- [ ] Gate 4.4 — Complete the remaining bounded provider-adapter and durable
+  lifecycle conformance required by Gate 3.5 as amended by Gate 4.1: pre-spawn
+  logical requests and physical-attempt arming, per-attempt result/retry
+  persistence, narrow
+  malformed-output evidence, bounded audit/output and account/effort evidence,
+  child-environment hardening, retry revalidation, and reporting distinctions,
+  without an invocation graph or generalized event platform.
+  - Gate 4.3 intentionally leaves run schema 13 and current recovery unchanged;
+    this follow-on requires its own owner-approved contract before implementation.
 - [ ] Add provider/model/effort catalogs and configuration-backed route
   selection. Every selectable combination must resolve to one complete
   registered route; neither CLI nor UI may splice arbitrary models, effort
