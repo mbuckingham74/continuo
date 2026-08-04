@@ -259,9 +259,10 @@ the approved contracts.
   no-fallback policy or permission ceilings.
   - Owner-approved bounded contract and adversarial matrix:
     [`gate-4/gate-4.3-provider-adapter-extraction.md`](contracts/gate-4/gate-4.3-provider-adapter-extraction.md).
-  - Publication evidence (2026-08-04): approved and pushed at
-    `402b85128925a38fc5cbc4e23e4a6600f14bdd8f` on
-    `recovery/icloud-2026-08-03`.
+  - Contract-reset evidence (2026-08-04): the bounded architecture reset was
+    committed at `402b85128925a38fc5cbc4e23e4a6600f14bdd8f` on
+    `recovery/icloud-2026-08-03`; repository-owner approval was recorded at
+    `1ff8479fdd50795e071852cf1170df1588c50dba`.
   - Runtime implementation is intentionally not started; Gate 4.4 owns the
     remaining provider-adapter and durable-lifecycle conformance.
 - [ ] Gate 4.4 — Complete the remaining bounded provider-adapter and durable

@@ -1,7 +1,9 @@
 # Gate 4.3 contract — Extract current provider commands into provider adapters
 
-**Status:** architectural reset awaiting repository-owner approval; runtime
-implementation has not started.
+**Status:** repository-owner approved on 2026-08-04; runtime implementation
+has not started. The architectural reset was committed at
+`402b85128925a38fc5cbc4e23e4a6600f14bdd8f`, and repository-owner approval
+was recorded at `1ff8479fdd50795e071852cf1170df1588c50dba`.
 
 **Runtime baseline:**
 `9fd0de0e8141d26e2f8f995fc3c63e11c08f024c` (the published Gate 4.2
