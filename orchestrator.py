@@ -24,6 +24,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+import adapters
 from configuration import (
     CONFIGURATION_ROOT,
     ACCOUNT_PROFILE_CATALOG,
@@ -450,10 +451,14 @@ def doctor_report(
     checks.append(_doctor_check("run_storage", storage["status"], storage["code"], storage["summary"]))
 
     required_binaries = {
-        "claude": "claude",
-        "codex": "codex",
+        "claude": "claude_cli",
+        "codex": "codex_cli",
     }
-    missing = sorted(name for name, binary in required_binaries.items() if not shutil.which(binary))
+    probes = {
+        name: adapters.get_adapter(adapter_id).probe_local()
+        for name, adapter_id in required_binaries.items()
+    }
+    missing = sorted(name for name, probe in probes.items() if not probe.available)
     checks.append(
         _doctor_check(
             "provider_binaries",
@@ -470,11 +475,11 @@ def doctor_report(
             "No side-effect-free local provider authentication probe is configured.",
         )
     )
-    adapter_binaries = {"claude_cli": "claude", "codex_cli": "codex"}
+    registered_adapter_ids = {"claude_cli", "codex_cli"}
     route_valid = all(
-        route.provider_adapter_id in adapter_binaries
+        route.provider_adapter_id in registered_adapter_ids
         and route.role_id in OPERATION_ROLES.values()
-        and shutil.which(adapter_binaries[route.provider_adapter_id]) is not None
+        and adapters.get_adapter(route.provider_adapter_id).probe_local().available
         for route in ROUTE_IDENTITIES.values()
     )
     checks.append(
@@ -2293,6 +2298,16 @@ _PROVIDER_RESUMABLE_BLOCKS = {
 }
 
 
+_DEFAULT_PROVIDER_FACADES = frozenset(
+    {
+        execute_sonnet_review,
+        execute_terra_resolution,
+        execute_sol_escalation,
+        execute_luna_implementation,
+    }
+)
+
+
 class Controller:
     def __init__(
         self,
@@ -2449,6 +2464,33 @@ class Controller:
             or route.provider_adapter_id != account.provider_adapter_id
         ):
             raise ControllerError("configuration_binding_mismatch")
+
+    def _invoke_route(
+        self,
+        run: WorkflowRun,
+        identity: ProviderRouteIdentity,
+        operation_id: ProviderOperation,
+        prompt: str,
+        capability: ProviderCapability,
+        provider: Callable[[str, Path], ProviderExecution] | None = None,
+    ) -> ProviderExecution:
+        if provider is None:
+            provider = self._provider_for(run, identity)
+        if provider not in _DEFAULT_PROVIDER_FACADES:
+            return provider(prompt, self.repo)
+        configuration = run.resolved_configuration
+        if configuration is None:
+            raise ControllerError("configuration_missing")
+        binding = configuration.role_bindings[identity.role_id]
+        request = adapters.AdapterAttemptRequest(
+            operation_id=operation_id,
+            route_profile=binding.route_profile,
+            provider_account_profile=binding.provider_account_profile,
+            prompt=prompt,
+            working_directory=self.repo,
+            capability=capability,
+        )
+        return adapters.run_compatibility(request)
 
     def _validate_live_configuration(self, run: WorkflowRun) -> None:
         configuration = run.resolved_configuration
@@ -2903,7 +2945,14 @@ class Controller:
             "retrying the same provider once.[/yellow]"
         )
         provider = self._provider_for(run, identity)
-        execution = provider(prompt, self.repo)
+        execution = self._invoke_route(
+            run,
+            identity,
+            operation_id,
+            prompt,
+            "read_only",
+            provider,
+        )
         execution = _record_provider(
             run,
             operation_id,
@@ -3008,7 +3057,14 @@ class Controller:
             f"[cyan]Stage:[/cyan] Resuming {stage} — "
             f"{saved_identity.display_name}"
         )
-        execution = provider(prompt, self.repo)
+        execution = self._invoke_route(
+            run,
+            saved_identity,
+            operation_id,
+            prompt,
+            "read_only",
+            provider,
+        )
         execution = _record_provider(
             run,
             operation_id,
@@ -3054,7 +3110,13 @@ class Controller:
         self._save(run)
 
         console.print("[cyan]Stage:[/cyan] Policy clarification — Terra High")
-        execution = self.terra(prompt, self.repo)
+        execution = self._invoke_route(
+            run,
+            POLICY_AUTHORITY_ROUTE,
+            "policy_clarification",
+            prompt,
+            "read_only",
+        )
         execution = _record_provider(
             run,
             "policy_clarification",
@@ -3119,7 +3181,13 @@ class Controller:
         console.print(
             f"[cyan]Stage:[/cyan] {label} — Sonnet 5 High"
         )
-        execution = self.sonnet(prompt, self.repo)
+        execution = self._invoke_route(
+            run,
+            ADVERSARIAL_REVIEW_ROUTE,
+            operation_id,
+            prompt,
+            "read_only",
+        )
         execution = _record_provider(
             run,
             operation_id,
@@ -3325,7 +3393,18 @@ class Controller:
 
         label = "Correction" if active.stage == "correcting" else "Implementation"
         console.print(f"[cyan]Stage:[/cyan] {label} — Luna High")
-        execution = self.luna(prompt, self.repo)
+        writer_operation: ProviderOperation = (
+            "correction_write"
+            if active.purpose == "correction"
+            else "implementation_write"
+        )
+        execution = self._invoke_route(
+            run,
+            IMPLEMENTATION_ROUTE,
+            writer_operation,
+            prompt,
+            "workspace_write",
+        )
 
         post_files: list[str] | None = None
         post_fingerprint: str | None = None
@@ -3339,11 +3418,7 @@ class Controller:
 
         execution = _record_provider(
             run,
-            (
-                "correction_write"
-                if active.purpose == "correction"
-                else "implementation_write"
-            ),
+            writer_operation,
             IMPLEMENTATION_ROUTE,
             execution,
             capability="workspace_write",
@@ -3449,7 +3524,13 @@ class Controller:
         console.print(
             "[cyan]Stage:[/cyan] Escalation diagnosis — Sol High"
         )
-        execution = self.sol(prompt, self.repo)
+        execution = self._invoke_route(
+            run,
+            ESCALATION_EXECUTIVE_ROUTE,
+            "escalation_guidance",
+            prompt,
+            "read_only",
+        )
         execution = _record_provider(
             run,
             "escalation_guidance",

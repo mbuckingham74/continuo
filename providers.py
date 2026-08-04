@@ -1,13 +1,15 @@
-"""Provider command construction and subprocess boundaries.
+"""Compatibility facades and the shared provider transport boundary.
 
-The controller owns workflow decisions. These functions only build/run provider
-commands and parse Sonnet's closed structured response.
+Gate 4.3 relocated provider-specific command construction behind the
+code-owned adapters in `adapters.py`. This module keeps the shared transport
+policy (supervision, failure normalization, and the bounded same-provider
+retry loop) plus thin facades so existing imports and deterministic test
+seams continue to work. The facades contain no provider-specific argv logic.
 """
 
 from __future__ import annotations
 
 import errno
-import json
 import math
 import os
 import re
@@ -23,6 +25,7 @@ from models import (
     ADVERSARIAL_REVIEW_ROUTE,
     ESCALATION_EXECUTIVE_ROUTE,
     IMPLEMENTATION_ROUTE,
+    OPERATION_ROLES,
     POLICY_AUTHORITY_ROUTE,
     ProviderCapability,
     ProviderFailureKind,
@@ -40,33 +43,6 @@ PROVIDER_HEARTBEAT_SECONDS = 5.0
 PROVIDER_TIMEOUT_RETURN_CODE = 124
 PROVIDER_INTERRUPTED_RETURN_CODE = 130
 PROVIDER_STDOUT_TAIL_BYTES = 8 * 1024
-
-SONNET_REVIEW_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "status": {"type": "string", "enum": ["PASS", "FAIL"]},
-        "category": {
-            "type": "string",
-            "enum": [
-                "PASS",
-                "IMPLEMENTATION_DEFECT",
-                "POLICY_AMBIGUITY",
-                "SCOPE_VIOLATION",
-            ],
-        },
-        "finding_key": {"type": "string", "minLength": 1, "maxLength": 120},
-        "summary": {"type": "string"},
-    },
-    "required": ["status", "category", "finding_key", "summary"],
-    "additionalProperties": False,
-}
-SONNET_REVIEW_SCHEMA_JSON = json.dumps(SONNET_REVIEW_SCHEMA, separators=(",", ":"))
-
-LUNA_GIT_PROHIBITIONS = (
-    "You have workspace-write only for bounded implementation edits. "
-    "Do not commit, push, create or switch branches, merge, rebase, reset, "
-    "or modify any Git metadata (.git). The controller alone has Git authority."
-)
 
 
 @dataclass(frozen=True)
@@ -112,73 +88,6 @@ class ProviderFailureEvidence:
 class _SupervisedResult:
     completed: subprocess.CompletedProcess[str]
     failure_kind: ProviderFailureKind | None = None
-
-
-def build_sonnet_command(prompt: str) -> list[str]:
-    """Build a fresh, read-only, structured Sonnet invocation."""
-
-    return [
-        "claude",
-        "-p",
-        "--model",
-        ADVERSARIAL_REVIEW_ROUTE.model_id,
-        "--permission-mode",
-        "plan",
-        "--tools",
-        "Read,Glob,Grep",
-        "--output-format",
-        "json",
-        "--json-schema",
-        SONNET_REVIEW_SCHEMA_JSON,
-        "--",
-        prompt,
-    ]
-
-
-def build_terra_command(prompt: str) -> list[str]:
-    return [
-        "codex",
-        "exec",
-        "--model",
-        POLICY_AUTHORITY_ROUTE.model_id,
-        "--sandbox",
-        "read-only",
-        "--",
-        prompt,
-    ]
-
-
-def build_sol_command(prompt: str) -> list[str]:
-    """Build a read-only Sol High escalation invocation."""
-
-    return [
-        "codex",
-        "exec",
-        "--model",
-        ESCALATION_EXECUTIVE_ROUTE.model_id,
-        "--sandbox",
-        "read-only",
-        "--",
-        prompt,
-    ]
-
-
-def build_luna_command(prompt: str) -> list[str]:
-    bounded_prompt = f"{LUNA_GIT_PROHIBITIONS}\n\n{prompt}"
-    return [
-        "codex",
-        "exec",
-        "--model",
-        IMPLEMENTATION_ROUTE.model_id,
-        "--sandbox",
-        "workspace-write",
-        "--config",
-        "approval_policy=never",
-        "--config",
-        "sandbox_workspace_write.network_access=false",
-        "--",
-        bounded_prompt,
-    ]
 
 
 def classify_provider_failure(
@@ -364,61 +273,6 @@ def _os_failure_evidence(exc: OSError) -> ProviderFailureEvidence:
     if exc.errno is not None:
         code += f":{exc.errno}"
     return ProviderFailureEvidence(kind, "os_error", code[:120])
-
-
-def classify_claude_native_failure(
-    result: subprocess.CompletedProcess[str],
-) -> ProviderFailureEvidence | None:
-    """Read only Claude's structured result discriminator/error fields."""
-
-    try:
-        envelope = json.loads(result.stdout)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if not isinstance(envelope, dict):
-        return None
-    if envelope.get("type") != "result" or envelope.get("is_error") is not True:
-        return None
-
-    subtype = envelope.get("subtype")
-    code = (
-        subtype
-        if isinstance(subtype, str) and 0 < len(subtype) <= 120
-        else None
-    )
-    status = envelope.get("api_error_status")
-    if isinstance(status, str) and status.isdigit():
-        status = int(status)
-    kind = _kind_for_http_status(status) if isinstance(status, int) else None
-    return ProviderFailureEvidence(
-        kind or "provider_error",
-        "provider_native",
-        code,
-    )
-
-
-def normalize_sonnet_execution(
-    execution: ProviderExecution,
-) -> ProviderExecution:
-    """Normalize a Sonnet result before persistence or controller routing."""
-
-    if execution.failure_source in {"supervisor", "os_error"}:
-        return execution
-    completed = subprocess.CompletedProcess(
-        execution.command,
-        execution.returncode,
-        execution.stdout,
-        execution.stderr,
-    )
-    evidence = classify_claude_native_failure(completed)
-    if evidence is not None:
-        return replace(
-            execution,
-            failure_kind=evidence.kind,
-            failure_source=evidence.source,
-            failure_code=evidence.code,
-        )
-    return normalize_provider_execution(execution)
 
 
 def normalize_provider_execution(
@@ -707,37 +561,22 @@ def _supervise_process(
         raise
 
 
-def _run(
-    command: list[str],
-    repo: Path,
+def run_attempt_loop(
     *,
+    label: str,
     capability: ProviderCapability,
-    display_name: str = "provider",
-    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    execute_attempt_once: Callable[[], ProviderAttempt],
     sleeper: Callable[[float], None] = time.sleep,
-    deadline_seconds: float = READ_ONLY_PROVIDER_DEADLINE_SECONDS,
-    term_grace_seconds: float = PROVIDER_TERM_GRACE_SECONDS,
-    poll_interval_seconds: float = PROVIDER_POLL_INTERVAL_SECONDS,
-    heartbeat_seconds: float = PROVIDER_HEARTBEAT_SECONDS,
-    native_classifier: Callable[
-        [subprocess.CompletedProcess[str]],
-        ProviderFailureEvidence | None,
-    ]
-    | None = None,
-    allow_stdout_tail: bool = False,
 ) -> ProviderExecution:
-    """Run one provider with bounded same-provider outage retries only."""
+    """Shared bounded same-provider transport retry loop.
+
+    Each iteration consumes exactly one already-normalized physical attempt
+    from `execute_attempt_once` and never reclassifies it.
+    """
 
     if capability not in {"read_only", "workspace_write"}:
         raise ValueError("provider capability must be read_only or workspace_write")
 
-    _validate_supervision_timing(
-        deadline_seconds,
-        term_grace_seconds,
-        poll_interval_seconds,
-        heartbeat_seconds,
-    )
-    label = display_name
     attempts: list[ProviderAttempt] = []
     retry_delays = (5.0, 15.0)
     max_attempts = 1 + len(retry_delays)
@@ -757,97 +596,36 @@ def _run(
             flush=True,
         )
 
-        terminal_failure_kind: ProviderFailureKind | None = None
-        direct_evidence: ProviderFailureEvidence | None = None
-        try:
-            if runner is not subprocess.run:
-                result = runner(
-                    command,
-                    cwd=repo,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-            else:
-                supervised = _supervise_process(
-                    command,
-                    repo,
-                    label=label,
-                    interactive=interactive,
-                    deadline_seconds=deadline_seconds,
-                    term_grace_seconds=term_grace_seconds,
-                    poll_interval_seconds=poll_interval_seconds,
-                    heartbeat_seconds=heartbeat_seconds,
-                )
-                result = supervised.completed
-                terminal_failure_kind = supervised.failure_kind
-        except OSError as exc:
-            result = subprocess.CompletedProcess(
-                command,
-                127,
-                "",
-                f"{type(exc).__name__}: {exc}",
-            )
-            direct_evidence = _os_failure_evidence(exc)
-
+        attempt = execute_attempt_once()
         elapsed = time.monotonic() - started
-        evidence = direct_evidence
-        if terminal_failure_kind is not None:
-            evidence = ProviderFailureEvidence(
-                terminal_failure_kind,
-                "supervisor",
-                terminal_failure_kind,
-            )
-        elif native_classifier is not None:
-            evidence = native_classifier(result) or evidence
-        if evidence is None:
-            evidence = normalize_provider_failure(
-                result.returncode,
-                result.stdout,
-                result.stderr,
-                allow_stdout_tail=allow_stdout_tail,
-            )
-        failure_kind = evidence.kind if evidence is not None else None
 
         # Only true provider/network unavailability is retried automatically.
         # Timeout, interruption, quota, billing, auth, rate-limit,
         # configuration, and unknown errors stop immediately.
         retry_scheduled = (
-            failure_kind == "unavailable"
+            attempt.failure_kind == "unavailable"
             and capability == "read_only"
             and attempt_number < max_attempts
         )
-
-        attempts.append(
-            ProviderAttempt(
-                command=command,
-                returncode=result.returncode,
-                stdout=result.stdout,
-                stderr=result.stderr,
-                duration_seconds=elapsed,
-                failure_kind=failure_kind,
-                failure_source=(
-                    evidence.source if evidence is not None else None
-                ),
-                failure_code=(
-                    evidence.code if evidence is not None else None
-                ),
-                capability=capability,
-                retry_scheduled=retry_scheduled,
-            )
+        attempt = replace(
+            attempt,
+            duration_seconds=elapsed,
+            capability=capability,
+            retry_scheduled=retry_scheduled,
         )
+        attempts.append(attempt)
 
         if interactive:
             print("\r\033[2K", end="", file=sys.stderr)
 
         mark = (
             "✓"
-            if result.returncode == 0 and failure_kind is None
+            if attempt.returncode == 0 and attempt.failure_kind is None
             else "✗"
         )
         print(
             f"{mark} {label} finished in {elapsed:0.1f}s "
-            f"(exit {result.returncode})",
+            f"(exit {attempt.returncode})",
             file=sys.stderr,
             flush=True,
         )
@@ -864,21 +642,16 @@ def _run(
             continue
 
         return ProviderExecution(
-            command=command,
-            returncode=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
+            command=attempt.command,
+            returncode=attempt.returncode,
+            stdout=attempt.stdout,
+            stderr=attempt.stderr,
             duration_seconds=sum(
-                attempt.duration_seconds or 0.0
-                for attempt in attempts
+                item.duration_seconds or 0.0 for item in attempts
             ),
-            failure_kind=failure_kind,
-            failure_source=(
-                evidence.source if evidence is not None else None
-            ),
-            failure_code=(
-                evidence.code if evidence is not None else None
-            ),
+            failure_kind=attempt.failure_kind,
+            failure_source=attempt.failure_source,
+            failure_code=attempt.failure_code,
             capability=capability,
             attempts=tuple(attempts),
         )
@@ -886,7 +659,171 @@ def _run(
     raise RuntimeError("unreachable provider retry state")
 
 
+def _run(
+    command: list[str],
+    repo: Path,
+    *,
+    capability: ProviderCapability,
+    display_name: str = "provider",
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    sleeper: Callable[[float], None] = time.sleep,
+    deadline_seconds: float = READ_ONLY_PROVIDER_DEADLINE_SECONDS,
+    term_grace_seconds: float = PROVIDER_TERM_GRACE_SECONDS,
+    poll_interval_seconds: float = PROVIDER_POLL_INTERVAL_SECONDS,
+    heartbeat_seconds: float = PROVIDER_HEARTBEAT_SECONDS,
+    native_classifier: Callable[
+        [subprocess.CompletedProcess[str]],
+        ProviderFailureEvidence | None,
+    ]
+    | None = None,
+    allow_stdout_tail: bool = False,
+) -> ProviderExecution:
+    """Compatibility facade keeping the legacy injected-runner test seam."""
+
+    if capability not in {"read_only", "workspace_write"}:
+        raise ValueError("provider capability must be read_only or workspace_write")
+
+    _validate_supervision_timing(
+        deadline_seconds,
+        term_grace_seconds,
+        poll_interval_seconds,
+        heartbeat_seconds,
+    )
+
+    def execute_attempt_once() -> ProviderAttempt:
+        terminal_failure_kind: ProviderFailureKind | None = None
+        direct_evidence: ProviderFailureEvidence | None = None
+        try:
+            if runner is not subprocess.run:
+                result = runner(
+                    command,
+                    cwd=repo,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            else:
+                supervised = _supervise_process(
+                    command,
+                    repo,
+                    label=display_name,
+                    interactive=sys.stderr.isatty(),
+                    deadline_seconds=deadline_seconds,
+                    term_grace_seconds=term_grace_seconds,
+                    poll_interval_seconds=poll_interval_seconds,
+                    heartbeat_seconds=heartbeat_seconds,
+                )
+                result = supervised.completed
+                terminal_failure_kind = supervised.failure_kind
+        except OSError as exc:
+            result = subprocess.CompletedProcess(
+                command,
+                127,
+                "",
+                f"{type(exc).__name__}: {exc}",
+            )
+            direct_evidence = _os_failure_evidence(exc)
+
+        evidence = direct_evidence
+        if terminal_failure_kind is not None:
+            evidence = ProviderFailureEvidence(
+                terminal_failure_kind,
+                "supervisor",
+                terminal_failure_kind,
+            )
+        elif native_classifier is not None:
+            evidence = native_classifier(result) or evidence
+        if evidence is None:
+            evidence = normalize_provider_failure(
+                result.returncode,
+                result.stdout,
+                result.stderr,
+                allow_stdout_tail=allow_stdout_tail,
+            )
+        return ProviderAttempt(
+            command=command,
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            failure_kind=evidence.kind if evidence is not None else None,
+            failure_source=(
+                evidence.source if evidence is not None else None
+            ),
+            failure_code=(
+                evidence.code if evidence is not None else None
+            ),
+        )
+
+    return run_attempt_loop(
+        label=display_name,
+        capability=capability,
+        execute_attempt_once=execute_attempt_once,
+        sleeper=sleeper,
+    )
+
+
+def _compatibility_binding(operation_id: str):
+    from configuration import (
+        ACCOUNT_PROFILE_CATALOG,
+        ROUTE_PROFILE_CATALOG,
+        compatibility_selection,
+    )
+
+    role = OPERATION_ROLES[operation_id]
+    selection = compatibility_selection(role)
+    return (
+        ROUTE_PROFILE_CATALOG[selection.route_id],
+        ACCOUNT_PROFILE_CATALOG[selection.provider_account_profile_id],
+    )
+
+
+def _compatibility_capability(role_id: str) -> ProviderCapability:
+    return "workspace_write" if role_id == "implementation" else "read_only"
+
+
+def _build_compatibility_command(operation_id: str, prompt: str) -> list[str]:
+    import adapters
+
+    route_profile, account = _compatibility_binding(operation_id)
+    request = adapters.AdapterAttemptRequest(
+        operation_id=operation_id,
+        route_profile=route_profile,
+        provider_account_profile=account,
+        prompt=prompt,
+        working_directory=DEFAULT_REPO,
+        capability=_compatibility_capability(route_profile.role_id),
+    )
+    adapter = adapters.get_adapter(route_profile.provider_adapter_id)
+    return list(adapter.build_attempt(request).command)
+
+
+def build_sonnet_command(prompt: str) -> list[str]:
+    """Facade over the Claude adapter's exact review argv."""
+
+    return _build_compatibility_command("specification_review", prompt)
+
+
+def build_terra_command(prompt: str) -> list[str]:
+    """Facade over the Codex adapter's exact advisory argv."""
+
+    return _build_compatibility_command("policy_clarification", prompt)
+
+
+def build_sol_command(prompt: str) -> list[str]:
+    """Facade over the Codex adapter's exact escalation argv."""
+
+    return _build_compatibility_command("escalation_guidance", prompt)
+
+
+def build_luna_command(prompt: str) -> list[str]:
+    """Facade over the Codex adapter's exact writer argv."""
+
+    return _build_compatibility_command("implementation_write", prompt)
+
+
 def execute_sonnet_review(prompt: str, repo: Path = DEFAULT_REPO) -> ProviderExecution:
+    from adapters import classify_claude_native_failure
+
     return _run(
         build_sonnet_command(prompt),
         repo,
@@ -895,36 +832,6 @@ def execute_sonnet_review(prompt: str, repo: Path = DEFAULT_REPO) -> ProviderExe
         deadline_seconds=READ_ONLY_PROVIDER_DEADLINE_SECONDS,
         native_classifier=classify_claude_native_failure,
     )
-
-
-def parse_sonnet_review(execution: ProviderExecution) -> ReviewResult:
-    execution = normalize_sonnet_execution(execution)
-    if execution_failed(execution):
-        raise RuntimeError(execution.stderr or "Sonnet review failed")
-    envelope = json.loads(execution.stdout)
-    if not isinstance(envelope, dict):
-        raise ValueError("Claude result envelope must be an object")
-    if (
-        envelope.get("type") != "result"
-        or envelope.get("subtype") != "success"
-        or envelope.get("is_error") is not False
-    ):
-        raise ValueError("Claude result envelope is not a recognized success")
-    if "structured_output" not in envelope:
-        raise ValueError("Claude success envelope lacks structured_output")
-    structured = envelope["structured_output"]
-    result = ReviewResult.model_validate(structured)
-    if (result.status == "PASS") != (result.category == "PASS"):
-        raise ValueError("Sonnet returned inconsistent status/category")
-    if result.category == "PASS" and result.finding_key not in (None, "PASS"):
-        raise ValueError("Sonnet PASS must use finding_key PASS")
-    if result.category != "PASS" and result.finding_key == "PASS":
-        raise ValueError("Sonnet failure cannot use finding_key PASS")
-    return result
-
-
-def run_sonnet_review(prompt: str, repo: Path = DEFAULT_REPO) -> ReviewResult:
-    return parse_sonnet_review(execute_sonnet_review(prompt, repo))
 
 
 def execute_terra_resolution(prompt: str, repo: Path = DEFAULT_REPO) -> ProviderExecution:
@@ -955,3 +862,56 @@ def execute_luna_implementation(prompt: str, repo: Path = DEFAULT_REPO) -> Provi
         display_name=IMPLEMENTATION_ROUTE.display_name,
         deadline_seconds=WRITE_PROVIDER_DEADLINE_SECONDS,
     )
+
+
+def parse_sonnet_review(execution: ProviderExecution) -> ReviewResult:
+    import json
+
+    from adapters import normalize_sonnet_execution
+
+    execution = normalize_sonnet_execution(execution)
+    if execution_failed(execution):
+        raise RuntimeError(execution.stderr or "Sonnet review failed")
+    envelope = json.loads(execution.stdout)
+    if not isinstance(envelope, dict):
+        raise ValueError("Claude result envelope must be an object")
+    if (
+        envelope.get("type") != "result"
+        or envelope.get("subtype") != "success"
+        or envelope.get("is_error") is not False
+    ):
+        raise ValueError("Claude result envelope is not a recognized success")
+    if "structured_output" not in envelope:
+        raise ValueError("Claude success envelope lacks structured_output")
+    structured = envelope["structured_output"]
+    result = ReviewResult.model_validate(structured)
+    if (result.status == "PASS") != (result.category == "PASS"):
+        raise ValueError("Sonnet returned inconsistent status/category")
+    if result.category == "PASS" and result.finding_key not in (None, "PASS"):
+        raise ValueError("Sonnet PASS must use finding_key PASS")
+    if result.category != "PASS" and result.finding_key == "PASS":
+        raise ValueError("Sonnet failure cannot use finding_key PASS")
+    return result
+
+
+def run_sonnet_review(prompt: str, repo: Path = DEFAULT_REPO) -> ReviewResult:
+    return parse_sonnet_review(execute_sonnet_review(prompt, repo))
+
+
+_RELOCATED_ADAPTER_NAMES = frozenset(
+    {
+        "SONNET_REVIEW_SCHEMA",
+        "SONNET_REVIEW_SCHEMA_JSON",
+        "LUNA_GIT_PROHIBITIONS",
+        "classify_claude_native_failure",
+        "normalize_sonnet_execution",
+    }
+)
+
+
+def __getattr__(name: str):
+    if name in _RELOCATED_ADAPTER_NAMES:
+        import adapters
+
+        return getattr(adapters, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
